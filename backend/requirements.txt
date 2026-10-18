@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-jose[cryptography]
+motor
+pymongo
+strands-agents
+python-dotenv
+dnspython

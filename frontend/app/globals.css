@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+:root {
+  --background: #05010d;
+  --foreground: #ffffff;
+  --surface: #0d061f;
+  --primary: #a855f7;
+  --accent: #d946ef;
+  --success: #10b981;
+  --critical: #ef4444;
+  --border: rgba(168, 85, 247, 0.2);
+  --glass: rgba(255, 255, 255, 0.03);
+  --glass-border: rgba(255, 255, 255, 0.08);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-primary: var(--primary);
+  --color-accent: var(--accent);
+  --color-success: var(--success);
+  --color-critical: var(--critical);
+  --color-glass: var(--glass);
+  
+  --shadow-glow: 0 0 20px rgba(168, 85, 247, 0.4);
+  --shadow-glow-accent: 0 0 20px rgba(217, 70, 239, 0.4);
+}
+
+* {
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  min-height: 100vh;
+  overflow-x: hidden;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.glass-card {
+  background: var(--glass);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: 1rem;
+}
+
+.neon-border {
+  border: 1px solid var(--primary);
+  box-shadow: var(--shadow-glow);
+}
+
+.neon-text {
+  color: var(--primary);
+  text-shadow: 0 0 8px rgba(168, 85, 247, 0.6);
+}

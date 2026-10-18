@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Role for Brand Guardian Agent with Bedrock and S3 permissions'
+
+Resources:
+  BrandGuardianExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'BrandGuardianExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+                - 'states.amazonaws.com'
+                - 'bedrock.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'BrandGuardianBedrockPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource: '*'
+        - PolicyName: 'BrandGuardianS3Policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - 'arn:aws:s3:::brand-guardian-raw'
+                  - 'arn:aws:s3:::brand-guardian-raw/*'
+                  - 'arn:aws:s3:::brand-guardian-final'
+                  - 'arn:aws:s3:::brand-guardian-final/*'
+        - PolicyName: 'BrandGuardianLoggingPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+
+Outputs:
+  RoleArn:
+    Description: 'ARN of the Brand Guardian Execution Role'
+    Value: !GetAtt BrandGuardianExecutionRole.Arn

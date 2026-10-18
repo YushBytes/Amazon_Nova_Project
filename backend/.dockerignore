@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+*.log
+temp_frames_*
+final_compliant_video.mp4
+test_frame.jpg
+.git
+.gitignore

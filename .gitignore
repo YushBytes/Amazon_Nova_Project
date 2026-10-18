@@ -49,8 +49,37 @@ venv/
 env/
 .env
 
-# data
-mongodb/
-data/
+# data (anchored to repo root: unanchored 'data/' also excluded source
+# directories such as frontend_backup/.../src/app/data/ — Phase 0 fix)
+/mongodb/
+/data/
 *.db
 *.sqlite3
+
+# ---------------------------------------------------------------------------
+# NovaFlow project additions (Phase 0 — repository recovery)
+# Rationale: see docs/PROJECT_AUDIT.md §10.6
+# ---------------------------------------------------------------------------
+
+# runtime artifacts produced by the video pipeline
+backend/uploads/
+temp_frames_*/
+test_output.jpg
+final_compliant_video.mp4
+
+# local agent/editor configuration (developer-local, must not be shared)
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# OS / editor noise
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# secrets & local cloud configuration (belt-and-braces alongside .env* above)
+*.key
+*.pem
+.aws/
+credentials

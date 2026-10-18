@@ -1,0 +1,24 @@
+# NovaFlow line-ending and diff policy (Phase 0)
+#
+# NOTE: text line-ending normalization (e.g. `* text=auto eol=lf`) is
+# DEFERRED deliberately. core.autocrlf is set to false locally so Git stores
+# bytes exactly as they appear on disk. Forcing LF now would rewrite
+# analyzer_nova.py and prompts.py, which are two of the five files already
+# present in the remote commit e059a9c and which Phase 0 must preserve
+# byte-for-byte. Revisit as an explicit, reviewed change in a later phase.
+
+# Treat binary assets as binary so Git never attempts normalization or diffs.
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.gif   binary
+*.ico   binary
+*.mp4   binary
+*.mov   binary
+*.avi   binary
+*.pdf   binary
+*.woff  binary
+*.woff2 binary
+
+# Lockfiles: keep out of diff noise, still tracked.
+package-lock.json -diff
