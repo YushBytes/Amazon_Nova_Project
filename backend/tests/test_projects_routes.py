@@ -214,9 +214,15 @@ def test_upload_init_as_client_is_forbidden(client, client_headers, table):
 def test_upload_init_rejects_agent_not_assigned_to_project(
     client, agent_headers, table
 ):
+    """An agent must not get an upload URL for someone else's project.
+
+    Phase 3 changed the response from 403 to 404: returning 403 confirmed that
+    the supplied project_id exists, which let an attacker enumerate ids. The
+    invariant that matters is unchanged - the request is refused.
+    """
     table.get_item.return_value = {"Item": _project_item(agent_id="someone_else")}
     r = client.post(f"/projects/{PROJECT_ID}/upload-init", headers=agent_headers)
-    assert r.status_code in (403, 500)
+    assert r.status_code == 404
     assert r.status_code != 200
 
 

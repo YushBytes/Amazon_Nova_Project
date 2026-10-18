@@ -41,15 +41,20 @@ Before Phase 0 the remote held only 5 root-level files; `backend/`, `frontend/`,
 
 The repository was made private *before* the backend was first pushed, so `backend/auth.py` and its hardcoded development JWT secret have never been publicly exposed. That secret is still a live defect (§5) and Roadmap Phase 3 replaces it.
 
-### 1.3 Three critical defects — do not build on top of them **[VERIFIED by AST]**
+### 1.3 The Phase 1 critical defects are fixed **[VERIFIED by test]**
 
-| Defect | Location | Effect |
+Fixed in Phase 2 (`2028dd5`), each with a regression test that was confirmed to
+fail beforehand. Kept here so the history is not lost and the patterns are not
+reintroduced.
+
+| Former defect | Location | Resolution |
 | :-- | :-- | :-- |
-| `json` used but never imported at module scope | `backend/analyzer.py:145,155` | Every frame analysis raises `NameError`, swallowed by `except` on line 162. **No detection is ever written to DynamoDB.** The violations API always returns `[]`. |
-| async `decode_token` called without `await` | `backend/projects.py:38` | `user` is a coroutine; `user["role"]` raises `TypeError`. **All 6 `/projects` routes return 500.** |
-| Remediation returns its input unchanged | `backend/audit_manager.py:116,119` | The Bedrock call is commented out; the caller sets `remediated: True` (line 178). **The system reports success while editing nothing.** |
+| `json` used but never imported at module scope | `backend/analyzer.py` | Module-scope imports added; each frame now reaches exactly one terminal state (`audited` / `audit_failed`), so a failure can no longer read as a clean frame. |
+| async `decode_token` called without `await` | `backend/projects.py` | `get_current_user` is async and awaits it; Phase 3 then centralised it in `auth.py`. |
+| Remediation returned its input unchanged | `backend/audit_manager.py` | The disguised mock was removed. Real Nova Canvas remediation is a later phase and is **not** implemented — do not re-add a stub that reports success. |
 
-Roadmap Phase 2 fixes these. Until then, assume the detection pipeline does not work.
+**Still true:** the pipeline has never been run end to end against live AWS, so
+detection accuracy is unverified. See §3 for what has and has not been executed.
 
 ### 1.4 The README is materially inaccurate **[VERIFIED]**
 
@@ -158,7 +163,22 @@ Python 3.14.6 (Dockerfile targets 3.11 — mismatch) · Node v24.18.1 · npm 11.
 
 ## 4. Environment variables
 
-**Names only — never write values into any file, commit, or report.** No `.env` exists on disk; no `.env.example` exists yet (Roadmap Phase 3 adds one).
+**Names only — never write values into any file, commit, or report.** No `.env` exists on disk. `.env.example` at the repository root is the placeholder template; copy it to `.env` (git-ignored) and fill it in.
+
+Security configuration (Phase 3, all via `backend/config.py`):
+
+| Name | Required? | Default |
+| :-- | :-- | :-- |
+| `JWT_SECRET_KEY` | **Yes in production** (≥ 32 chars; blocklisted placeholders rejected) | ephemeral random key in development |
+| `NOVAFLOW_ENV` | No | `development` |
+| `JWT_ALGORITHM` | No | `HS256` (HS256/384/512 only) |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | No | `1440` |
+| `CORS_ALLOWED_ORIGINS` | No (set it in production) | `http://localhost:3000`; `*` rejected |
+| `EXPOSE_API_DOCS` | No | `false` in production |
+| `MAX_UPLOAD_BYTES` | No | `104857600` (100 MiB) |
+| `ALLOWED_VIDEO_EXTENSIONS` | No | `mp4,mov,avi,webm,mkv` |
+
+Pre-existing application configuration:
 
 | Name | Read at | Default in code |
 | :-- | :-- | :-- |
@@ -173,7 +193,7 @@ Python 3.14.6 (Dockerfile targets 3.11 — mismatch) · Node v24.18.1 · npm 11.
 | `BEDROCK_GUARDRAIL_VERSION` | `safety.py:14` | `1` |
 | `NEXT_PUBLIC_API_URL` | 4 frontend files | `http://localhost:8000` |
 
-AWS credentials come from the boto3 default chain. The JWT signing key is **hardcoded** at `backend/auth.py:15` rather than env-sourced — Roadmap Phase 3 fixes this.
+AWS credentials come from the boto3 default chain, not from these variables. The JWT signing key is read from `JWT_SECRET_KEY`; it is no longer in the source.
 
 `.gitignore` correctly covers `.env*`. **Never commit a `.env`.** When reporting, name variables and redact values.
 
@@ -181,18 +201,34 @@ AWS credentials come from the boto3 default chain. The JWT signing key is **hard
 
 ## 5. Security posture
 
-**No live secrets exist in the repository or its history** [VERIFIED] — a pattern scan for AWS key IDs, `mongodb+srv://` URIs, API keys, and bearer tokens found none and no `.env` is on disk. Re-confirmed against the staged tree at the Phase 0 commit.
+**Phase 3 (2026-10-19) hardened this area. Full detail: `docs/SECURITY_AUDIT.md`.**
 
-Known issues, all in `docs/PROJECT_AUDIT.md` §10:
+**No live secrets exist in the repository** [VERIFIED] — pattern scans over the working tree and each phase diff found no AWS key ids, credentialed connection strings, API keys, or tokens, and no `.env` is on disk. A full Git-history scan is still outstanding (release checklist 2A.60).
 
-- **Hardcoded JWT secret** (`auth.py:15`) — anyone with repository read access can forge a token for any user and any role. Never publicly exposed (§1.2), but still a live defect; Phase 3 replaces it.
-- **Privilege escalation at signup** — `role` is client-supplied (`auth.py:56,97`); anyone can self-register as `agent`.
-- **Unsalted SHA-256 password hashing** (`auth.py:24`).
-- **Path traversal on upload** — the extension is taken from the client filename (`app.py:75`) and `split('.')[-1]` does not strip separators.
-- **No auth on 10 of 16 routes**; `/uploads/*` is served publicly with no auth or expiry.
-- **No file size, MIME, or duration validation** server-side.
-- **CORS `allow_origins=["*"]`** (`app.py:30`), conflicting with the auth sub-app's restrictive policy.
-- README publishes test credentials (`password123`) for users that do not exist.
+### Conventions you must follow
+
+- **Never hardcode a secret.** All security configuration is read through `backend/config.py`. There is no `auth.SECRET_KEY` any more, and a test asserts it never comes back.
+- **`JWT_SECRET_KEY` is required in production.** `NOVAFLOW_ENV=production` without a valid key raises `ConfigurationError` and the app refuses to start. In development an ephemeral random key is generated per process, so local work needs no setup but sessions do not survive a restart.
+- **Known-insecure values are blocklisted.** `config.KNOWN_INSECURE_SECRETS` permanently rejects the secret that used to be hardcoded, plus common placeholders, in every environment. Do not remove entries from that list.
+- **Passwords use Argon2id** via `argon2-cffi`. Call `auth.hash_password` / `auth.check_password`; never add another hashing path. Legacy SHA-256 records migrate transparently on successful login.
+- **Length policy belongs on signup, not login.** `SignupRequest` enforces a minimum; `LoginRequest` deliberately does not, or pre-existing accounts with short passwords would be locked out.
+- **Roles come from stored account data, never from a request.** `config.VALID_ROLES` is the whole model (`client`, `agent`). Public signup always assigns `config.DEFAULT_SIGNUP_ROLE`; a `role` field in the body is ignored. The agent role is granted only by an operator updating MongoDB directly — there is no API for it by design.
+- **Protect new routes with the shared dependencies** in `auth.py`: `Depends(get_current_user)` for authentication, `Depends(require_roles("agent"))` for role limits. Do not write a per-router copy.
+- **Check ownership for anything user-owned.** Use `app.require_video_owner` for videos and `projects._require_participant` for projects. A missing ownership record is a **denial**, not a pass. Return **404, not 403**, so endpoints cannot be used to enumerate ids.
+- **Never interpolate a client-supplied filename into a path.** `app._safe_extension` validates against an allowlist and the stored name is always server-generated (`vid_<8 hex>.<ext>`); the original survives only as display metadata.
+- **Never return exception text to a client.** The catch-all handler in `app.py` logs the traceback and returns a flat `{"detail": "Internal server error"}`. Catch `BotoCoreError`/`ClientError` around AWS calls and return a generic 502.
+- **Never log a password, hash, token, signing key, or model analysis body.** Log counts, ids, and exception *types*. Tests assert this.
+- **Never put a secret in a `NEXT_PUBLIC_*` variable** — those are compiled into the browser bundle and are public.
+- **Media access uses a scoped token.** A browser `<video>` element cannot send an `Authorization` header, so `GET /uploads/{file}` takes a 15-minute token bound to one `video_id`. Session tokens and media tokens are not interchangeable.
+
+### Known remaining gaps
+
+- **No rate limiting** on `/auth/login` or `/auth/signup` — the most significant outstanding gap.
+- **No token revocation.** Tokens live in `localStorage` and are valid until expiry; rotating `JWT_SECRET_KEY` is the only break-glass.
+- **`users.username` has no unique index** — concurrent signups can duplicate a username (low impact; operator step documented).
+- **Pre-Phase-3 uploads have no ownership record** and are therefore inaccessible.
+- **S3 bucket hardening and the IAM policy gaps** from `docs/PROJECT_AUDIT.md` §10.3 are untouched.
+- Upload validation does **not** prove a file is a safe video; there is no content scanning.
 
 When working in this repo: never print a secret value, never commit one, and if you find one, report its **file and variable name** with the value redacted and recommend rotation — do not delete user files or change cloud permissions yourself.
 
@@ -217,7 +253,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0 and 1 are **complete, committed, and pushed** (`e50ed57`): the repository is correctly rooted, flattened, private, and tracking `origin/main`, with the audit deliverables on the remote. **Phase 2 (critical defect fixes) is next and has not been started.** It still needs the maintainer decisions recorded in §9 — do not start it until it is explicitly assigned.
+Phases 0, 1, 2 and 3 are **complete, committed, and pushed**: the repository is correctly rooted, flattened, private and tracking `origin/main`; the four critical Phase 1 defects are fixed with regression tests; and authentication, authorization, resource ownership and upload handling are hardened (`docs/SECURITY_AUDIT.md`). **Phase 4 (connect the end-to-end pipeline) is next and has not been started.** It still needs the maintainer decisions recorded in §9 — do not start it until it is explicitly assigned.
 
 ---
 
@@ -242,9 +278,9 @@ Observed in the existing code, for consistency. Several are **bad practices the 
 - 4-space indent; module-level constants in `SCREAMING_SNAKE_CASE`; `load_dotenv()` at module top.
 - boto3 clients are built at module scope — convenient for CLI use, but it makes testing harder and means no shared timeout config. New code should accept an injected client.
 - Each pipeline module has an `if __name__ == "__main__":` CLI block with `sys.argv` parsing. Keep this; it is genuinely useful.
-- ⚠️ **`print()` is used for all logging** (only `s3_trigger.py` configures a logger). **Use `logging` in new code.**
-- ⚠️ **Bare `except Exception` that logs and continues** is pervasive and is the direct cause of the §1.3 defects being silent. **Catch specific exceptions and record a terminal failure state.**
-- ⚠️ **Raw exception strings are returned to clients** (`app.py:155`, `projects.py:201`). Do not do this.
+- `logging` is used in `app.py`, `auth.py`, `config.py`, `projects.py`, `video_repo.py` and `analyzer.py`. ⚠️ Several older modules (`extractor.py`, `video_stitcher.py`, `audit_manager.py`, `safety.py`) still use `print()`. **Use `logging` in new code.**
+- ⚠️ **Bare `except Exception` that logs and continues** is still common in the older modules, and was the direct cause of the §1.3 defects being silent. **Catch specific exceptions and record a terminal failure state.**
+- Raw exception strings are **no longer** returned to clients: `app.py` has a catch-all handler returning a generic 500, and AWS errors become a generic 502. Keep it that way.
 - Pydantic `BaseModel` for request/response schemas — follow this, and extend it to **validating AI model output**, which is currently unvalidated everywhere.
 
 **Frontend (TypeScript/React)**

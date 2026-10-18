@@ -26,20 +26,75 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
   useEffect(() => {
-    const savedToken = localStorage.getItem("novaflow_token");
-    const savedUser = localStorage.getItem("novaflow_user");
-    
-    if (savedToken && savedUser) {
-      setToken(savedToken);
-      setUser(JSON.parse(savedUser));
-    } else {
-      // Redirect to login if not authenticated and not already on login page
-      if (window.location.pathname !== "/login") {
-        router.push("/login");
+    let cancelled = false;
+
+    const restoreSession = async () => {
+      const savedToken = localStorage.getItem("novaflow_token");
+      const savedUser = localStorage.getItem("novaflow_user");
+
+      if (!savedToken || !savedUser) {
+        if (window.location.pathname !== "/login") {
+          router.push("/login");
+        }
+        if (!cancelled) setIsLoading(false);
+        return;
       }
-    }
-    setIsLoading(false);
-  }, [router]);
+
+      // Do not trust localStorage. The token may be expired, revoked, or
+      // signed with a key this backend no longer accepts, and the stored role
+      // may be stale. Ask the server, which reads the role from the database.
+      try {
+        const res = await fetch(`${API_URL}/auth/me`, {
+          headers: { Authorization: `Bearer ${savedToken}` },
+        });
+
+        if (cancelled) return;
+
+        if (!res.ok) {
+          // 401 means the session is gone; clear it rather than leaving the
+          // user apparently signed in until their next request fails.
+          localStorage.removeItem("novaflow_token");
+          localStorage.removeItem("novaflow_user");
+          setToken(null);
+          setUser(null);
+          if (window.location.pathname !== "/login") {
+            router.push("/login");
+          }
+          return;
+        }
+
+        const verified = await res.json();
+        if (cancelled) return;
+
+        const userData: User = {
+          username: verified.username,
+          role: verified.role,
+        };
+        setToken(savedToken);
+        setUser(userData);
+        // Keep the cached copy aligned with the server's view of the role.
+        localStorage.setItem("novaflow_user", JSON.stringify(userData));
+      } catch {
+        // Network failure: keep the cached session rather than signing the
+        // user out because the backend was briefly unreachable. Any protected
+        // request will still be rejected server-side if the token is invalid.
+        if (cancelled) return;
+        setToken(savedToken);
+        try {
+          setUser(JSON.parse(savedUser));
+        } catch {
+          setUser(null);
+        }
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+
+    void restoreSession();
+    return () => {
+      cancelled = true;
+    };
+  }, [router, API_URL]);
 
   const login = (newToken: string, role: string, username: string) => {
     const userData: User = { username, role: role as "client" | "agent" };

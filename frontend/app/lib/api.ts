@@ -23,6 +23,37 @@ export function apiBaseUrl(): string {
   return process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 }
 
+/** Storage key for the session token; owned by AuthContext. */
+export const TOKEN_STORAGE_KEY = "novaflow_token";
+
+/**
+ * Read the stored session token.
+ *
+ * Returns null during server-side rendering and when the user is signed out.
+ * The token is a bearer credential, so it is only ever attached to requests
+ * aimed at this application's own API.
+ */
+export function getStoredToken(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // Storage can throw in private browsing modes.
+    return null;
+  }
+}
+
+/**
+ * Authorization header for the current session, or an empty object.
+ *
+ * Phase 3 made every data route require authentication, so each call below
+ * attaches this.
+ */
+function authHeaders(): Record<string, string> {
+  const token = getStoredToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export interface UploadReelResponse {
   video_id: string;
   video_url: string;
@@ -64,6 +95,11 @@ export class ApiError extends Error {
     this.name = "ApiError";
     this.status = status;
   }
+
+  /** True when the session is missing, expired, or rejected. */
+  get isUnauthorized(): boolean {
+    return this.status === 401;
+  }
 }
 
 async function readError(res: Response, fallback: string): Promise<ApiError> {
@@ -89,6 +125,7 @@ export async function uploadReel(file: File): Promise<UploadReelResponse> {
 
   const res = await fetch(`${apiBaseUrl()}/upload-reel`, {
     method: "POST",
+    headers: authHeaders(),
     body: form,
   });
 
@@ -112,6 +149,7 @@ export async function uploadReel(file: File): Promise<UploadReelResponse> {
 export async function startAnalysis(videoId: string): Promise<StartAnalysisResponse> {
   const res = await fetch(`${apiBaseUrl()}/analyze/${encodeURIComponent(videoId)}`, {
     method: "POST",
+    headers: authHeaders(),
   });
 
   if (!res.ok) {
@@ -123,7 +161,8 @@ export async function startAnalysis(videoId: string): Promise<StartAnalysisRespo
 /** Fetch whatever detections have been persisted for a video so far. */
 export async function fetchViolations(videoId: string): Promise<ViolationsResponse> {
   const res = await fetch(
-    `${apiBaseUrl()}/violations/${encodeURIComponent(videoId)}`
+    `${apiBaseUrl()}/violations/${encodeURIComponent(videoId)}`,
+    { headers: authHeaders() }
   );
 
   if (!res.ok) {
@@ -136,6 +175,31 @@ export async function fetchViolations(videoId: string): Promise<ViolationsRespon
     detections: Array.isArray(data?.detections) ? data.detections : [],
     frame_count: typeof data?.frame_count === "number" ? data.frame_count : 0,
   };
+}
+
+export interface Submission {
+  id: string;
+  filename?: string;
+  original_filename?: string | null;
+  title?: string;
+  status?: string;
+  created_at?: string | null;
+  size_bytes?: number;
+  url?: string;
+}
+
+/** List the signed-in user's own uploads. Never another user's. */
+export async function fetchSubmissions(): Promise<Submission[]> {
+  const res = await fetch(`${apiBaseUrl()}/submissions`, {
+    headers: authHeaders(),
+  });
+
+  if (!res.ok) {
+    throw await readError(res, `Could not fetch submissions (HTTP ${res.status})`);
+  }
+
+  const data = await res.json();
+  return Array.isArray(data?.submissions) ? data.submissions : [];
 }
 
 /**

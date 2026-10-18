@@ -1,18 +1,23 @@
 """Shared test configuration for the NovaFlow backend.
 
-Two things happen here:
+Three things happen here:
 
 1. The backend directory is placed on ``sys.path`` so tests can import the
    application modules by their flat names (``import analyzer``), which is how
    the application itself imports them at runtime.
 
-2. Dummy AWS/Mongo environment variables are set *before* any backend module is
-   imported. Several backend modules build boto3 clients at module scope
-   (``analyzer.py``, ``projects.py``, ``extractor.py``), so the environment has
-   to look plausible at import time. Client construction performs no network
-   I/O, and every test patches the client objects, so no real AWS call is ever
-   made. The credentials below are obvious non-secrets used only to stop botocore
-   from searching the developer's real credential chain.
+2. Dummy AWS/Mongo environment variables and a synthetic JWT signing key are
+   set *before* any backend module is imported. Several backend modules build
+   boto3 clients at module scope (``analyzer.py``, ``projects.py``,
+   ``extractor.py``) and ``app.py`` resolves security settings at import time,
+   so the environment has to look plausible. Client construction performs no
+   network I/O, and every test patches the client objects, so no real AWS call
+   is ever made. The values below are obvious non-secrets used only to stop
+   botocore from searching the developer's real credential chain and to give
+   the token tests a deterministic key.
+
+3. An in-memory MongoDB substitute is provided, so authentication, signup,
+   and video-ownership behaviour can be tested without a running database.
 """
 
 import os
@@ -34,8 +39,20 @@ os.environ.setdefault("DYNAMODB_TABLE_NAME", "TestFrames")
 os.environ.setdefault("MONGODB_URL", "mongodb://localhost:27017")
 os.environ.setdefault("MONGODB_DB_NAME", "novaflow_test")
 
+# Synthetic signing key for the test process only. Long enough to satisfy the
+# production validator and not present in config.KNOWN_INSECURE_SECRETS, so the
+# token tests exercise the real validation path.
+os.environ.setdefault(
+    "JWT_SECRET_KEY", "pytest-only-synthetic-signing-key-0123456789abcdef"
+)
+os.environ.setdefault("NOVAFLOW_ENV", "development")
+
 import pytest  # noqa: E402  (import after sys.path/env setup, intentionally)
 
+
+# ---------------------------------------------------------------------------
+# Frames / analyzer fixtures
+# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def frame_jpeg_bytes() -> bytes:
@@ -45,3 +62,132 @@ def frame_jpeg_bytes() -> bytes:
     Bedrock (mocked in tests). Only the SOI/EOI markers matter for realism.
     """
     return b"\xff\xd8\xff\xe0" + b"\x00" * 32 + b"\xff\xd9"
+
+
+# ---------------------------------------------------------------------------
+# In-memory MongoDB substitute
+# ---------------------------------------------------------------------------
+
+class FakeCursor:
+    """Supports the ``find(...).sort(...).limit(...)`` async-iteration chain."""
+
+    def __init__(self, docs):
+        self._docs = list(docs)
+
+    def sort(self, field, direction=1):
+        self._docs.sort(key=lambda d: d.get(field) or 0, reverse=direction == -1)
+        return self
+
+    def limit(self, count):
+        self._docs = self._docs[:count]
+        return self
+
+    def __aiter__(self):
+        async def gen():
+            for doc in self._docs:
+                yield doc
+
+        return gen()
+
+
+class FakeCollection:
+    """Minimal async collection covering the operations the backend uses.
+
+    Deliberately simple: documents are plain dicts in a list. It implements
+    just enough of the motor API (``find_one``, ``insert_one``,
+    ``update_one``, ``find``, ``create_index``) for the authentication and
+    ownership code paths.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.docs = []
+        self.indexes = []
+        self._counter = 0
+
+    def _matches(self, doc, query):
+        return all(doc.get(key) == value for key, value in query.items())
+
+    async def find_one(self, query):
+        for doc in self.docs:
+            if self._matches(doc, query):
+                return dict(doc)
+        return None
+
+    async def insert_one(self, document):
+        self._counter += 1
+        stored = dict(document)
+        stored.setdefault("_id", f"{self.name}-{self._counter}")
+        # Honour a unique index on video_id so duplicate-id behaviour matches
+        # the real collection.
+        if any(idx == ("video_id", True) for idx in self.indexes):
+            if any(d.get("video_id") == stored.get("video_id") for d in self.docs):
+                raise RuntimeError("duplicate key error: video_id")
+        self.docs.append(stored)
+
+        class Result:
+            inserted_id = stored["_id"]
+
+        return Result()
+
+    async def update_one(self, query, update):
+        matched = modified = 0
+        for doc in self.docs:
+            if self._matches(doc, query):
+                matched = 1
+                for key, value in update.get("$set", {}).items():
+                    doc[key] = value
+                modified = 1
+                break
+
+        class Result:
+            matched_count = matched
+            modified_count = modified
+
+        return Result()
+
+    def find(self, query=None):
+        query = query or {}
+        return FakeCursor(
+            [dict(doc) for doc in self.docs if self._matches(doc, query)]
+        )
+
+    async def create_index(self, field, unique=False):
+        self.indexes.append((field, unique))
+        return field
+
+
+class FakeDatabase:
+    def __init__(self):
+        self.collections = {}
+
+    def __getitem__(self, name):
+        if name not in self.collections:
+            self.collections[name] = FakeCollection(name)
+        return self.collections[name]
+
+
+@pytest.fixture
+def fake_db(monkeypatch):
+    """Patch ``db.get_database`` so every consumer sees one in-memory database.
+
+    Patched on the ``db`` module *and* on the modules that imported the
+    function by name, because ``from db import get_database`` binds a separate
+    reference.
+    """
+    import db as db_module
+
+    database = FakeDatabase()
+
+    async def _get_database():
+        return database
+
+    monkeypatch.setattr(db_module, "get_database", _get_database)
+
+    for module_name in ("auth", "video_repo"):
+        if module_name in sys.modules:
+            monkeypatch.setattr(
+                sys.modules[module_name], "get_database", _get_database, raising=False
+            )
+
+    return database

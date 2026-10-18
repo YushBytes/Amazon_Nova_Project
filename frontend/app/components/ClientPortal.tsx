@@ -14,42 +14,61 @@ import {
 import { motion } from "framer-motion";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { ApiError, fetchSubmissions, type Submission } from "../lib/api";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-interface Submission {
-  id: string;
-  filename: string;
-  title: string;
-  agent: string;
-  time: string;
-  status: string;
-  url: string;
-  size: string;
+// The Submission shape comes from the API client so this view cannot drift
+// from the backend contract. The previous local interface required `agent`
+// and `time`, which the backend fabricated and no longer returns.
+
+/** Render an ISO timestamp as a short local time, or a dash when absent. */
+function formatUploadedAt(iso?: string | null): string {
+  if (!iso) return "--";
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return "--";
+  return parsed.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Render a byte count as MB, or a dash when absent. */
+function formatSize(bytes?: number): string {
+  if (typeof bytes !== "number" || bytes <= 0) return "--";
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 export default function ClientPortal({ onSelect }: { onSelect: (sub: Submission) => void }) {
   const [submissions, setSubmissions] = React.useState<Submission[]>([]);
   const [loading, setLoading] = React.useState(true);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
   const [activeTab, setActiveTab] = React.useState("ALL NODES");
 
   React.useEffect(() => {
-    const fetchSubmissions = async () => {
+    const load = async () => {
       try {
-        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/submissions`);
-        const data = await res.json();
-        if (data && Array.isArray(data.submissions)) {
-          setSubmissions(data.submissions);
-        }
+        // /submissions now requires authentication and returns only the
+        // signed-in user's own uploads.
+        setSubmissions(await fetchSubmissions());
+        setLoadError(null);
       } catch (err) {
-        console.error("Fetch error", err);
+        if (err instanceof ApiError && err.isUnauthorized) {
+          setLoadError("Your session has expired. Please sign in again.");
+        } else {
+          setLoadError(
+            err instanceof Error ? err.message : "Could not load assets."
+          );
+        }
       } finally {
         setLoading(false);
       }
     };
-    fetchSubmissions();
+    load();
   }, []);
 
   return (
@@ -103,6 +122,13 @@ export default function ClientPortal({ onSelect }: { onSelect: (sub: Submission)
           [1,2,3].map(i => (
             <div key={i} className="bg-white/[0.01] h-80 animate-pulse rounded-[2rem] border border-white/5" />
           ))
+        ) : loadError ? (
+          <div
+            role="alert"
+            className="md:col-span-2 lg:col-span-3 rounded-[2rem] border border-critical/30 bg-critical/5 p-8 text-xs font-bold uppercase tracking-widest text-critical"
+          >
+            {loadError}
+          </div>
         ) : (
           (submissions || []).map((sub) => (
             <motion.div 
@@ -129,9 +155,9 @@ export default function ClientPortal({ onSelect }: { onSelect: (sub: Submission)
                 <div>
                   <h3 className="text-base font-bold text-white tracking-wide truncate">{sub.title}</h3>
                   <div className="flex items-center space-x-2 mt-2">
-                    <span className="text-[10px] font-semibold text-white/20 uppercase tracking-tighter">Node: {sub.agent}</span>
+                    <span className="text-[10px] font-semibold text-white/20 uppercase tracking-tighter">{formatUploadedAt(sub.created_at)}</span>
                     <span className="text-white/10 text-xs">•</span>
-                    <span className="text-[10px] font-semibold text-white/20 uppercase tracking-tighter">{sub.time}</span>
+                    <span className="text-[10px] font-semibold text-white/20 uppercase tracking-tighter">{formatSize(sub.size_bytes)}</span>
                   </div>
                 </div>
 

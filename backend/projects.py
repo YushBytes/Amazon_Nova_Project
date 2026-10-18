@@ -1,12 +1,17 @@
 import os
 import uuid
+import logging
+
 import boto3
 from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import BotoCoreError, ClientError
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
-from auth import decode_token, oauth2_scheme
+from auth import get_current_user, require_roles
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -35,19 +40,47 @@ class ProjectResponse(BaseModel):
 
 # --- Helpers ---
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    # decode_token is a coroutine function; it must be awaited. Returning the
-    # un-awaited coroutine made every route below fail with
-    # TypeError: 'coroutine' object is not subscriptable.
-    payload = await decode_token(token)
-    return payload
+# get_current_user and require_roles are defined once in auth.py so every
+# router enforces authentication the same way. Role checks below are made from
+# the token's role claim, which is derived from stored account data at login;
+# request bodies are never consulted for authorization.
+require_client = require_roles("client")
+require_agent = require_roles("agent")
+
+
+def _fetch_project(project_id: str) -> dict:
+    """Load a project's metadata, or raise 404.
+
+    Separated from authorization so that a storage failure cannot be confused
+    with an authorization decision.
+    """
+    try:
+        item = table.get_item(
+            Key={"project_id": project_id, "sk": "metadata"}
+        ).get("Item")
+    except (BotoCoreError, ClientError):
+        logger.exception("DynamoDB read failed for project %s", project_id)
+        raise HTTPException(status_code=502, detail="Project store unavailable")
+    if not item:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return item
+
+
+def _require_participant(item: dict, user: dict) -> None:
+    """Allow only the owning client or the assigned agent.
+
+    Guards against reading another tenant's project by supplying its id. 404
+    rather than 403 so the endpoint cannot confirm that an id exists.
+    """
+    username = user["sub"]
+    if username not in (item.get("client_id"), item.get("agent_id")):
+        logger.warning("Denied cross-user access attempt to a project")
+        raise HTTPException(status_code=404, detail="Project not found")
 
 # --- Routes ---
 
 @router.post("/", response_model=ProjectResponse)
-async def create_project(data: ProjectCreate, user: dict = Depends(get_current_user)):
-    if user["role"] != "client":
-        raise HTTPException(status_code=403, detail="Only clients can create projects")
+async def create_project(data: ProjectCreate, user: dict = Depends(require_client)):
     
     project_id = str(uuid.uuid4())
     item = {
@@ -85,9 +118,7 @@ async def get_marketplace(user: dict = Depends(get_current_user)):
         return []
 
 @router.patch("/{project_id}/accept")
-async def accept_project(project_id: str, user: dict = Depends(get_current_user)):
-    if user["role"] != "agent":
-        raise HTTPException(status_code=403, detail="Only agents can accept projects")
+async def accept_project(project_id: str, user: dict = Depends(require_agent)):
     
     try:
         table.update_item(
@@ -115,20 +146,16 @@ class UploadInitResponse(BaseModel):
     s3_key: str
 
 @router.post("/{project_id}/upload-init", response_model=UploadInitResponse)
-async def initialize_upload(project_id: str, user: dict = Depends(get_current_user)):
+async def initialize_upload(project_id: str, user: dict = Depends(require_agent)):
     """
     Called by Agent to get a pre-signed URL to upload the Reel to S3.
     """
-    if user["role"] != "agent":
-        raise HTTPException(status_code=403, detail="Only agents can upload reels")
     
-    # 1. Verify project assignment
-    try:
-        item = table.get_item(Key={"project_id": project_id, "sk": "metadata"}).get("Item")
-        if not item or item.get("agent_id") != user["sub"]:
-            raise HTTPException(status_code=403, detail="You are not assigned to this project")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Database error")
+    # 1. Verify project assignment.
+    item = _fetch_project(project_id)
+    if item.get("agent_id") != user["sub"]:
+        logger.warning("Denied upload-init by an agent not assigned to the project")
+        raise HTTPException(status_code=404, detail="Project not found")
 
     # 2. Generate S3 Pre-signed URL
     s3_client = boto3.client('s3', region_name=REGION)
@@ -167,19 +194,17 @@ class ReviewAction(BaseModel):
     post_time: Optional[str] = None # For schedule post
 
 @router.post("/{project_id}/review")
-async def client_review(project_id: str, data: ReviewAction, user: dict = Depends(get_current_user)):
-    if user["role"] != "client":
-        raise HTTPException(status_code=403, detail="Only clients can review projects")
+async def client_review(project_id: str, data: ReviewAction, user: dict = Depends(require_client)):
     
-    # 1. Verify project ownership and status
-    try:
-        item = table.get_item(Key={"project_id": project_id, "sk": "metadata"}).get("Item")
-        if not item or item.get("client_id") != user["sub"]:
-            raise HTTPException(status_code=403, detail="Unauthorized")
-        if item.get("status") != "CLIENT_REVIEW":
-             raise HTTPException(status_code=400, detail="Project not ready for review")
-    except Exception:
-        raise HTTPException(status_code=500, detail="Database error")
+    # 1. Verify project ownership and status. These HTTPExceptions must not be
+    #    caught and converted to a 500: that previously masked the
+    #    authorization decision behind a generic "Database error".
+    item = _fetch_project(project_id)
+    if item.get("client_id") != user["sub"]:
+        logger.warning("Denied cross-user review attempt on a project")
+        raise HTTPException(status_code=404, detail="Project not found")
+    if item.get("status") != "CLIENT_REVIEW":
+        raise HTTPException(status_code=400, detail="Project not ready for review")
 
     # 2. Update status based on action
     new_status = "COMPLETED" if data.action in ["APPROVE", "REJECT"] else "IN_PROGRESS"
@@ -212,10 +237,11 @@ async def ai_chat(project_id: str, request: ChatRequest, user: dict = Depends(ge
     """
     Simulates a chat with Amazon Nova about the project/video quality.
     """
-    # 1. Get Project Context from DynamoDB
-    item = table.get_item(Key={"project_id": project_id, "sk": "metadata"}).get("Item")
-    if not item:
-        raise HTTPException(status_code=404, detail="Project not found")
+    # 1. Get project context, but only for a participant in this project.
+    #    Without this check any authenticated user could read any project's
+    #    requirements by supplying its id.
+    item = _fetch_project(project_id)
+    _require_participant(item, user)
 
     # 2. Construct Prompt for Nova Pro (Placeholder for Bedrock call)
     # The prompt would include the video requirements, the analysis report, and the user's message.

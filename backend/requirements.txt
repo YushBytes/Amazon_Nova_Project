@@ -27,6 +27,9 @@ pydantic==2.14.1
 
 # --- auth ---
 python-jose[cryptography]==3.5.0
+# Argon2id password hashing. Replaces the previous unsalted SHA-256 scheme;
+# auth.py migrates legacy hashes transparently on successful login.
+argon2-cffi==25.1.0
 
 # --- AWS (S3, DynamoDB, Bedrock) ---
 # Imported by analyzer.py, app.py, extractor.py, projects.py, video_stitcher.py,

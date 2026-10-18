@@ -87,5 +87,15 @@ desktop.ini
 # secrets & local cloud configuration (belt-and-braces alongside .env* above)
 *.key
 *.pem
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ecdsa
+id_ed25519
 .aws/
 credentials
+
+# ...but the placeholder template MUST be tracked. Negation comes after the
+# `.env*` rule above so it wins. Real .env files stay ignored.
+!.env.example

@@ -4,8 +4,11 @@ import {
   uploadReel,
   startAnalysis,
   fetchViolations,
+  fetchSubmissions,
+  getStoredToken,
   isRenderableDetection,
   ApiError,
+  TOKEN_STORAGE_KEY,
 } from "./api";
 
 /**
@@ -191,5 +194,117 @@ describe("isRenderableDetection", () => {
     ["NaN in box", { bounding_box: [1, 2, 3, NaN] }],
   ])("rejects %s so the overlay never renders NaN", (_label, input) => {
     expect(isRenderableDetection(input as never)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: the client must authenticate every data request
+// ---------------------------------------------------------------------------
+
+describe("bearer token handling", () => {
+  const TOKEN = "header.payload.signature";
+
+  beforeEach(() => {
+    process.env.NEXT_PUBLIC_API_URL = "http://backend.test";
+    window.localStorage.clear();
+  });
+
+  function stub(body: unknown = {}, status = 200) {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(body, status));
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("attaches the stored token to uploadReel", async () => {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, TOKEN);
+    const fetchMock = stub({ video_id: "vid_abc12345" });
+
+    await uploadReel(new File(["x"], "clip.mp4", { type: "video/mp4" }));
+
+    const init = fetchMock.mock.calls[0][1];
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("attaches the stored token to startAnalysis", async () => {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, TOKEN);
+    const fetchMock = stub({ video_id: "vid_abc12345", status: "ANALYZING" });
+
+    await startAnalysis("vid_abc12345");
+
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe(
+      `Bearer ${TOKEN}`
+    );
+  });
+
+  it("attaches the stored token to fetchViolations", async () => {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, TOKEN);
+    const fetchMock = stub({ detections: [], frame_count: 0 });
+
+    await fetchViolations("vid_abc12345");
+
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe(
+      `Bearer ${TOKEN}`
+    );
+  });
+
+  it("attaches the stored token to fetchSubmissions", async () => {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, TOKEN);
+    const fetchMock = stub({ submissions: [] });
+
+    await fetchSubmissions();
+
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe(
+      `Bearer ${TOKEN}`
+    );
+  });
+
+  it("sends no Authorization header when signed out", async () => {
+    const fetchMock = stub({ submissions: [] });
+
+    await fetchSubmissions();
+
+    const headers = fetchMock.mock.calls[0][1].headers ?? {};
+    expect(headers.Authorization).toBeUndefined();
+  });
+
+  it("never puts the token in the request URL", async () => {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, TOKEN);
+    const fetchMock = stub({ detections: [], frame_count: 0 });
+
+    await fetchViolations("vid_abc12345");
+
+    expect(String(fetchMock.mock.calls[0][0])).not.toContain(TOKEN);
+  });
+
+  it("surfaces a 401 as an unauthorized ApiError", async () => {
+    stub({ detail: "Could not validate credentials" }, 401);
+
+    await expect(fetchSubmissions()).rejects.toMatchObject({
+      name: "ApiError",
+      status: 401,
+    });
+
+    stub({ detail: "Could not validate credentials" }, 401);
+    const error = await fetchSubmissions().catch((e) => e);
+    expect(error.isUnauthorized).toBe(true);
+  });
+
+  it("does not treat a 403 as an expired session", async () => {
+    stub({ detail: "Insufficient role for this operation" }, 403);
+    const error = await fetchSubmissions().catch((e) => e);
+    expect(error.status).toBe(403);
+    expect(error.isUnauthorized).toBe(false);
+  });
+
+  it("tolerates localStorage being unavailable", () => {
+    const original = window.localStorage.getItem;
+    // Private-browsing modes can throw on access.
+    vi.spyOn(window.localStorage, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+
+    expect(getStoredToken()).toBeNull();
+
+    window.localStorage.getItem = original;
   });
 });

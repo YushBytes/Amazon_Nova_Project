@@ -26,7 +26,10 @@ export default function LoginPage() {
       const response = await fetch(`${API_URL}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password, role }),
+        // No role is sent. Registration always creates a least-privileged
+        // account server-side; the agent role is granted by an operator.
+        // Sending a role here would imply the client could choose it.
+        body: JSON.stringify({ username, password }),
       });
 
       const data = await response.json();
@@ -73,15 +76,32 @@ export default function LoginPage() {
             </div>
           </div>
 
-          {/* Role Selection */}
+          {/* Role selection is a sign-in convenience only. It grants no
+              privilege: the backend derives the session role from stored
+              account data, and registration always creates a Client account.
+              Hiding or disabling a control is never authorization. */}
           <div className="grid grid-cols-2 gap-6">
             {[
-              { id: "client", label: "Client", icon: User, desc: "Organization Owner" },
-              { id: "agent", label: "Agent", icon: Shield, desc: "Operational Unit" }
+              {
+                id: "client",
+                label: "Client",
+                icon: User,
+                desc: "Organization Owner",
+                signupAllowed: true,
+              },
+              {
+                id: "agent",
+                label: "Agent",
+                icon: Shield,
+                desc: isLogin ? "Operational Unit" : "By approval only",
+                signupAllowed: false,
+              },
             ].map((item) => (
               <button
                 key={item.id}
-                onClick={() => setRole(item.id as any)}
+                type="button"
+                disabled={!isLogin && !item.signupAllowed}
+                onClick={() => setRole(item.id as "client" | "agent")}
                 className={cn(
                   "p-6 rounded-3xl border transition-all duration-500 text-left group relative overflow-hidden",
                   role === item.id 
@@ -100,6 +120,13 @@ export default function LoginPage() {
               </button>
             ))}
           </div>
+
+          {!isLogin && (
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-white/30">
+              New accounts are created as Client. Agent access is granted by an
+              administrator.
+            </p>
+          )}
 
           {/* Auth Form */}
           <form onSubmit={handleAuth} className="space-y-6">

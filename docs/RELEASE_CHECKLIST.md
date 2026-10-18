@@ -67,6 +67,125 @@
 
 ---
 
+## 2A. Phase 3 security hardening
+
+Added 2026-10-19. Evidence is in `docs/SECURITY_AUDIT.md` §4 unless stated.
+Items marked ☒ were verified by an automated test or a recorded command; items
+left ☐ require an operator action or a live environment this phase could not
+reach.
+
+### Required environment configuration
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2A.1 | ☒ `JWT_SECRET_KEY` read from the environment, never hardcoded | `test_auth_module_has_no_hardcoded_secret` |
+| 2A.2 | ☒ Production refuses to start without a valid signing key | live check: exit 1 |
+| 2A.3 | ☒ Previously hardcoded key permanently blocklisted | `test_production_rejects_the_old_hardcoded_secret` |
+| 2A.4 | ☒ `.env.example` committed with placeholders only; real `.env` ignored | `git add --dry-run` refuses `.env` |
+| 2A.5 | ☐ A fresh `JWT_SECRET_KEY` generated and set in the deployment environment | operator action |
+| 2A.6 | ☐ `CORS_ALLOWED_ORIGINS` set to the real frontend origin | operator action; default is localhost |
+| 2A.7 | ☐ All pre-Phase-3 tokens treated as invalid after key rotation | operator action |
+
+### Authentication and passwords
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2A.8 | ☒ Passwords stored with Argon2id | `test_new_hashes_use_argon2id` |
+| 2A.9 | ☒ Per-password salting (identical passwords differ) | `test_hash_is_salted_so_identical_passwords_differ` |
+| 2A.10 | ☒ Legacy SHA-256 records migrate on successful login | `test_legacy_account_is_migrated_on_successful_login` |
+| 2A.11 | ☒ A failed login never rewrites the stored hash | `test_failed_login_leaves_a_legacy_record_untouched` |
+| 2A.12 | ☒ Malformed stored hashes never authenticate | 11 parametrised cases |
+| 2A.13 | ☒ Short pre-existing passwords still work (no lockout) | `test_login_accepts_a_short_legacy_password` |
+| 2A.14 | ☒ Login cannot be used to enumerate usernames | `test_unknown_user_and_wrong_password_look_identical` |
+| 2A.15 | ☐ Legacy password migration observed against real MongoDB | needs a live database |
+| 2A.16 | ☐ Argon2 parameters benchmarked on production hardware | library defaults in use |
+
+### Token validation
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2A.17 | ☒ Invalid signatures rejected | `test_token_signed_with_a_different_key_is_rejected` |
+| 2A.18 | ☒ Expired tokens rejected | `test_expired_token_is_rejected` |
+| 2A.19 | ☒ Malformed tokens rejected | 7 parametrised shapes |
+| 2A.20 | ☒ `alg=none` rejected; algorithm pinned | `test_unsigned_none_algorithm_token_is_rejected` |
+| 2A.21 | ☒ Expiry claim required | `test_token_without_exp_is_rejected` |
+| 2A.22 | ☒ Unknown role claims rejected | 9 parametrised values |
+| 2A.23 | ☒ Authentication failures return one uniform response | `test_authentication_errors_are_uniform` |
+
+### Roles and route authorization
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2A.24 | ☒ Public signup cannot grant a privileged role | `test_security_signup_roles.py` (23) |
+| 2A.25 | ☒ Escalated signup is still refused by agent-only routes | `test_escalated_signup_cannot_reach_agent_only_routes` |
+| 2A.26 | ☒ Existing agent accounts not downgraded | `test_existing_agent_account_is_not_downgraded` |
+| 2A.27 | ☒ Every registered route reviewed and classified | `SECURITY_AUDIT.md` S4 table (16 routes) |
+| 2A.28 | ☒ All 12 non-public routes reject anonymous callers | 24 parametrised assertions |
+| 2A.29 | ☒ Role restrictions enforced server-side | role tests in `test_security_routes.py` |
+| 2A.30 | ☒ Request-body role fields cannot elevate privilege | `test_role_cannot_be_elevated_through_the_request_body` |
+| 2A.31 | ☒ Intentionally public routes still public | `/status`, `/auth/login`, `/auth/signup` tests |
+| 2A.32 | ☐ Rate limiting on `/auth/login` and `/auth/signup` | **not implemented**; out of Phase 3 scope |
+
+### Resource ownership
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2A.33 | ☒ Video ownership recorded at upload | `test_upload_records_the_caller_as_owner` |
+| 2A.34 | ☒ Cross-user video read denied | `test_another_user_cannot_read_violations` |
+| 2A.35 | ☒ Cross-user analysis trigger denied | `test_another_user_cannot_start_analysis` |
+| 2A.36 | ☒ Videos with no ownership record denied | `test_video_with_no_ownership_record_is_denied` |
+| 2A.37 | ☒ `/submissions` returns only the caller's uploads | `test_submissions_only_lists_the_callers_own_videos` |
+| 2A.38 | ☒ Project chat limited to participants | `test_non_participant_cannot_read_a_project_brief_via_chat` |
+| 2A.39 | ☒ Ownership cannot be set through a payload | `test_project_ownership_cannot_be_set_through_the_payload` |
+| 2A.40 | ☒ Denials return 404, not 403, to prevent id enumeration | ownership tests |
+| 2A.41 | ☐ Pre-Phase-3 uploads deleted or backfilled | operator decision; currently inaccessible |
+
+### Upload validation
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2A.42 | ☒ Extension allowlist enforced | 8 disallowed extensions rejected |
+| 2A.43 | ☒ Traversal-shaped filenames rejected | 7 parametrised payloads |
+| 2A.44 | ☒ Nothing is ever written outside the upload directory | `test_no_file_written_outside_the_upload_directory` |
+| 2A.45 | ☒ Storage filenames fully server-generated | `test_stored_filename_shape_is_server_controlled` |
+| 2A.46 | ☒ Empty uploads rejected | `test_empty_upload_is_rejected` |
+| 2A.47 | ☒ Size limit enforced while streaming; partial file removed | `test_oversized_upload_is_rejected` |
+| 2A.48 | ☒ Malformed multipart requests rejected | `test_malformed_multipart_request_is_rejected` |
+| 2A.49 | ☒ Content type is a secondary check, not authoritative | `test_content_type_alone_cannot_bypass_the_extension_allowlist` |
+| 2A.50 | ☒ Stored media no longer served publicly | `test_media_without_a_token_is_refused` |
+| 2A.51 | ☒ Media tokens scoped to one video and one user | 3 media-scope tests |
+| 2A.52 | ☐ Content/malware scanning of uploads | **not implemented**; excluded from scope |
+
+### Errors, logging, and secret scanning
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2A.53 | ☒ No stack traces or exception text in responses | `test_error_responses_do_not_leak_internals` |
+| 2A.54 | ☒ Passwords, hashes, and tokens absent from logs | 2 logging tests |
+| 2A.55 | ☒ Health probe leaks no configuration | `test_status_does_not_leak_configuration` |
+| 2A.56 | ☒ API docs off in production unless opted in | `test_docs_are_hidden_in_production_by_default` |
+| 2A.57 | ☒ CORS wildcard rejected by configuration | `test_cors_wildcard_is_rejected` |
+| 2A.58 | ☒ Secret scan clean over the Phase 3 diff | recorded in the Phase 3 report |
+| 2A.59 | ☒ No secrets in `NEXT_PUBLIC_*` variables | `.env.example` documents the rule |
+| 2A.60 | ☐ Secret scan over the full Git history | still outstanding (see item 2.14) |
+
+### Dependencies and regression results
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2A.61 | ☒ `argon2-cffi` declared and pinned | `requirements.txt` |
+| 2A.62 | ☒ Clean install from the manifest succeeds | fresh venv, exit 0 |
+| 2A.63 | ☒ Backend suite green | **277 passed, 1 skipped** |
+| 2A.64 | ☒ Security suite green | **202 passed** |
+| 2A.65 | ☒ Frontend tests green | **42 passed** |
+| 2A.66 | ☒ Frontend typecheck clean | `npm run typecheck` exit 0 |
+| 2A.67 | ☒ Frontend build succeeds | `npm run build` exit 0, 7/7 pages |
+| 2A.68 | ☒ Frontend lint no worse than baseline | 30 problems vs 33 before |
+| 2A.69 | ☒ Upload-to-analysis flow still compatible | `HUDView.test.tsx` (15) still green |
+| 2A.70 | ☐ `users.username` unique index created | operator action (S12) |
+
+---
+
 ## 3. Reliability
 
 | # | Item | Phase | Evidence |
