@@ -10,27 +10,36 @@ Facts below are marked **[VERIFIED]** (proven during the audit) or **[UNVERIFIED
 
 ## 1. Critical warnings — read first
 
-### 1.1 The Git repository is rooted at the user's Desktop **[VERIFIED]**
+### 1.1 Repository root — correct now, but a stray Desktop repo still exists **[VERIFIED 2026-10-18, Phase 0]**
 
 ```
-git rev-parse --show-toplevel  →  C:/Users/ayush/OneDrive/Desktop
+git rev-parse --show-toplevel  →  C:/Users/ayush/OneDrive/Desktop/Amazon Nova
 ```
 
-A `git init` was run in the Desktop folder, not the project folder. `git status --porcelain -uall | wc -l` at that root reports **37,558 files**, including the user's resumes, personal PDFs, and unrelated projects. The remote repository is **PUBLIC**.
+The project is now a correctly-rooted repository at `C:/Users/ayush/OneDrive/Desktop/Amazon Nova`, tracking `origin/main`. The `Amazon_Nova-main/` zip-extraction layer was flattened in Phase 0, so project files sit at the repository root and the root `.gitignore` governs the whole project.
 
-**Therefore:**
-- **Never run `git add -A`, `git add .`, or `git commit -a`** until Roadmap Phase 0 is accepted.
-- **Verify `git rev-parse --show-toplevel` before every commit.**
-- Stage files explicitly by path.
-- The project's `.gitignore` is at `Amazon_Nova-main/.gitignore` and governs only that subtree — it does not protect the Desktop root.
+**The original hazard is contained but not gone.** A `git init` had been run in `C:/Users/ayush/OneDrive/Desktop`, and that repository **still exists** — deliberately preserved and untouched: 0 commits, 0 refs, 0 remotes, and roughly 37,400 untracked files including the user's resumes, personal PDFs, and unrelated projects. It was never committed to and never pushed. Working inside the project directory is safe because the nested `.git` takes precedence, but a session whose working directory is the Desktop would still be operating in that repository.
 
-Phase 0 of `docs/IMPLEMENTATION_ROADMAP.md` fixes this. It needs maintainer decisions and has not been done.
+**Therefore, these practices remain mandatory:**
+- **Verify `git rev-parse --show-toplevel` before every commit** — it must print the project root, never the Desktop.
+- **Stage files explicitly by path.** Never `git add -A`, `git add .`, or `git commit -a`.
+- Never commit from, or add a remote to, the Desktop repository.
 
-### 1.2 The remote has almost nothing **[VERIFIED]**
+### 1.2 The remote now holds the full project, and is private **[VERIFIED 2026-10-18, Phase 0]**
 
-`YushBytes/Amazon_Nova_Project` (PUBLIC) `main` = commit `e059a9c` ("Add files via upload") containing exactly **5 blobs**: `.gitignore`, `README.md`, `analyzer_nova.py`, `prompts.py`, `test_frame.jpg`.
+`YushBytes/Amazon_Nova_Project` is **PRIVATE** (confirmed by an unauthenticated API probe returning 404) and `main` now contains the complete project — 136 tracked files.
 
-The `backend/`, `frontend/`, `infra/`, `docs/`, and `frontend_backup/` trees have **never been pushed**. Those 5 remote files are byte-identical to their local counterparts (SHA differences are purely `core.autocrlf=true` CRLF normalization), so **nothing on the remote needs preserving beyond the commit itself** — and a normal merge suffices. **Never force-push.**
+History is linear, with the original commit preserved as its root:
+
+```
+e50ed57  docs: audit existing project and define implementation roadmap
+7e1649c  chore: recover repository at project root and import project files
+e059a9c  Add files via upload          <- original remote commit, preserved
+```
+
+Before Phase 0 the remote held only 5 root-level files; `backend/`, `frontend/`, `infra/`, `docs/`, and `frontend_backup/` had never been pushed. Four of those five files remain byte-identical to `e059a9c`; only `.gitignore` was intentionally extended. **Never force-push** — published history must be preserved.
+
+The repository was made private *before* the backend was first pushed, so `backend/auth.py` and its hardcoded development JWT secret have never been publicly exposed. That secret is still a live defect (§5) and Roadmap Phase 3 replaces it.
 
 ### 1.3 Three critical defects — do not build on top of them **[VERIFIED by AST]**
 
@@ -55,7 +64,7 @@ Roadmap Phase 2 fixes these. Until then, assume the detection pipeline does not 
 ### 2.1 Layout
 
 ```
-Amazon Nova/Amazon_Nova-main/        <- de facto project root (holds .gitignore)
+Amazon Nova/                         <- project root (flattened in Phase 0; holds .gitignore)
 ├── backend/          FastAPI service, 17 Python modules
 ├── frontend/         Next.js 16 App Router dashboard (the live one)
 ├── frontend_backup/  375 KB ORPHANED Vite dashboard — zero references
@@ -143,7 +152,7 @@ When a phase adds tests, run them and **quote the real output**. Never write "te
 
 ### Environment on this machine **[VERIFIED 2026-10-18]**
 
-Python 3.14.6 (Dockerfile targets 3.11 — mismatch) · Node v24.18.1 · npm 11.16.0 · Docker 29.8.0 · git 2.51.0 (`core.autocrlf=true`) · gh 2.97.0 authenticated as `YushBytes` (scopes `gist`, `read:org`, `repo`, `workflow`) · **FFmpeg NOT INSTALLED** · `boto3`, `motor`, `pymongo`, `jose`, `ffmpeg-python`, `strands`, `nova_act` **all missing** · `frontend/node_modules` absent.
+Python 3.14.6 (Dockerfile targets 3.11 — mismatch) · Node v24.18.1 · npm 11.16.0 · Docker 29.8.0 · git 2.51.0 (`core.autocrlf=false` set locally for this repo) · gh 2.97.0 authenticated as `YushBytes` (scopes `gist`, `read:org`, `repo`, `workflow`) · **FFmpeg NOT INSTALLED** · `boto3`, `motor`, `pymongo`, `jose`, `ffmpeg-python`, `strands`, `nova_act` **all missing** · `frontend/node_modules` absent.
 
 ---
 
@@ -172,11 +181,11 @@ AWS credentials come from the boto3 default chain. The JWT signing key is **hard
 
 ## 5. Security posture
 
-**No live secrets exist in the repository or its history** [VERIFIED] — a pattern scan for AWS key IDs, `mongodb+srv://` URIs, API keys, and bearer tokens found none, no `.env` is on disk, and there is no local Git history at all.
+**No live secrets exist in the repository or its history** [VERIFIED] — a pattern scan for AWS key IDs, `mongodb+srv://` URIs, API keys, and bearer tokens found none and no `.env` is on disk. Re-confirmed against the staged tree at the Phase 0 commit.
 
 Known issues, all in `docs/PROJECT_AUDIT.md` §10:
 
-- **Hardcoded JWT secret** (`auth.py:15`) in a **public** repo — anyone can forge a token for any role.
+- **Hardcoded JWT secret** (`auth.py:15`) — anyone with repository read access can forge a token for any user and any role. Never publicly exposed (§1.2), but still a live defect; Phase 3 replaces it.
 - **Privilege escalation at signup** — `role` is client-supplied (`auth.py:56,97`); anyone can self-register as `agent`.
 - **Unsalted SHA-256 password hashing** (`auth.py:24`).
 - **Path traversal on upload** — the extension is taken from the client filename (`app.py:75`) and `split('.')[-1]` does not strip separators.
@@ -208,20 +217,20 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phase 1 (audit) is **complete but uncommitted** — committing requires Phase 0. **Phase 0 is blocked** on three maintainer decisions (project root, approval to remove the Desktop `.git`, repository visibility). Do not start Phase 2 until Phase 0 is accepted.
+Phases 0 and 1 are **complete, committed, and pushed** (`e50ed57`): the repository is correctly rooted, flattened, private, and tracking `origin/main`, with the audit deliverables on the remote. **Phase 2 (critical defect fixes) is next and has not been started.** It still needs the maintainer decisions recorded in §9 — do not start it until it is explicitly assigned.
 
 ---
 
 ## 7. Git safety rules
 
 - **Verify `git rev-parse --show-toplevel`** is the project root before every commit. See §1.1.
-- **Stage explicitly by path.** No `git add -A` / `git add .` until Phase 0 is accepted and a verified `.gitignore` is in place.
+- **Stage explicitly by path.** Never `git add -A` / `git add .` — the stray Desktop repository still exists (§1.1).
 - Read `git status` and `git diff --cached` before committing.
 - `git fetch` and inspect remote state before pushing. On conflict, **stop and report** — never force.
-- **Never force-push.** The remote's single commit must be preserved, and its content is byte-identical to local, so a normal merge works.
+- **Never force-push.** The remote's published history (rooted at `e059a9c`) must be preserved; local `main` descends from it, so a normal fast-forward push works.
 - If a push fails for auth/network/permission reasons, **preserve the local commit** and report the exact error. Never claim work was pushed when it was not.
 - Do not create another GitHub repository. Do not delete branches or rewrite history.
-- `core.autocrlf=true` is set and there is no `.gitattributes` — expect spurious line-ending diffs until Phase 0 adds one.
+- `core.autocrlf=false` is set locally and `.gitattributes` declares binary assets, so Git stores bytes as they appear on disk. Repo-wide text line-ending normalization (`* text=auto eol=lf`) was deliberately deferred in Phase 0 — see the rationale in `.gitattributes`.
 
 ---
 
@@ -266,7 +275,7 @@ These block specific phases. Do not decide them unilaterally.
 
 ## 10. Things to never do in this repository
 
-- Never `git add -A` / `git add .` / `git commit -a` while the repo is rooted at the Desktop (§1.1).
+- Never `git add -A` / `git add .` / `git commit -a` — stage by explicit path; the stray Desktop repository still exists (§1.1).
 - Never force-push, rewrite history, or create another GitHub repository.
 - Never commit a `.env`, a credential, `node_modules/`, `backend/uploads/`, `temp_frames_*/`, or build artifacts.
 - Never present a mock, hardcoded value, or silent fallback as real AI output.
