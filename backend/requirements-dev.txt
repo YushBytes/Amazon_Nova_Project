@@ -1,0 +1,15 @@
+# NovaFlow backend development and test dependencies.
+#
+# Install alongside the runtime manifest:
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Kept separate so production images built from requirements.txt alone do not
+# pull test tooling.
+
+pytest==9.1.1
+# Lets async test functions be collected without a per-test marker
+# (asyncio_mode = auto in pytest.ini).
+pytest-asyncio==1.4.0
+# Required by fastapi.testclient.TestClient, which the project-route regression
+# tests use to drive the ASGI app in-process without a live server.
+httpx==0.28.1

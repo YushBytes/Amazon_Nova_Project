@@ -1,6 +1,7 @@
 import os
 import uuid
 import boto3
+from boto3.dynamodb.conditions import Attr
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
@@ -34,8 +35,11 @@ class ProjectResponse(BaseModel):
 
 # --- Helpers ---
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    payload = decode_token(token)
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    # decode_token is a coroutine function; it must be awaited. Returning the
+    # un-awaited coroutine made every route below fail with
+    # TypeError: 'coroutine' object is not subscriptable.
+    payload = await decode_token(token)
     return payload
 
 # --- Routes ---
@@ -73,7 +77,7 @@ async def get_marketplace(user: dict = Depends(get_current_user)):
     # For now, we'll scan (limited for POC)
     try:
         response = table.scan(
-            FilterExpression=boto3.dynamodb.conditions.Attr("status").eq("SUBMITTED")
+            FilterExpression=Attr("status").eq("SUBMITTED")
         )
         return [ProjectResponse(**item) for item in response.get("Items", [])]
     except Exception as e:

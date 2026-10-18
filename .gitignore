@@ -61,6 +61,12 @@ env/
 # Rationale: see docs/PROJECT_AUDIT.md §10.6
 # ---------------------------------------------------------------------------
 
+# test tooling caches (Phase 2 introduced pytest and vitest)
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
 # runtime artifacts produced by the video pipeline
 backend/uploads/
 temp_frames_*/

@@ -16,24 +16,56 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import {
+  uploadReel,
+  startAnalysis,
+  fetchViolations,
+  isRenderableDetection,
+  type Detection,
+} from "../lib/api";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/**
+ * Phases of the real audit workflow.
+ *
+ *   idle      nothing submitted yet (or a failure was dismissed)
+ *   uploading POST /upload-reel in flight
+ *   starting  POST /analyze/{id} in flight
+ *   analyzing the backend accepted the job and is working on it
+ *   failed    upload or trigger failed; retry is offered
+ *
+ * There is deliberately no 'complete' phase: the backend exposes no
+ * completion signal (see app/lib/api.ts), so the UI must not claim an audit
+ * has finished. It reports only what has actually been persisted so far.
+ */
+type AuditPhase = "idle" | "uploading" | "starting" | "analyzing" | "failed";
+
 export default function HUDView() {
   const [goal, setGoal] = React.useState("");
   const [submissions, setSubmissions] = React.useState<any[]>([]);
   const [activeVideoId, setActiveVideoId] = React.useState<string | null>(null);
-  const [detections, setDetections] = React.useState<any[]>([]);
+  const [detections, setDetections] = React.useState<Detection[]>([]);
   const [currentTime, setCurrentTime] = React.useState(0);
+
+  // Real audit workflow state.
+  const [auditPhase, setAuditPhase] = React.useState<AuditPhase>("idle");
+  const [auditError, setAuditError] = React.useState<string | null>(null);
+  const [framesAudited, setFramesAudited] = React.useState(0);
+  // Set once the upload succeeds, so a retry after a failed trigger does
+  // not re-upload the same file.
+  const [uploadedVideoId, setUploadedVideoId] = React.useState<string | null>(null);
+  // Guards against double submission from rapid clicks, independently of
+  // the disabled attribute.
+  const inFlightRef = React.useRef(false);
   const videoInputRef = React.useRef<HTMLInputElement>(null);
   const videoRef = React.useRef<HTMLVideoElement>(null);
   const pollingRef = React.useRef<any>(null);
 
   const [videoSrc, setVideoSrc] = React.useState<string | null>(null);
   const [selectedFile, setSelectedFile] = React.useState<File | null>(null);
-  const [isUploading, setIsUploading] = React.useState(false);
   const [activeTab, setActiveTab] = React.useState("Overview");
 
   React.useEffect(() => {
@@ -46,31 +78,86 @@ export default function HUDView() {
     return () => window.removeEventListener('storage', handleStorage);
   }, []);
 
-  const steps = [
-    { title: "Neural Link Status", status: "success", desc: "4096 clusters synced and ready.", time: "0.4s" },
-    { title: "Spatial Analysis", status: "active", desc: "Parsing environment metadata...", time: "" },
-    { title: "Optimization Loop", status: "pending", desc: "Awaiting cluster data confirmation.", time: "" },
-  ];
+  // Real pipeline telemetry, derived from actual workflow state. This
+  // previously rendered a fixed, fabricated list ('4096 clusters synced') that
+  // reported success regardless of what the backend had done.
+  const steps = React.useMemo(() => {
+    const done = (s: AuditPhase[]) => s.includes(auditPhase);
+    return [
+      {
+        title: "Payload Upload",
+        status:
+          auditPhase === "uploading"
+            ? "active"
+            : uploadedVideoId
+              ? "success"
+              : auditPhase === "failed"
+                ? "error"
+                : "pending",
+        desc: uploadedVideoId
+          ? `Stored as ${uploadedVideoId}.`
+          : auditPhase === "uploading"
+            ? "Transferring payload to backend..."
+            : "Awaiting a selected video.",
+        time: "",
+      },
+      {
+        title: "Analysis Trigger",
+        status:
+          auditPhase === "starting"
+            ? "active"
+            : done(["analyzing"])
+              ? "success"
+              : auditPhase === "failed" && uploadedVideoId
+                ? "error"
+                : "pending",
+        desc: done(["analyzing"])
+          ? "Backend accepted the analysis job."
+          : auditPhase === "starting"
+            ? "Requesting frame extraction and audit..."
+            : "Not yet requested.",
+        time: "",
+      },
+      {
+        title: "Frame Audit",
+        status: auditPhase === "analyzing" ? "active" : "pending",
+        desc:
+          auditPhase === "analyzing"
+            ? `${framesAudited} frame(s) recorded, ${detections.length} violation(s) so far.`
+            : "No frames audited yet.",
+        time: "",
+      },
+    ];
+  }, [auditPhase, uploadedVideoId, framesAudited, detections.length]);
 
-  // Fetch violations polling
+  // Poll for persisted results while the backend is working. This is the
+  // only results mechanism the backend offers; it reports progress, never
+  // completion.
   React.useEffect(() => {
-    if (!activeVideoId) return;
+    if (!activeVideoId || auditPhase !== "analyzing") return;
+
+    let cancelled = false;
 
     const pollViolations = async () => {
       try {
-        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/violations/${activeVideoId}`);
-        const data = await res.json();
-        if (data.detections) {
-          setDetections(data.detections);
-        }
+        const data = await fetchViolations(activeVideoId);
+        if (cancelled) return;
+        setDetections(data.detections);
+        setFramesAudited(data.frame_count);
       } catch (err) {
-        console.error("Polling error", err);
+        // A transient poll failure is not an audit failure; surface it
+        // without tearing down the workflow state.
+        console.error("Violation poll failed", err);
       }
     };
 
+    void pollViolations();
     pollingRef.current = setInterval(pollViolations, 3000);
-    return () => clearInterval(pollingRef.current);
-  }, [activeVideoId]);
+    return () => {
+      cancelled = true;
+      clearInterval(pollingRef.current);
+    };
+  }, [activeVideoId, auditPhase]);
 
   return (
     <motion.div 
@@ -114,7 +201,13 @@ export default function HUDView() {
               {/* Real-Time Bounding Box Overlay */}
               <div className="absolute inset-0 pointer-events-none">
                 {detections
-                  .filter(d => Math.abs(d.timestamp - currentTime) < 0.5)
+                  // Skip malformed model output rather than rendering NaN.
+                  .filter(isRenderableDetection)
+                  .filter(
+                    (d) =>
+                      typeof d.timestamp === "number" &&
+                      Math.abs(d.timestamp - currentTime) < 0.5
+                  )
                   .map((d, idx) => (
                   <motion.div
                     key={idx}
@@ -122,14 +215,17 @@ export default function HUDView() {
                     animate={{ opacity: 1 }}
                     className="absolute border-2 border-critical shadow-glow-critical rounded-md"
                     style={{
-                      top: `${d.bounding_box[0] / 10}%`,
-                      left: `${d.bounding_box[1] / 10}%`,
-                      height: `${(d.bounding_box[2] - d.bounding_box[0]) / 10}%`,
-                      width: `${(d.bounding_box[3] - d.bounding_box[1]) / 10}%`,
+                      top: `${d.bounding_box![0] / 10}%`,
+                      left: `${d.bounding_box![1] / 10}%`,
+                      height: `${(d.bounding_box![2] - d.bounding_box![0]) / 10}%`,
+                      width: `${(d.bounding_box![3] - d.bounding_box![1]) / 10}%`,
                     }}
                   >
                     <div className="absolute -top-7 left-0 bg-critical text-white text-[10px] font-bold px-3 py-1 rounded-t-md whitespace-nowrap">
-                      {d.category} • {Math.round(d.confidence * 100)}%
+                      {d.category ?? "violation"}
+                      {typeof d.confidence === "number"
+                        ? ` • ${Math.round(d.confidence * 100)}%`
+                        : ""}
                     </div>
                   </motion.div>
                 ))}
@@ -176,48 +272,106 @@ export default function HUDView() {
                 </div>
               </div>
 
-              <button 
-                disabled={!selectedFile || isUploading || !!activeVideoId}
+              {/* Real workflow status. Never reports completion: the backend
+                  has no completion signal (see app/lib/api.ts). */}
+              {auditPhase !== "idle" && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className={cn(
+                    "rounded-2xl border px-5 py-4 text-[10px] font-bold uppercase tracking-widest",
+                    auditPhase === "failed"
+                      ? "border-critical/40 bg-critical/10 text-critical"
+                      : "border-accent/30 bg-accent/5 text-accent"
+                  )}
+                >
+                  {auditPhase === "uploading" && "Uploading payload..."}
+                  {auditPhase === "starting" && "Starting analysis..."}
+                  {auditPhase === "analyzing" && (
+                    <>
+                      Analysis in progress — {framesAudited} frame(s) recorded,{" "}
+                      {detections.length} violation(s) found so far
+                    </>
+                  )}
+                  {auditPhase === "failed" && (
+                    <>
+                      Audit failed: {auditError ?? "unknown error"}
+                    </>
+                  )}
+                </div>
+              )}
+
+              <button
+                data-testid="launch-audit"
+                disabled={
+                  !selectedFile ||
+                  auditPhase === "uploading" ||
+                  auditPhase === "starting" ||
+                  auditPhase === "analyzing"
+                }
                 onClick={async () => {
                   if (!selectedFile) return;
-                  setIsUploading(true);
-                  const video = document.createElement('video');
-                  video.preload = 'metadata';
-                  video.onloadedmetadata = async function() {
-                    window.URL.revokeObjectURL(video.src);
-                    const formData = new FormData();
-                    formData.append('file', selectedFile);
-                    try {
-                      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/upload-reel`, {
-                        method: 'POST',
-                        body: formData,
-                      });
-                      const data = await response.json();
-                      if (data.video_id) {
-                        setActiveVideoId(data.video_id);
-                        setVideoSrc(data.video_url);
-                        setSubmissions(prev => [{
-                          id: data.video_id,
+                  // Hard guard against duplicate submissions.
+                  if (inFlightRef.current) return;
+                  inFlightRef.current = true;
+                  setAuditError(null);
+
+                  try {
+                    // Step 1: upload, unless a previous attempt already
+                    // uploaded this file and only the trigger failed.
+                    let videoId = uploadedVideoId;
+                    if (!videoId) {
+                      setAuditPhase("uploading");
+                      const uploaded = await uploadReel(selectedFile);
+                      videoId = uploaded.video_id;
+                      setUploadedVideoId(videoId);
+                      setActiveVideoId(videoId);
+                      setVideoSrc(uploaded.video_url);
+                      setSubmissions((prev) => [
+                        {
+                          id: videoId,
                           title: selectedFile.name,
-                          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                          status: "READY",
-                          agent: "Nova-01"
-                        }, ...prev]);
-                      }
-                    } catch (err) {
-                      alert("Sync Error");
-                    } finally {
-                      setIsUploading(false);
+                          time: new Date().toLocaleTimeString([], {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          }),
+                          // Reflects the real backend state after upload.
+                          status: "UPLOADED",
+                        },
+                        ...prev,
+                      ]);
                     }
+
+                    // Step 2: actually trigger the analysis pipeline. This
+                    // call was missing entirely, so no upload was ever
+                    // analysed.
+                    setAuditPhase("starting");
+                    await startAnalysis(videoId);
+                    setAuditPhase("analyzing");
+                  } catch (err) {
+                    setAuditError(
+                      err instanceof Error ? err.message : String(err)
+                    );
+                    setAuditPhase("failed");
+                  } finally {
+                    inFlightRef.current = false;
                   }
-                  video.src = URL.createObjectURL(selectedFile);
                 }}
                 className={cn(
                   "w-full h-14 rounded-2xl font-bold text-xs uppercase tracking-widest transition-all",
-                  selectedFile && !activeVideoId ? "bg-accent text-white shadow-xl hover:translate-y-[-2px]" : "bg-white/5 text-white/10"
+                  selectedFile &&
+                    auditPhase !== "uploading" &&
+                    auditPhase !== "starting" &&
+                    auditPhase !== "analyzing"
+                    ? "bg-accent text-white shadow-xl hover:translate-y-[-2px]"
+                    : "bg-white/5 text-white/10"
                 )}
               >
-                {isUploading ? "Syncing..." : "Launch Audit"}
+                {auditPhase === "uploading" && "Uploading..."}
+                {auditPhase === "starting" && "Starting..."}
+                {auditPhase === "analyzing" && "Analyzing..."}
+                {auditPhase === "failed" && "Retry Audit"}
+                {auditPhase === "idle" && "Launch Audit"}
               </button>
             </section>
 
@@ -258,6 +412,7 @@ export default function HUDView() {
                     <div className={cn(
                       "w-1.5 h-1.5 rounded-full mt-2 shrink-0",
                       step.status === 'success' ? "bg-primary shadow-glow" : 
+                      step.status === 'error' ? "bg-critical shadow-glow-critical" :
                       step.status === 'active' ? "bg-accent animate-pulse" : "bg-white/10"
                     )} />
                     <div className="space-y-1">

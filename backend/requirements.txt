@@ -1,8 +1,56 @@
-fastapi
-uvicorn
-python-jose[cryptography]
-motor
-pymongo
-strands-agents
-python-dotenv
-dnspython
+# NovaFlow backend runtime dependencies.
+#
+# Supported Python: 3.11 - 3.14.
+#   * 3.11 is the floor imposed by pymongo, dnspython and Pillow, and matches
+#     the python:3.11-slim base image in Dockerfile.
+#   * Verified installing and importing on 3.14.6 (local development).
+#
+# Policy: direct imports are pinned exactly for reproducibility; transitive
+# dependencies are left to the resolver rather than pinned arbitrarily. A full
+# lock file is a later-phase improvement.
+#
+# NOTE ON FFMPEG: ffmpeg-python below is only a Python wrapper. It requires the
+# separate `ffmpeg` EXECUTABLE on PATH, which pip cannot install. The Dockerfile
+# installs it via apt-get. For local development install it yourself and verify
+# with `ffmpeg -version`. extractor.py and debug_probe.py will not work without
+# the executable, regardless of this package.
+
+# --- web framework ---
+fastapi==0.146.0
+uvicorn==0.54.0
+# Required by FastAPI to parse multipart/form-data. app.py's /upload-reel uses
+# UploadFile = File(...), which raises at request time without this.
+python-multipart==0.0.32
+# Imported directly by app.py, auth.py and projects.py for request/response
+# schemas, so declared explicitly rather than relied on via fastapi.
+pydantic==2.14.1
+
+# --- auth ---
+python-jose[cryptography]==3.5.0
+
+# --- AWS (S3, DynamoDB, Bedrock) ---
+# Imported by analyzer.py, app.py, extractor.py, projects.py, video_stitcher.py,
+# aws_config.py, audit_manager.py, safety.py and automation.py. Its absence from
+# this manifest previously made the backend unimportable from a clean install,
+# because app.py imports projects.py which imports boto3.
+boto3==1.43.114
+
+# --- MongoDB (user accounts) ---
+# pymongo also supplies the `gridfs` and `bson` modules used by
+# audit_manager.py and verifier.py.
+motor==3.7.1
+pymongo==4.19.0
+dnspython==2.9.0
+
+# --- video and image processing ---
+ffmpeg-python==0.2.0
+Pillow==13.0.0
+
+# --- configuration ---
+python-dotenv==1.2.4
+
+# --- agent orchestration ---
+# Used by orchestrator.py for the /execute route. orchestrator.py falls back to
+# stub classes when this import fails; that fallback is a known issue tracked
+# for a later phase. Retained here because it was already a declared dependency.
+strands-agents==1.61.1
