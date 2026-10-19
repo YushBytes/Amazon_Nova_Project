@@ -10,7 +10,9 @@ import HUDView from "./components/HUDView";
 import AgentsView from "./components/AgentsView";
 import LogsView from "./components/LogsView";
 import ClientPortal from "./components/ClientPortal";
-import ProjectDetailView from "./components/ProjectDetailView";
+import ProjectDetailView, {
+  type Submission,
+} from "./components/ProjectDetailView";
 
 type ViewType = "HUD" | "AGENTS" | "LOGS" | "PROFILE" | "CLIENT";
 
@@ -18,7 +20,8 @@ export default function UnifiedCommandCenter() {
   const [mounted, setMounted] = useState(false);
   const { user, logout, isLoading: authLoading } = useAuth();
   const [activeView, setActiveView] = useState<ViewType>("HUD");
-  const [selectedSubmission, setSelectedSubmission] = useState<any>(null);
+  const [selectedSubmission, setSelectedSubmission] =
+    useState<Submission | null>(null);
 
   React.useEffect(() => {
     setMounted(true);
@@ -201,7 +204,9 @@ export default function UnifiedCommandCenter() {
                           ].map((item, i) => (
                             <div key={i} className="flex items-center justify-between p-4 bg-white/[0.02] border border-white/5 rounded-2xl">
                                <span className="text-xs font-bold text-white/80">{item.label}</span>
-                               <span className="text-[10px] font-black text-primary">{item.level} // {item.status}</span>
+                               <span className="text-[10px] font-black text-primary">
+                                {item.level} {"//"} {item.status}
+                              </span>
                             </div>
                           ))}
                        </div>

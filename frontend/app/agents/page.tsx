@@ -99,7 +99,7 @@ export default function AgentsPage() {
           <div className="flex space-x-1.5">
             {[80, 70, 60, 40, 30].map((v, i) => (
               <div key={i} className="flex-1 h-3 bg-white/5 rounded-sm overflow-hidden">
-                 <div className="h-full bg-primary/40" style={{ ["--width" as any]: `${v}%`, width: 'var(--width)' }} />
+                 <div className="h-full bg-primary/40" style={{ width: `${v}%` }} />
               </div>
             ))}
           </div>

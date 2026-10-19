@@ -31,6 +31,7 @@ from orchestrator import NovaFlowOrchestrator
 from automation import NovaFlowAutomation
 
 # Import routers
+import db_init
 import video_repo
 from auth import (
     create_media_token,
@@ -40,7 +41,9 @@ from auth import (
 )
 from config import ALLOWED_UPLOAD_CONTENT_TYPES, ALLOWED_UPLOAD_CONTENT_TYPE_PREFIXES
 from config import get_settings
+from logging_setup import install_log_redaction
 from projects import router as projects_router
+from rate_limit import RateLimitMiddleware, build_credential_rules
 from video_repo import OwnershipUnknown
 
 load_dotenv()
@@ -51,14 +54,27 @@ logger = logging.getLogger(__name__)
 # malformed, or a known-insecure placeholder.
 settings = get_settings()
 
+# Media playback URLs carry a short-lived token in the query string, so strip
+# those values from this process's log records before anything is emitted.
+# External proxy and CDN logs are a separate, deployment-level concern.
+install_log_redaction()
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Best-effort index creation. A missing MongoDB must not prevent startup."""
+    """Repeatable database initialization.
+
+    Best effort: a missing or unreachable MongoDB must not prevent the process
+    from starting. `initialize_database` never modifies account data, and it
+    skips the unique username index (logging counts only) when duplicates
+    would make it fail. Run it deliberately with strict=True to surface that
+    as an error; see docs/SECURITY_OPERATIONS.md.
+    """
     try:
-        await video_repo.ensure_indexes()
+        results = await db_init.initialize_database(strict=False)
+        logger.info("Database initialization results: %s", results)
     except Exception:
         logger.warning(
-            "Could not create video ownership indexes; is MongoDB reachable?"
+            "Database initialization skipped; is MongoDB reachable?"
         )
     yield
 
@@ -71,6 +87,17 @@ app = FastAPI(
     docs_url="/docs" if settings.expose_docs else None,
     redoc_url="/redoc" if settings.expose_docs else None,
     openapi_url="/openapi.json" if settings.expose_docs else None,
+)
+
+# Throttle the credential endpoints. Added before CORS so the limit applies to
+# the request regardless of origin, and implemented as ASGI middleware so a
+# malformed body cannot slip past the counter (a route decorator runs only
+# after validation). Counters are per-process; see rate_limit.py.
+app.add_middleware(
+    RateLimitMiddleware,
+    rules=build_credential_rules(settings),
+    trusted_proxy_count=settings.trusted_proxy_count,
+    enabled=settings.rate_limit_enabled,
 )
 
 # Exact origins only. A wildcard would let any site call the API with a

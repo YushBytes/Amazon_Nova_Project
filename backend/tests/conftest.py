@@ -51,6 +51,46 @@ import pytest  # noqa: E402  (import after sys.path/env setup, intentionally)
 
 
 # ---------------------------------------------------------------------------
+# Rate limiter isolation
+# ---------------------------------------------------------------------------
+
+def _find_rate_limiter(application):
+    """Locate the live RateLimitMiddleware instance in an app's stack."""
+    from rate_limit import RateLimitMiddleware
+
+    if getattr(application, "middleware_stack", None) is None:
+        # Starlette builds this on first request; build it now so the
+        # instance exists and can be reset before the test runs.
+        application.middleware_stack = application.build_middleware_stack()
+
+    node = application.middleware_stack
+    while node is not None:
+        if isinstance(node, RateLimitMiddleware):
+            return node
+        node = getattr(node, "app", None)
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Give every test a fresh rate-limit budget.
+
+    The limiter is real in tests (it is a security control, so disabling it
+    would hide regressions), but its counters live for the life of the
+    process. Without this reset, a test that logs in repeatedly would throttle
+    whichever test happened to run next.
+    """
+    import app as app_module
+
+    limiter = _find_rate_limiter(app_module.app)
+    if limiter is not None:
+        limiter.reset()
+    yield
+    if limiter is not None:
+        limiter.reset()
+
+
+# ---------------------------------------------------------------------------
 # Frames / analyzer fixtures
 # ---------------------------------------------------------------------------
 
@@ -115,14 +155,20 @@ class FakeCollection:
         return None
 
     async def insert_one(self, document):
+        from pymongo.errors import DuplicateKeyError
+
         self._counter += 1
         stored = dict(document)
         stored.setdefault("_id", f"{self.name}-{self._counter}")
-        # Honour a unique index on video_id so duplicate-id behaviour matches
-        # the real collection.
-        if any(idx == ("video_id", True) for idx in self.indexes):
-            if any(d.get("video_id") == stored.get("video_id") for d in self.docs):
-                raise RuntimeError("duplicate key error: video_id")
+        # Honour every unique index that has been declared, and raise the same
+        # exception type the real driver raises, so application code that
+        # catches DuplicateKeyError is genuinely exercised.
+        for field, unique in self.indexes:
+            if not unique:
+                continue
+            value = stored.get(field)
+            if any(d.get(field) == value for d in self.docs):
+                raise DuplicateKeyError(f"E11000 duplicate key error: {field}")
         self.docs.append(stored)
 
         class Result:
@@ -153,8 +199,33 @@ class FakeCollection:
         )
 
     async def create_index(self, field, unique=False):
-        self.indexes.append((field, unique))
+        """Declare an index.
+
+        Mirrors the real driver in the way that matters here: creating a
+        unique index on a collection that already holds duplicates fails.
+        """
+        from pymongo.errors import DuplicateKeyError
+
+        if unique:
+            seen = set()
+            for doc in self.docs:
+                value = doc.get(field)
+                if value in seen:
+                    raise DuplicateKeyError(
+                        f"E11000 duplicate key error: {field} already duplicated"
+                    )
+                seen.add(value)
+        if (field, unique) not in self.indexes:
+            self.indexes.append((field, unique))
         return field
+
+    def insert_raw(self, document):
+        """Insert bypassing index checks, to seed pre-existing bad data."""
+        self._counter += 1
+        stored = dict(document)
+        stored.setdefault("_id", f"{self.name}-{self._counter}")
+        self.docs.append(stored)
+        return stored
 
 
 class FakeDatabase:
@@ -184,7 +255,7 @@ def fake_db(monkeypatch):
 
     monkeypatch.setattr(db_module, "get_database", _get_database)
 
-    for module_name in ("auth", "video_repo"):
+    for module_name in ("auth", "video_repo", "db_init"):
         if module_name in sys.modules:
             monkeypatch.setattr(
                 sys.modules[module_name], "get_database", _get_database, raising=False

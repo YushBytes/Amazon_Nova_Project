@@ -31,7 +31,8 @@ from argon2.exceptions import HashingError, InvalidHashError, VerifyMismatchErro
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from pymongo.errors import DuplicateKeyError
 
 from config import DEFAULT_SIGNUP_ROLE, VALID_ROLES, get_settings
 from db import get_database
@@ -145,8 +146,6 @@ def verify_password(password: str, hashed: object) -> bool:
 SCOPE_ACCESS = "access"
 SCOPE_MEDIA = "media"
 
-MEDIA_TOKEN_TTL_MINUTES = 15
-
 
 def create_access_token(username: str, role: str) -> str:
     """Mint a session token. The role must come from stored account data."""
@@ -174,7 +173,7 @@ def create_media_token(username: str, video_id: str) -> str:
         "scope": SCOPE_MEDIA,
         "vid": video_id,
         "iat": now,
-        "exp": now + timedelta(minutes=MEDIA_TOKEN_TTL_MINUTES),
+        "exp": now + timedelta(minutes=settings.media_token_ttl_minutes),
     }
     return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
@@ -313,6 +312,20 @@ class SignupRequest(BaseModel):
     password: str = Field(min_length=8, max_length=1024)
     role: str | None = None
 
+    @field_validator("username")
+    @classmethod
+    def _no_surrounding_whitespace(cls, value: str) -> str:
+        """Reject names that differ from their trimmed form.
+
+        Applied to NEW accounts only. Existing records are matched exactly and
+        are never rewritten, because silently trimming a stored username would
+        make that account unreachable. Rejecting here stops new
+        " alice" / "alice" confusion from being created.
+        """
+        if value != value.strip():
+            raise ValueError("username must not start or end with whitespace")
+        return value
+
 
 # Retained name for existing callers and tests; signup is the stricter schema.
 AuthRequest = SignupRequest
@@ -364,7 +377,16 @@ async def signup(body: SignupRequest):
         "role": assigned_role,
         "created_at": datetime.now(timezone.utc),
     }
-    await users_collection.insert_one(new_user)
+
+    try:
+        await users_collection.insert_one(new_user)
+    except DuplicateKeyError:
+        # The find_one check above is not atomic. Once the unique index from
+        # db_init exists, a concurrent signup for the same username surfaces
+        # here, and it must look identical to the checked case rather than
+        # becoming an unhandled 500.
+        logger.info("Signup rejected by the unique index (concurrent request)")
+        raise HTTPException(status_code=400, detail="Username already exists")
 
     token = create_access_token(body.username, assigned_role)
     return TokenResponse(access_token=token, role=assigned_role)

@@ -1,12 +1,12 @@
 # Security Implementation Plan — Status
 
-**Phase 3 (Security Hardening)**
-**Last updated:** 2026-10-19 — reflects what is actually implemented, verified
-by the test runs recorded in `docs/SECURITY_AUDIT.md` §4.
+**Phase 3 (Security Hardening) + Phase 3.5 (Security Closure)**
+**Last updated:** 2026-10-19 (Phase 3.5) — reflects what is actually
+implemented, verified by the test runs recorded in `docs/SECURITY_AUDIT.md` §4.
 
 This document is a status record, not a proposal. Nothing below is marked
 complete without a test or command backing it. Findings are identified as
-`S1`–`S13` per `docs/SECURITY_AUDIT.md`.
+`S1`–`S17` per `docs/SECURITY_AUDIT.md` (S14–S17 were added in Phase 3.5).
 
 ---
 
@@ -47,13 +47,43 @@ complete without a test or command backing it. Findings are identified as
 | 31 | Frontend validates the stored session | S13 | `AuthContext` calls `/auth/me` | typecheck + build |
 | 32 | Signup UI states the real role contract | S3 | `frontend/app/login/page.tsx` | typecheck + build |
 
+### Added in Phase 3.5
+
+| # | Workstream | Finding | Where | Evidence |
+| :-- | :-- | :-- | :-- | :-- |
+| 47 | Rate limiting on `/auth/login` and `/auth/signup` | S14 | `backend/rate_limit.py` | `test_security_rate_limit.py` (30) |
+| 48 | Limits configurable, validated at startup | S14 | `config.load_rate_limit_*` | `test_limits_are_configurable`, `test_malformed_limit_string_fails_at_startup` |
+| 49 | 429 with `Retry-After`, `X-RateLimit-*`, `Cache-Control: no-store` | S14 | `RateLimitMiddleware._reject` | `test_throttled_response_carries_retry_after_and_no_store` |
+| 50 | Malformed bodies cannot bypass the limit | S14 | ASGI middleware, not a route decorator | `test_malformed_requests_consume_the_limit` (+2 variants) |
+| 51 | Trailing-slash paths cannot evade a rule | S14 | `RateLimitMiddleware.__call__` | `test_trailing_slash_cannot_evade_the_rule` |
+| 52 | Budget recovers after the window | S14 | `MovingWindowRateLimiter` | `test_budget_recovers_after_the_window` (clock patched, not slept) |
+| 53 | `X-Forwarded-For` ignored unless proxies configured | S14 | `rate_limit.client_identifier` | `test_spoofed_forwarded_header_cannot_mint_new_buckets` |
+| 54 | Throttle logs omit username and password | S14 | `RateLimitMiddleware._reject` | `test_throttle_logging_does_not_include_credentials` |
+| 55 | `users.username` unique index, duplicate-aware | S16 | `backend/db_init.py` | `test_security_db_integrity.py` (26) |
+| 56 | Duplicate report exposes counts only | S16 | `find_duplicate_username_counts` | `test_duplicate_report_never_exposes_usernames` |
+| 57 | Blocked migration modifies no account | S16 | `ensure_user_indexes` | `test_no_account_is_modified_or_removed_by_a_blocked_migration` |
+| 58 | Signup handles `DuplicateKeyError` cleanly | S16 | `auth.signup` | `test_signup_survives_a_duplicate_key_race` |
+| 59 | New usernames reject surrounding whitespace | S16 | `SignupRequest` validator | 4 parametrised cases |
+| 60 | Existing untrimmed usernames still log in | S16 | exact matching preserved | `test_existing_untrimmed_username_can_still_log_in` |
+| 61 | One `video_id` cannot acquire two owners | S5/S16 | unique index + `record_video` | `test_duplicate_video_id_cannot_create_a_second_owner` |
+| 62 | Ownership cannot be claimed by supplying an id | S5 | server-generated ids | `test_ownership_cannot_be_claimed_by_supplying_an_id` |
+| 63 | Media tokens redacted from this process's logs | S15 | `backend/logging_setup.py` | `test_security_media_tokens.py` (20) |
+| 64 | Redaction handles URL objects, not just strings | S15 | `RedactQueryStringFilter._redact_args` | `test_access_log_filter_redacts_the_token` |
+| 65 | Media TTL configurable and short | S15 | `MEDIA_TOKEN_TTL_MINUTES` | `test_media_token_lifetime_is_configurable` |
+| 66 | Media token is read-only and single-resource | S15 | `auth._decode` scopes | `test_media_token_grants_read_only` |
+| 67 | Tokens not persisted in records or browser storage | S15 | `/submissions` mints fresh | `test_ownership_record_does_not_store_the_token`; dead `localStorage` read removed from `HUDView` |
+| 68 | Frontend handles 429 distinctly from 401 | S14 | `frontend/app/login/page.tsx` | `app/login/page.test.tsx` (8) |
+| 69 | Least-privilege IAM template | S17 | `infra/iam_policy_least_privilege.json` | JSON validated; 7 statements; no invented identifiers |
+| 70 | Zero frontend lint errors | — | 8 `any`/JSX errors fixed | `npm run lint`: 0 errors (was 8) |
+| 71 | Operator runbook | all | `docs/SECURITY_OPERATIONS.md` | — |
+
 ---
 
 ## 2. Partially implemented
 
 | # | Item | What was done | What remains |
 | :-- | :-- | :-- | :-- |
-| 33 | Unique indexes (S12) | `videos.video_id` unique index created at startup | `users.username` unique index is **not** created automatically — it would fail on an existing deployment holding duplicates. Operator step documented in `SECURITY_AUDIT.md` §5. |
+| 33 | Unique indexes (S12/S16) | **Closed in Phase 3.5.** `db_init.initialize_database` creates both the `videos` and `users.username` indexes, detecting duplicates first and skipping safely. | If duplicates already exist the index is skipped (logged, counts only) until an operator resolves them — `SECURITY_OPERATIONS.md` §4.3. |
 | 34 | Pre-existing uploads (S5) | New uploads record ownership; videos without a record are denied | Videos uploaded before this phase are **inaccessible**. Their uploader was never recorded, so they cannot be attributed retroactively. Operator must delete or backfill. |
 | 35 | Agent role grant (S3) | Role is no longer self-assignable | Granting is a **manual, unaudited** database update. No API, by instruction. |
 
@@ -66,12 +96,12 @@ None is claimed as done.
 
 | # | Item | Finding | Why deferred |
 | :-- | :-- | :-- | :-- |
-| 36 | Rate limiting on auth endpoints | — | Out of scope. **Genuinely missing**: credential stuffing is unthrottled. Highest-priority follow-up. |
+| ~~36~~ | ~~Rate limiting on auth endpoints~~ | S14 | **Closed in Phase 3.5** — see items 47-54. One caveat remains: counters are per-process, so the limit is multiplied by the worker count. Not distributed protection; `SECURITY_OPERATIONS.md` §3.2. |
 | 37 | Refresh tokens / httpOnly cookies | S13 | Session-architecture change the brief excludes. |
 | 38 | Server-side token revocation | S13 | Same. Rotating `JWT_SECRET_KEY` is the only break-glass today. |
 | 39 | Role-management API or admin UI | S3 | Brief excludes adding one. |
-| 40 | S3 bucket hardening (public-access block, encryption, versioning) | Phase 1 §10.3 | Cloud configuration; no live AWS calls permitted this phase. |
-| 41 | IAM policy fixes (no DynamoDB permissions; `bedrock:InvokeModel` on `*`) | Phase 1 §10.3 | Same. |
+| 40 | S3 bucket hardening (public-access block, encryption, versioning) | Phase 1 §10.3 | Still **not applied**: it is bucket configuration, not code. The required settings are now enumerated in `SECURITY_OPERATIONS.md` §7.4 and in the template's `_BUCKET_HARDENING_NOT_EXPRESSIBLE_HERE` block. No live AWS call was made. |
+| 41 | IAM policy fixes | S17 | **Template provided** in Phase 3.5 (`infra/iam_policy_least_privilege.json`), derived from the boto3 calls the code actually makes. Applying it is an operator action, and the bucket naming conflict must be resolved first (`SECURITY_OPERATIONS.md` §7.1). The existing `infra/iam_policy.yaml` was deliberately left unchanged rather than edited with guessed resource names. |
 | 42 | Content scanning of uploaded media | S7 | Brief excludes a scanning service. An extension allowlist is **not** claimed to prove a file is safe. |
 | 43 | Password-strength rules beyond length | S2 | Minimum length only, on signup. |
 | 44 | Multi-factor authentication | — | Not in scope. |
@@ -99,9 +129,26 @@ Preserved to stay within scope and avoid regressions:
 
 ---
 
+## 4A. Phase 3.5 scope decisions worth recording
+
+| Decision | Why |
+| :-- | :-- |
+| ASGI middleware instead of slowapi's decorator | Measured: with the decorator, 10 malformed requests left a `3/minute` budget fully intact, so a malformed body was an unlimited bypass. `slowapi` was installed, tested for runtime compatibility, then **uninstalled** and not declared; the project depends on `limits` directly, which is the engine slowapi itself uses. |
+| In-memory storage, no Redis | A shared store is the correct answer for multi-instance deployments, but provisioning one is a deployment decision. Shipping an unconfigured production dependency would be worse than a documented limitation. |
+| `X-Forwarded-For` ignored by default | Trusting it without a known proxy depth lets a client mint a fresh bucket per request, defeating the limit entirely. |
+| Usernames still matched exactly | Trimming or lower-casing on read would make existing `" alice"` / `"Alice"` accounts unreachable. New signups reject surrounding whitespace; normalising existing data is an operator decision. |
+| `infra/iam_policy.yaml` left in place | Editing it would require inventing bucket names and an account id. A placeholder template was added alongside it instead. |
+| 22 frontend lint warnings left | Unused imports and `<img>` suggestions in views unrelated to security. Fixing them would mean touching components outside this phase's scope; suppressing the rules would hide real issues later. |
+
+---
+
 ## 5. Known limitations
 
-1. **No rate limiting.** The most significant remaining gap (#36).
+1. **Rate limiting is per-process**, so the effective limit scales with the
+   worker count. Accurate for the current single-process Dockerfile; not
+   distributed protection (#36, `SECURITY_OPERATIONS.md` §3.2). There is also
+   no per-account throttle, so an attacker rotating source addresses can still
+   target one account slowly.
 2. **No revocation.** A stolen token is valid until expiry unless the signing
    key is rotated (S13).
 3. **Media tokens live in URLs.** Necessary so `<video src>` works; they are
@@ -110,12 +157,23 @@ Preserved to stay within scope and avoid regressions:
    `app.serve_upload`.
 4. **Argon2 parameters unbenchmarked.** Library defaults; not tuned against
    production hardware.
-5. **The in-memory MongoDB fake is not MongoDB.** Tests exercise application
-   logic, not real driver or index behaviour.
+5. **Real-MongoDB integration tests are written but UNVERIFIED.**
+   `tests/test_integration_mongodb.py` covers real unique-index enforcement,
+   duplicate-key handling, conditional legacy-password migration, concurrent
+   logins, and ownership scoping. They could **not be executed**: no MongoDB
+   was reachable and the Docker daemon was not responding. 10 safety-guard
+   tests (which need no database) do pass, proving the guard refuses any
+   target it cannot confirm is disposable. Run
+   `pytest -m requires_mongodb` with `MONGODB_TEST_URL` set.
 6. **No live-service verification.** AWS, Bedrock, and MongoDB were mocked
-   throughout; nothing was deployed.
+   throughout both phases; nothing was deployed, and no live IAM role, bucket
+   policy, or table was changed.
+7. **Log redaction covers this process only.** Proxy, CDN, and platform access
+   logs, plus browser history and `Referer`, are outside it
+   (`SECURITY_OPERATIONS.md` §8.3).
 
 ---
 
-*See `docs/SECURITY_AUDIT.md` for per-finding detail and the operator action
-list, and `docs/RELEASE_CHECKLIST.md` for the release gate.*
+*See `docs/SECURITY_AUDIT.md` for per-finding detail,
+`docs/SECURITY_OPERATIONS.md` for the operator runbook, and
+`docs/RELEASE_CHECKLIST.md` for the release gate.*

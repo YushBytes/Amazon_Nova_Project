@@ -1,0 +1,191 @@
+{
+  "_README": [
+    "NovaFlow / Brand Guardian - least-privilege IAM policy TEMPLATE (Phase 3.5).",
+    "",
+    "THIS IS A TEMPLATE, NOT A DEPLOYABLE POLICY. Every ${PLACEHOLDER} below must",
+    "be replaced with a real value before use. No account id, bucket name, or",
+    "table name has been invented here: the repository contains two conflicting",
+    "bucket naming schemes (application code defaults to 'novaflow-media' while",
+    "infra/init_s3.py creates 'brand-guardian-raw' and 'brand-guardian-final'),",
+    "so an operator must resolve that first. See docs/SECURITY_OPERATIONS.md.",
+    "",
+    "Placeholders:",
+    "  ${AWS_REGION}              e.g. the region in AWS_REGION",
+    "  ${AWS_ACCOUNT_ID}          your 12-digit account id",
+    "  ${S3_BUCKET_NAME}          value of the S3_BUCKET_NAME env var",
+    "  ${DYNAMODB_FRAMES_TABLE}   value of DYNAMODB_TABLE_NAME (default NovaFlowFrames)",
+    "  ${DYNAMODB_PROJECTS_TABLE} the projects table (code hardcodes NovaFlowProjects)",
+    "",
+    "Actions were derived from the boto3 calls the code actually makes, not from",
+    "the previous policy. Differences from infra/iam_policy.yaml:",
+    "  * bedrock:InvokeModel was scoped from Resource '*' to specific models.",
+    "  * DynamoDB permissions were MISSING entirely; the app could not run.",
+    "  * Bucket ARNs now come from a placeholder rather than a hardcoded name.",
+    "  * s3:ListBucket is constrained to the prefixes the app actually lists.",
+    "  * aws:SecureTransport is required, so plaintext calls are denied.",
+    "",
+    "Remove this _README key before applying; it is documentation, not policy."
+  ],
+
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyUnencryptedTransport",
+      "Effect": "Deny",
+      "Action": [
+        "s3:*",
+        "dynamodb:*",
+        "bedrock:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    },
+
+    {
+      "Sid": "BedrockInvokeNovaProOnly",
+      "_comment": [
+        "backend/analyzer.py and backend/audit_manager.py call invoke_model with",
+        "modelId 'amazon.nova-pro-v1:0'. The streaming variant is NOT used by any",
+        "code path; add bedrock:InvokeModelWithResponseStream only if that",
+        "changes. The Nova Canvas entry is commented out below because the only",
+        "call site (audit_manager.remediate_frame) is disabled - grant it when",
+        "remediation is actually implemented."
+      ],
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModel",
+      "Resource": [
+        "arn:aws:bedrock:${AWS_REGION}::foundation-model/amazon.nova-pro-v1:0"
+      ]
+    },
+
+    {
+      "Sid": "S3FrameAndReelObjects",
+      "_comment": [
+        "put_object  - extractor.py writes frames/{video_id}/frame_NNNN.jpg",
+        "get_object  - analyzer.py reads those frames back",
+        "download_file - video_stitcher.py (GetObject under the hood)",
+        "generate_presigned_url for put_object - projects.py raw/ uploads",
+        "Scoped to the two prefixes in use so the role cannot touch anything",
+        "else in the bucket."
+      ],
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET_NAME}/frames/*",
+        "arn:aws:s3:::${S3_BUCKET_NAME}/raw/*"
+      ]
+    },
+
+    {
+      "Sid": "S3ListOnlyUsedPrefixes",
+      "_comment": [
+        "ListBucket is a bucket-level action, constrained by prefix condition so",
+        "the role cannot enumerate the whole bucket."
+      ],
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "frames/*",
+            "raw/*"
+          ]
+        }
+      }
+    },
+
+    {
+      "Sid": "DynamoDbFramesTable",
+      "_comment": [
+        "put_item/update_item - extractor.py and analyzer.py",
+        "query               - app.py /violations and video_stitcher.py",
+        "scan                - analyzer.check_pending_frames (acknowledged as a",
+        "                      POC shortcut; remove this action once a GSI on",
+        "                      status replaces the scan).",
+        "No DeleteItem: no code path deletes a frame record."
+      ],
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:Scan"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${DYNAMODB_FRAMES_TABLE}"
+      ]
+    },
+
+    {
+      "Sid": "DynamoDbProjectsTable",
+      "_comment": [
+        "projects.py: put_item (create), get_item (read), update_item (accept,",
+        "review, upload-init), scan (marketplace listing - also a POC shortcut).",
+        "No DeleteItem: no code path deletes a project."
+      ],
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Scan"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${DYNAMODB_PROJECTS_TABLE}"
+      ]
+    },
+
+    {
+      "Sid": "CloudWatchLogs",
+      "_comment": "Scoped to this application's log group rather than logs:*:*:*.",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:/novaflow/*:*"
+      ]
+    }
+  ],
+
+  "_NOT_GRANTED": {
+    "_comment": [
+      "Deliberately withheld. Add only when the corresponding feature is",
+      "actually implemented, and never to make a failing call succeed."
+    ],
+    "bedrock:InvokeModelWithResponseStream": "No code path streams a response.",
+    "amazon.nova-canvas-v1:0": "audit_manager.remediate_frame's invoke_model call is commented out; remediation is a later phase.",
+    "bedrock:ApplyGuardrail": "backend/safety.py is never imported by the running app. Grant with the guardrail ARN if it is wired up.",
+    "states:*": "backend/aws_config.py builds a Step Functions client that no code uses.",
+    "s3:CreateBucket": "infra/init_s3.py is an operator bootstrap script and should run under separate administrative credentials, not the application role.",
+    "s3:DeleteObject": "No code path deletes an S3 object. A retention/cleanup job would need this explicitly.",
+    "dynamodb:DeleteItem": "No code path deletes a record.",
+    "dynamodb:CreateTable": "Table provisioning is an operator action; see docs/SECURITY_OPERATIONS.md.",
+    "logs:CreateLogGroup": "Create the log group once, out of band, so the running role cannot create arbitrary groups."
+  },
+
+  "_BUCKET_HARDENING_NOT_EXPRESSIBLE_HERE": {
+    "_comment": [
+      "These are bucket and account settings, not identity-policy statements.",
+      "They are listed so they are not forgotten; apply them to the bucket",
+      "itself. infra/init_s3.py currently creates buckets with none of them."
+    ],
+    "PublicAccessBlockConfiguration": "BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets - all true.",
+    "BucketEncryption": "SSE-S3 (AES256) at minimum, or SSE-KMS with a CMK.",
+    "Versioning": "Enabled, so an overwritten frame or reel is recoverable.",
+    "BucketPolicy": "Add an explicit Deny for aws:SecureTransport=false at the bucket level too, so the constraint does not depend on the caller's identity policy.",
+    "LifecycleConfiguration": "Expire or transition frames/ and raw/ objects per the retention decision in docs/SECURITY_OPERATIONS.md.",
+    "ServerAccessLogging_or_CloudTrailDataEvents": "Needed to audit who read a reel; neither is configured today.",
+    "OwnershipControls": "BucketOwnerEnforced, which disables ACLs entirely."
+  }
+}

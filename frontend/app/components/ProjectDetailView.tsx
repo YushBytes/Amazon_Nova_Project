@@ -14,16 +14,32 @@ import {
   Zap
 } from "lucide-react";
 import { motion } from "framer-motion";
+import type { Submission } from "../lib/api";
 
-interface Submission {
-  id: string;
-  filename: string;
-  title: string;
-  agent: string;
-  time: string;
-  status: string;
-  url: string;
-  size: string;
+export type { Submission };
+
+// The shape is imported from the API client so this view cannot drift from
+// the backend contract. The previous local interface required `agent`, `time`
+// and `size`, which the backend fabricated and no longer returns; rendering
+// them yielded "undefined" once /submissions began returning real records.
+
+/** Render an ISO timestamp as a short local date-time, or a dash. */
+function formatUploadedAt(iso?: string | null): string {
+  if (!iso) return "--";
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return "--";
+  return parsed.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Render a byte count as MB, or a dash. */
+function formatSize(bytes?: number): string {
+  if (typeof bytes !== "number" || bytes <= 0) return "--";
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 export default function ProjectDetailView({ 
@@ -87,8 +103,16 @@ export default function ProjectDetailView({
             
             {[
               { icon: Database, label: "Filename", value: submission.filename },
-              { icon: Clock, label: "Last Modified", value: submission.time },
-              { icon: HardDrive, label: "Filesize", value: submission.size },
+              {
+                icon: Clock,
+                label: "Uploaded",
+                value: formatUploadedAt(submission.created_at),
+              },
+              {
+                icon: HardDrive,
+                label: "Filesize",
+                value: formatSize(submission.size_bytes),
+              },
               { icon: Cpu, label: "Encoding", value: "H.265 Neural" }
             ].map((item, i) => (
               <div key={i} className="flex items-center space-x-5 group">

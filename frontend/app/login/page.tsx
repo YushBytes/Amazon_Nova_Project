@@ -32,12 +32,42 @@ export default function LoginPage() {
         body: JSON.stringify({ username, password }),
       });
 
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Authentication failed");
+      // A throttled response may not carry a JSON body, so read it
+      // defensively rather than assuming one.
+      let detail: string | undefined;
+      try {
+        const data = await response.json();
+        detail = typeof data?.detail === "string" ? data.detail : undefined;
 
-      login(data.access_token, data.role, username);
-    } catch (err: any) {
-      setError(err.message);
+        if (response.ok) {
+          login(data.access_token, data.role, username);
+          return;
+        }
+      } catch {
+        // Non-JSON body; fall through to the status-based message below.
+      }
+
+      if (response.status === 429) {
+        // The credential endpoints are rate limited. Surface the wait time
+        // from Retry-After so the user knows this is temporary rather than a
+        // rejected password.
+        const retryAfter = Number(response.headers.get("Retry-After"));
+        const wait =
+          Number.isFinite(retryAfter) && retryAfter > 0
+            ? `${retryAfter} second${retryAfter === 1 ? "" : "s"}`
+            : "a moment";
+        setError(`Too many attempts. Please wait ${wait} and try again.`);
+        return;
+      }
+
+      setError(detail || "Authentication failed");
+    } catch (err: unknown) {
+      // Network or unexpected failure. Never surface a raw object.
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : "Could not reach the server. Please try again."
+      );
     } finally {
       setIsLoading(false);
     }

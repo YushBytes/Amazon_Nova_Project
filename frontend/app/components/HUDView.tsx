@@ -43,9 +43,17 @@ function cn(...inputs: ClassValue[]) {
  */
 type AuditPhase = "idle" | "uploading" | "starting" | "analyzing" | "failed";
 
+/** The local record shown in this view's recent-uploads list. */
+interface SubmissionSummary {
+  id: string;
+  title: string;
+  time: string;
+  status: string;
+}
+
 export default function HUDView() {
   const [goal, setGoal] = React.useState("");
-  const [submissions, setSubmissions] = React.useState<any[]>([]);
+  const [submissions, setSubmissions] = React.useState<SubmissionSummary[]>([]);
   const [activeVideoId, setActiveVideoId] = React.useState<string | null>(null);
   const [detections, setDetections] = React.useState<Detection[]>([]);
   const [currentTime, setCurrentTime] = React.useState(0);
@@ -62,21 +70,18 @@ export default function HUDView() {
   const inFlightRef = React.useRef(false);
   const videoInputRef = React.useRef<HTMLInputElement>(null);
   const videoRef = React.useRef<HTMLVideoElement>(null);
-  const pollingRef = React.useRef<any>(null);
+  const pollingRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [videoSrc, setVideoSrc] = React.useState<string | null>(null);
   const [selectedFile, setSelectedFile] = React.useState<File | null>(null);
   const [activeTab, setActiveTab] = React.useState("Overview");
 
-  React.useEffect(() => {
-    const handleStorage = () => {
-      const saved = JSON.parse(localStorage.getItem("novaflow_submissions") || "[]");
-      setSubmissions(saved);
-    };
-    handleStorage();
-    window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
-  }, []);
+  // The recent-uploads list is session state only. It was previously
+  // hydrated from a "novaflow_submissions" localStorage key that nothing ever
+  // wrote, so the read was dead code. It is removed rather than implemented:
+  // submission URLs carry a short-lived media token, and persisting them in
+  // browser storage would outlive the token's purpose. /submissions is the
+  // authoritative, owner-scoped source.
 
   // Real pipeline telemetry, derived from actual workflow state. This
   // previously rendered a fixed, fabricated list ('4096 clusters synced') that
@@ -155,7 +160,10 @@ export default function HUDView() {
     pollingRef.current = setInterval(pollViolations, 3000);
     return () => {
       cancelled = true;
-      clearInterval(pollingRef.current);
+      if (pollingRef.current !== null) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+      }
     };
   }, [activeVideoId, auditPhase]);
 
@@ -192,7 +200,9 @@ export default function HUDView() {
             <div className="aspect-video relative">
               <video 
                 ref={videoRef}
-                onTimeUpdate={(e) => setCurrentTime((e.target as any).currentTime)}
+                onTimeUpdate={(e) =>
+                  setCurrentTime(e.currentTarget.currentTime)
+                }
                 src={videoSrc || "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"}
                 className="w-full h-full object-cover"
                 controls
@@ -324,12 +334,15 @@ export default function HUDView() {
                       setAuditPhase("uploading");
                       const uploaded = await uploadReel(selectedFile);
                       videoId = uploaded.video_id;
-                      setUploadedVideoId(videoId);
-                      setActiveVideoId(videoId);
+                      // Bound to a non-nullable local so the list entry
+                      // cannot be built with a null id.
+                      const newVideoId: string = videoId;
+                      setUploadedVideoId(newVideoId);
+                      setActiveVideoId(newVideoId);
                       setVideoSrc(uploaded.video_url);
                       setSubmissions((prev) => [
                         {
-                          id: videoId,
+                          id: newVideoId,
                           title: selectedFile.name,
                           time: new Date().toLocaleTimeString([], {
                             hour: "2-digit",
@@ -430,7 +443,7 @@ export default function HUDView() {
             <div className="pt-10 border-t border-white/5 space-y-8 flex-1">
               <h3 className="text-[10px] font-bold uppercase tracking-[0.3em] text-white/20">Audit Pipeline</h3>
               <div className="space-y-4">
-                {submissions.slice(0, 4).map((sub: any) => (
+                {submissions.slice(0, 4).map((sub) => (
                   <div key={sub.id} className="flex items-center justify-between p-5 rounded-2xl bg-white/[0.01] border border-white/5 hover:bg-white/[0.03] transition-colors group">
                     <div className="flex items-center space-x-4 min-w-0">
                       <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center shrink-0">
@@ -438,7 +451,7 @@ export default function HUDView() {
                       </div>
                       <div className="min-w-0">
                         <p className="text-xs font-bold text-white truncate">{sub.title}</p>
-                        <p className="text-[9px] text-white/20 font-medium uppercase tracking-tighter mt-1">{sub.agent} • {sub.time}</p>
+                        <p className="text-[9px] text-white/20 font-medium uppercase tracking-tighter mt-1">{sub.time}</p>
                       </div>
                     </div>
                     <div className="flex items-center space-x-3 ml-4">

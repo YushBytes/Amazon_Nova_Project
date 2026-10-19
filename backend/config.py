@@ -14,10 +14,22 @@ Environment variables (names only; never commit values):
                             Optional. Default 1440 (24h), preserving the
                             previous session lifetime.
     MAX_UPLOAD_BYTES        Optional. Default 104857600 (100 MiB).
+    MEDIA_TOKEN_TTL_MINUTES Optional. Lifetime of the video playback token
+                            carried in the ?access_token query parameter.
+                            Default 15. Keep it short: it appears in URLs.
     ALLOWED_VIDEO_EXTENSIONS
                             Optional. Comma-separated. Default mp4,mov,avi,webm,mkv.
     CORS_ALLOWED_ORIGINS    Optional. Comma-separated exact origins.
                             Default http://localhost:3000.
+    RATE_LIMIT_ENABLED      Optional. "false" disables the limiter entirely.
+                            Default true.
+    RATE_LIMIT_LOGIN        Optional. Limit string for POST /auth/login.
+                            Default "5/minute;20/hour".
+    RATE_LIMIT_SIGNUP       Optional. Limit string for POST /auth/signup.
+                            Default "3/minute;10/hour".
+    TRUSTED_PROXY_COUNT     Optional. Number of trusted reverse proxies in
+                            front of the app. 0 (default) means
+                            X-Forwarded-For is IGNORED entirely.
 
 See .env.example for a placeholder template.
 """
@@ -137,15 +149,6 @@ def load_jwt_secret() -> str:
     return secrets.token_urlsafe(48)
 
 
-def load_algorithm() -> str:
-    algorithm = (os.getenv("JWT_ALGORITHM") or "HS256").strip().upper()
-    if algorithm not in SUPPORTED_ALGORITHMS:
-        raise ConfigurationError(
-            f"JWT_ALGORITHM must be one of {sorted(SUPPORTED_ALGORITHMS)}."
-        )
-    return algorithm
-
-
 def _int_env(name: str, default: int, minimum: int = 1) -> int:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -157,6 +160,27 @@ def _int_env(name: str, default: int, minimum: int = 1) -> int:
     if value < minimum:
         raise ConfigurationError(f"{name} must be >= {minimum}.")
     return value
+
+
+def load_algorithm() -> str:
+    algorithm = (os.getenv("JWT_ALGORITHM") or "HS256").strip().upper()
+    if algorithm not in SUPPORTED_ALGORITHMS:
+        raise ConfigurationError(
+            f"JWT_ALGORITHM must be one of {sorted(SUPPORTED_ALGORITHMS)}."
+        )
+    return algorithm
+
+
+def load_media_token_ttl_minutes() -> int:
+    """Lifetime of a video playback token.
+
+    Deliberately short and separate from the session lifetime: this token
+    travels in a URL query string, so it can end up in browser history, a
+    Referer header, and any proxy log outside this process. 15 minutes is long
+    enough to start playback and short enough to limit the damage if a URL
+    leaks.
+    """
+    return _int_env("MEDIA_TOKEN_TTL_MINUTES", 15, minimum=1)
 
 
 def load_token_lifetime_minutes() -> int:
@@ -220,6 +244,83 @@ ALLOWED_UPLOAD_CONTENT_TYPES = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+# Defaults are deliberately strict for credential endpoints and far below what
+# a human types by hand. Login is the credential-stuffing target, so it gets a
+# small per-minute budget plus an hourly ceiling that a slow attacker cannot
+# walk around. Signup is lower still: a legitimate visitor registers once.
+DEFAULT_RATE_LIMIT_LOGIN = "5/minute;20/hour"
+DEFAULT_RATE_LIMIT_SIGNUP = "3/minute;10/hour"
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be a boolean value.")
+
+
+def load_rate_limit_enabled() -> bool:
+    return _bool_env("RATE_LIMIT_ENABLED", True)
+
+
+def _validate_limit_string(name: str, raw: str) -> str:
+    """Check a limit string parses before the app starts serving.
+
+    Format is one or more `<count>/<period>` rules separated by ";", e.g.
+    "5/minute;20/hour". Validation happens here so a typo fails at startup
+    rather than at the first login attempt.
+    """
+    from limits import parse
+
+    cleaned = raw.strip()
+    if not cleaned:
+        raise ConfigurationError(f"{name} is set but empty.")
+    for part in cleaned.split(";"):
+        part = part.strip()
+        if not part:
+            raise ConfigurationError(f"{name} contains an empty rule.")
+        try:
+            parse(part)
+        except Exception as exc:
+            raise ConfigurationError(
+                f"{name} contains an unparseable rule. Expected forms like "
+                f"'5/minute' or '20/hour'."
+            ) from exc
+    return cleaned
+
+
+def load_rate_limit_login() -> str:
+    return _validate_limit_string(
+        "RATE_LIMIT_LOGIN", os.getenv("RATE_LIMIT_LOGIN") or DEFAULT_RATE_LIMIT_LOGIN
+    )
+
+
+def load_rate_limit_signup() -> str:
+    return _validate_limit_string(
+        "RATE_LIMIT_SIGNUP", os.getenv("RATE_LIMIT_SIGNUP") or DEFAULT_RATE_LIMIT_SIGNUP
+    )
+
+
+def load_trusted_proxy_count() -> int:
+    """How many reverse proxies sit in front of this app.
+
+    0 means X-Forwarded-For is ignored completely and the peer address is used.
+    That is the safe default: a client can put anything in X-Forwarded-For, so
+    honouring it without a known proxy depth lets an attacker mint a fresh
+    rate-limit bucket per request.
+    """
+    return _int_env("TRUSTED_PROXY_COUNT", 0, minimum=0)
+
+
+# ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------
 
@@ -255,9 +356,14 @@ class Settings:
         self.jwt_secret = load_jwt_secret()
         self.jwt_algorithm = load_algorithm()
         self.access_token_expire_minutes = load_token_lifetime_minutes()
+        self.media_token_ttl_minutes = load_media_token_ttl_minutes()
         self.max_upload_bytes = load_max_upload_bytes()
         self.allowed_video_extensions = load_allowed_video_extensions()
         self.cors_origins = load_cors_origins()
+        self.rate_limit_enabled = load_rate_limit_enabled()
+        self.rate_limit_login = load_rate_limit_login()
+        self.rate_limit_signup = load_rate_limit_signup()
+        self.trusted_proxy_count = load_trusted_proxy_count()
         # API docs expose the full route surface; keep them off in production
         # unless an operator explicitly opts in.
         self.expose_docs = not self.is_production or (
@@ -271,9 +377,14 @@ class Settings:
             f"Settings(environment={self.environment!r}, "
             f"jwt_algorithm={self.jwt_algorithm!r}, "
             f"access_token_expire_minutes={self.access_token_expire_minutes}, "
+            f"media_token_ttl_minutes={self.media_token_ttl_minutes}, "
             f"max_upload_bytes={self.max_upload_bytes}, "
             f"allowed_video_extensions={sorted(self.allowed_video_extensions)}, "
             f"cors_origins={self.cors_origins}, "
+            f"rate_limit_enabled={self.rate_limit_enabled}, "
+            f"rate_limit_login={self.rate_limit_login!r}, "
+            f"rate_limit_signup={self.rate_limit_signup!r}, "
+            f"trusted_proxy_count={self.trusted_proxy_count}, "
             f"expose_docs={self.expose_docs}, jwt_secret=<redacted>)"
         )
 

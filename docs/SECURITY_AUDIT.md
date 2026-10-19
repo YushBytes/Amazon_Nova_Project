@@ -1,7 +1,7 @@
 # NovaFlow / Brand Guardian — Security Audit and Remediation
 
-**Phase:** 3 (Security Hardening)
-**Date:** 2026-10-19
+**Phase:** 3 (Security Hardening), extended by Phase 3.5 (Security Closure)
+**Date:** 2026-10-19 (Phase 3), updated 2026-10-19 (Phase 3.5)
 **Scope:** `backend/` and the frontend code that talks to it. The S3 + DynamoDB
 analysis pipeline, MongoDB account store, and Next.js frontend architecture are
 unchanged.
@@ -38,6 +38,10 @@ No secret value appears in this document.
 | S11 | Duplicate `/auth/docs` surface from a mounted sub-app | **Low** | Fixed |
 | S12 | No username uniqueness constraint | **Low** | Partially mitigated |
 | S13 | Tokens in `localStorage`, no revocation | **Medium** | Accepted, documented |
+| S14 | No rate limiting on the credential endpoints | **High** | Fixed (Phase 3.5) |
+| S15 | Media tokens recorded in application logs | **Medium** | Fixed (Phase 3.5) |
+| S16 | `users.username` had no unique index | **Low** | Fixed (Phase 3.5) |
+| S17 | Overbroad / incomplete IAM policy | **Medium** | Template provided; operator action |
 
 ---
 
@@ -418,6 +422,145 @@ there is one OpenAPI schema, one CORS policy, and no second docs surface.
 
 ---
 
+### S14 — No rate limiting on the credential endpoints — **High** — Fixed (Phase 3.5)
+
+**Verified.** A grep for any limiter across the backend returned nothing:
+`/auth/login` and `/auth/signup` were bounded only by network speed.
+
+**Impact.** Unlimited credential stuffing against any known username, and
+unlimited account creation. The uniform-401 response (S6) stops enumeration
+telling an attacker *which* usernames exist, but nothing stopped them guessing
+passwords as fast as the network allowed.
+
+**Remediation.** `backend/rate_limit.py` adds ASGI middleware enforcing
+per-path, per-client limits (defaults `5/minute;20/hour` for login,
+`3/minute;10/hour` for signup, all configurable). Returns 429 with
+`Retry-After`, `X-RateLimit-*`, and `Cache-Control: no-store`.
+
+Two design points, both chosen after testing the alternative:
+
+1. **Middleware, not a route decorator.** The idiomatic FastAPI approach is
+   slowapi's `@limiter.limit(...)`. Measured against this stack, a request with
+   a malformed body returns 422 **without consuming the budget** — 10 malformed
+   requests left a `3/minute` budget fully intact, giving an attacker an
+   unlimited channel through the same route. The middleware runs before routing
+   and validation, so every request counts.
+2. **The peer address, not `X-Forwarded-For`.** With `TRUSTED_PROXY_COUNT=0`
+   (default) the header is ignored entirely, because a client can set it freely
+   and would otherwise mint a fresh bucket per request. When proxies are
+   configured, the address is read from the right of the chain.
+
+**Evidence.** `tests/test_security_rate_limit.py` (30 tests): throttling after
+repeated failures, `Retry-After` present, malformed/non-JSON/empty bodies all
+consume the budget, a trailing slash cannot evade the rule, the budget recovers
+after the window (clock patched, not slept), login and signup budgets are
+independent, other routes unaffected, header rotation does not evade, and the
+throttle log contains neither the username nor the password.
+
+**[OPEN] Scope limitation.** Counters are in-process
+(`limits.storage.MemoryStorage`), so the effective limit is multiplied by the
+worker count. This is accurate for the current single-process Dockerfile and is
+**not** distributed protection. Options are documented in
+`docs/SECURITY_OPERATIONS.md` §3.2; a shared store was deliberately not enabled
+because none is provisioned.
+
+**[OPEN]** Limits are per-client, not per-account, so an attacker rotating
+source addresses can still target one account slowly.
+
+---
+
+### S15 — Media tokens recorded in application logs — **Medium** — Fixed (Phase 3.5)
+
+**Verified.** No redaction existed anywhere. Because playback uses
+`?access_token=…`, the request target is itself a credential, and any log line
+containing it captured a usable token. Reproduced in the test suite: the httpx
+client logger emitted the full tokenised URL.
+
+**Remediation.** `backend/logging_setup.py` installs a filter that rewrites
+sensitive query values to `REDACTED` before a record is formatted, across
+`uvicorn.access`, `uvicorn.error`, `httpx`, `httpx2`, and `httpcore`. It
+handles **URL objects as well as strings** — the first implementation missed
+httpx's `URL` type, which a test caught. The media TTL is now configurable
+(`MEDIA_TOKEN_TTL_MINUTES`, default 15) and the unhandled-exception handler
+logs `request.url.path` only.
+
+**Evidence.** `tests/test_security_media_tokens.py` (20 tests): token scoped to
+one video and one user, rejected for another video or user, not usable as a
+session credential, not usable to read arbitrary files (five traversal probes),
+forged and expired tokens rejected, response carries `nosniff` and an explicit
+`video/mp4`, the access-log filter redacts while preserving the useful part of
+the line, the filter is idempotent, and no token appears in logs during a real
+request or an induced failure. Also: the ownership record does not store the
+token, and `/submissions` mints fresh ones rather than persisting any.
+
+**[OPEN] Not covered, by nature.** Logs written by a reverse proxy, CDN, load
+balancer, or hosting platform, plus browser history and `Referer`. Those are
+deployment concerns; see `docs/SECURITY_OPERATIONS.md` §8.3.
+
+---
+
+### S16 — `users.username` had no unique index — **Low** — Fixed (Phase 3.5)
+
+**Verified.** `create_index` appeared only in `video_repo.py`; nothing created
+an index on `users`. `signup` relied on a non-atomic read-then-write check, so
+concurrent registrations could both succeed.
+
+**Remediation.** `backend/db_init.py` provides repeatable, non-destructive
+initialization, run from the application lifespan:
+
+- duplicates are detected **before** attempting the index, because creating a
+  unique index over existing duplicates fails;
+- the diagnostic reports **counts only**, never the usernames, so it is safe to
+  log;
+- no account is deleted, merged, or renamed to make the migration succeed —
+  verified by a test that compares the collection before and after;
+- `strict=False` (startup) logs and continues; `strict=True` (operator) raises.
+
+`signup` now also catches `DuplicateKeyError` and returns the same clean 400 as
+the checked path, so the losing side of a race is not an unhandled 500. New
+usernames with surrounding whitespace are rejected, while existing untrimmed
+records remain reachable (a test covers this) because rewriting a stored
+username would lock that account out.
+
+**Evidence.** `tests/test_security_db_integrity.py` (26 tests).
+
+**[OPEN]** Username matching remains case-sensitive and exact, so `Alice` and
+`alice` are distinct accounts. Normalising is an operator decision with the
+same data implications as a merge; see `docs/SECURITY_OPERATIONS.md` §4.3.
+
+---
+
+### S17 — Overbroad and incomplete IAM policy — **Medium** — Template provided
+
+**Verified** against the boto3 calls the code actually makes.
+`infra/iam_policy.yaml` granted `bedrock:InvokeModel` on `Resource: '*'`
+(every model in the account), granted `bedrock:InvokeModelWithResponseStream`
+which no code path uses, scoped S3 to `brand-guardian-*` buckets that **no code
+reads**, and omitted **DynamoDB entirely** — meaning the application could not
+have functioned under that role.
+
+**Remediation.** `infra/iam_policy_least_privilege.json`: a template with
+explicit placeholders, scoping Bedrock to `amazon.nova-pro-v1:0`, S3 to the
+`frames/` and `raw/` prefixes of one configured bucket, `ListBucket` to those
+prefixes by condition, DynamoDB to the two named tables with only the verb set
+in use, and logs to this application's group. It adds an explicit `Deny` when
+`aws:SecureTransport` is false, and records in `_NOT_GRANTED` every permission
+deliberately withheld and why.
+
+No account id, bucket name, or table ARN was invented. The existing
+`infra/iam_policy.yaml` was **not** rewritten, because the repository contains
+two conflicting bucket naming schemes and resolving that is an operator
+decision (`docs/SECURITY_OPERATIONS.md` §7.1).
+
+**[OPEN] Operator action.** Fill in the placeholders, resolve the bucket
+naming, create the DynamoDB tables (no IaC does), and apply the bucket
+hardening listed in §7.4 — public-access block, encryption, versioning, TLS
+bucket policy, and access logging, **none** of which
+`infra/init_s3.py` configures. No live AWS call was made and no live policy was
+changed.
+
+---
+
 ### S12 — No username uniqueness constraint — **Low** — Partially mitigated
 
 `signup` does a read-then-write existence check with no unique index, so two
@@ -425,9 +568,10 @@ simultaneous registrations of the same username can both succeed.
 
 **Mitigated:** `video_repo.ensure_indexes` creates a unique index on
 `videos.video_id` at startup.
-**[OPEN]:** a unique index on `users.username` is **not** created, because doing
-so against an existing deployment would fail if duplicates already exist, and
-resolving them is an operator decision. Recommended operator step:
+**Superseded by S16 (Phase 3.5).** `backend/db_init.py` now creates the
+`users.username` unique index safely: it detects duplicates first, reports
+counts only, and skips rather than failing or deleting data. The manual step
+below remains valid for an operator who prefers to do it explicitly:
 
 ```
 db.users.createIndex({username: 1}, {unique: true})
@@ -459,14 +603,16 @@ Removing the stored-XSS vector (S7) materially reduces the practical risk.
 
 ## 3. Explicitly out of scope
 
-Not addressed in this phase, by instruction:
+Not addressed in **Phase 3**, by instruction. Items marked done were
+subsequently closed in Phase 3.5:
 
-- Rate limiting on `/auth/login` and `/auth/signup` — **still absent**, so
-  credential stuffing is unthrottled. Recommended next.
+- **DONE (S14):** rate limiting on `/auth/login` and `/auth/signup`.
 - Refresh tokens / httpOnly cookies (S13).
 - A role-management API or admin dashboard (S3 grant path stays manual).
-- S3 bucket hardening and the IAM policy gaps from Phase 1 §10.3 (no DynamoDB
-  permissions; `bedrock:InvokeModel` on `Resource: '*'`).
+- S3 bucket hardening and the IAM policy gaps from Phase 1 §10.3 — a
+  least-privilege **template** is now provided (S17), but applying it,
+  resolving the bucket naming conflict, and hardening the bucket remain
+  operator actions. No live AWS change was made.
 - Content scanning of uploaded media.
 - Nova Canvas remediation, reconstruction, Nova Act, Step Functions.
 
@@ -476,21 +622,38 @@ Not addressed in this phase, by instruction:
 
 All commands run on 2026-10-19.
 
+Phase 3 (2026-10-19):
+
 | Check | Command | Result |
 | :-- | :-- | :-- |
 | Backend suite | `pytest -q` | **277 passed, 1 skipped** |
-| Security tests only | `pytest tests/test_security_*.py -q` | **202 passed** (config 24, auth 64, signup/roles 23, routes 47, uploads 44) |
+| Security tests only | `pytest tests/test_security_*.py -q` | **202 passed** |
 | Clean install | `pip install -r requirements.txt` (fresh venv) | exit 0 |
-| Import + routes | `python -c "import app"` | 16 OpenAPI paths, 15 modules |
 | Production fail-safe | `NOVAFLOW_ENV=production` without the key | exit 1, safe error |
 | Frontend tests | `npm test` | **42 passed** |
+| Frontend lint | `npm run lint` | 30 problems (8 errors, 22 warnings) |
+
+Phase 3.5 (2026-10-19), the current state:
+
+| Check | Command | Result |
+| :-- | :-- | :-- |
+| Backend suite | `pytest -q` | **363 passed, 14 skipped** |
+| Rate limiting | `pytest tests/test_security_rate_limit.py -q` | **30 passed** |
+| DB integrity | `pytest tests/test_security_db_integrity.py -q` | **26 passed** |
+| Media tokens | `pytest tests/test_security_media_tokens.py -q` | **20 passed** |
+| Real-MongoDB integration | `pytest -m requires_mongodb` | **13 skipped, NOT VERIFIED** (no MongoDB and no responding Docker daemon); 10 safety-guard tests pass without a database |
+| Clean install | `pip install -r requirements.txt` (fresh venv) | exit 0, 18 modules import |
+| Import + routes | `python -c "import app"` | 16 OpenAPI paths |
+| Frontend tests | `npm test` | **50 passed** |
 | Frontend types | `npm run typecheck` | exit 0 |
-| Frontend lint | `npm run lint` | 30 problems (8 errors, 22 warnings) — pre-existing |
+| Frontend lint | `npm run lint` | **22 problems (0 errors, 22 warnings)** |
 | Frontend build | `npm run build` | exit 0, 7/7 pages |
 
-The single skip is `requires_ffmpeg`: the FFmpeg executable is not installed on
-this machine, which is an environmental prerequisite rather than an application
-defect.
+The 14 skips are 1 x `requires_ffmpeg` (the executable is not installed on this
+machine) and 13 x `requires_mongodb` (no database available). Both are
+environmental prerequisites, not application defects. The remaining 22 frontend
+lint findings are all warnings - 17 unused variables and 5 `<img>` suggestions
+- none security-relevant; they are left documented rather than suppressed.
 
 **Not verified.** No live AWS, Bedrock, or MongoDB call was made at any point;
 all three are mocked. No deployment was performed. Argon2 parameters were not
@@ -508,11 +671,16 @@ benchmarked on production hardware.
 | 4 | Decide what to do with pre-Phase-3 uploads | They have no ownership record and are now inaccessible (S5) |
 | 5 | Create the `users.username` unique index | Not done automatically (S12) |
 | 6 | Grant the agent role by direct database update where needed | No API exists by design (S3) |
-| 7 | Add rate limiting before public exposure | Out of scope here, genuinely missing |
+| 7 | Review the rate limits and the per-process caveat | Implemented in Phase 3.5 (S14); see `docs/SECURITY_OPERATIONS.md` §3 |
+| 8 | Fill in `infra/iam_policy_least_privilege.json` and resolve the bucket naming conflict | The old policy omitted DynamoDB entirely (S17) |
+| 9 | Apply S3 bucket hardening | `infra/init_s3.py` configures none of it |
+| 10 | Configure proxy/CDN log redaction for `?access_token=` | The app cannot redact logs written outside this process (S15) |
+| 11 | Run `pytest -m requires_mongodb` against a disposable database | Written and guarded, but never executed |
 
 ---
 
-*Related: `docs/SECURITY_IMPLEMENTATION_PLAN.md` for what was implemented versus
+*Related: `docs/SECURITY_OPERATIONS.md` for the operator runbook,
+`docs/SECURITY_IMPLEMENTATION_PLAN.md` for what was implemented versus
 deferred, `docs/RELEASE_CHECKLIST.md` for the release gate, and
 `docs/PROJECT_AUDIT.md` for the original Phase 1 audit (§10 of which is
 corrected here by S7 and S8).*

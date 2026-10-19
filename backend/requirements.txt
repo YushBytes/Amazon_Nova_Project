@@ -25,6 +25,14 @@ python-multipart==0.0.32
 # schemas, so declared explicitly rather than relied on via fastapi.
 pydantic==2.14.1
 
+# --- rate limiting ---
+# Counting engine for the credential-endpoint limiter in rate_limit.py. This
+# is the maintained library that backs slowapi; it is used directly because
+# the limit must be enforced in ASGI middleware (before request validation),
+# which a route decorator cannot do. Storage is in-process memory, so the
+# limit is per-worker; see docs/SECURITY_OPERATIONS.md.
+limits==5.8.0
+
 # --- auth ---
 python-jose[cryptography]==3.5.0
 # Argon2id password hashing. Replaces the previous unsalted SHA-256 scheme;

@@ -201,7 +201,7 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 
 ## 5. Security posture
 
-**Phase 3 (2026-10-19) hardened this area. Full detail: `docs/SECURITY_AUDIT.md`.**
+**Phase 3 and Phase 3.5 (2026-10-19) hardened this area. Full detail: `docs/SECURITY_AUDIT.md`; operator procedures: `docs/SECURITY_OPERATIONS.md`.**
 
 **No live secrets exist in the repository** [VERIFIED] — pattern scans over the working tree and each phase diff found no AWS key ids, credentialed connection strings, API keys, or tokens, and no `.env` is on disk. A full Git-history scan is still outstanding (release checklist 2A.60).
 
@@ -219,16 +219,23 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **Never return exception text to a client.** The catch-all handler in `app.py` logs the traceback and returns a flat `{"detail": "Internal server error"}`. Catch `BotoCoreError`/`ClientError` around AWS calls and return a generic 502.
 - **Never log a password, hash, token, signing key, or model analysis body.** Log counts, ids, and exception *types*. Tests assert this.
 - **Never put a secret in a `NEXT_PUBLIC_*` variable** — those are compiled into the browser bundle and are public.
-- **Media access uses a scoped token.** A browser `<video>` element cannot send an `Authorization` header, so `GET /uploads/{file}` takes a 15-minute token bound to one `video_id`. Session tokens and media tokens are not interchangeable.
+- **Media access uses a scoped token.** A browser `<video>` element cannot send an `Authorization` header, so `GET /uploads/{file}` takes a short-lived token (`MEDIA_TOKEN_TTL_MINUTES`, default 15) bound to one `video_id`. Session tokens and media tokens are not interchangeable.
+- **Never log a full URL or request target.** Playback URLs carry a token in the query string. `backend/logging_setup.py` redacts sensitive query values on the request-emitting loggers; if you add a logger that prints a URL, register it there. Log `request.url.path`, never `request.url`.
+- **Rate-limit new credential-style endpoints** by adding a rule in `rate_limit.build_credential_rules`. Use middleware, not a route decorator: a decorator runs after request validation, so a malformed body bypasses the counter entirely (measured, see `rate_limit.py`). Counters are per-process.
+- **Never trust `X-Forwarded-For`** unless `TRUSTED_PROXY_COUNT` is set to the real proxy depth; read the chain from the right, never the client-controlled left.
+- **Database initialization must stay non-destructive.** `backend/db_init.py` detects duplicates before creating a unique index, reports counts only (never usernames), and skips rather than failing. Never delete or merge accounts to make a migration succeed.
+- **Usernames are matched exactly.** Do not add trimming or case-folding on read: existing `" alice"` / `"Alice"` records would become unreachable. New signups reject surrounding whitespace instead.
 
 ### Known remaining gaps
 
-- **No rate limiting** on `/auth/login` or `/auth/signup` — the most significant outstanding gap.
+- **Rate limiting is per-process.** `/auth/login` and `/auth/signup` are throttled, but counters live in process memory, so the effective limit is multiplied by the worker count. Accurate for the single-process Dockerfile; **not** distributed protection. No per-account throttle either.
 - **No token revocation.** Tokens live in `localStorage` and are valid until expiry; rotating `JWT_SECRET_KEY` is the only break-glass.
-- **`users.username` has no unique index** — concurrent signups can duplicate a username (low impact; operator step documented).
-- **Pre-Phase-3 uploads have no ownership record** and are therefore inaccessible.
-- **S3 bucket hardening and the IAM policy gaps** from `docs/PROJECT_AUDIT.md` §10.3 are untouched.
+- **Media tokens travel in URLs.** Redacted from this process's logs, but still reach browser history, `Referer`, and any proxy/CDN log — which this application cannot redact.
+- **Pre-Phase-3 uploads have no ownership record** and are therefore inaccessible. The uploader was never recorded, so it cannot be recovered from the data. Options in `docs/SECURITY_OPERATIONS.md` §6.
+- **AWS hardening is a template, not applied.** `infra/iam_policy_least_privilege.json` has placeholders; the bucket naming conflict (`novaflow-media` vs `brand-guardian-*`) is unresolved, and no bucket hardening is configured.
+- **Real-MongoDB integration tests are unverified.** Written and safety-guarded in `tests/test_integration_mongodb.py`, but never executed — no database or Docker daemon was available. Run `pytest -m requires_mongodb`.
 - Upload validation does **not** prove a file is a safe video; there is no content scanning.
+- 22 frontend lint **warnings** remain (unused vars, `<img>` usage); zero errors. None security-relevant.
 
 When working in this repo: never print a secret value, never commit one, and if you find one, report its **file and variable name** with the value redacted and recommend rotation — do not delete user files or change cloud permissions yourself.
 
@@ -253,7 +260,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0, 1, 2 and 3 are **complete, committed, and pushed**: the repository is correctly rooted, flattened, private and tracking `origin/main`; the four critical Phase 1 defects are fixed with regression tests; and authentication, authorization, resource ownership and upload handling are hardened (`docs/SECURITY_AUDIT.md`). **Phase 4 (connect the end-to-end pipeline) is next and has not been started.** It still needs the maintainer decisions recorded in §9 — do not start it until it is explicitly assigned.
+Phases 0, 1, 2, 3 and 3.5 are **complete, committed, and pushed**: the repository is correctly rooted, flattened, private and tracking `origin/main`; the four critical Phase 1 defects are fixed with regression tests; authentication, authorization, resource ownership and upload handling are hardened, and Phase 3.5 added credential-endpoint rate limiting, safe database initialization, media-token log redaction, and a least-privilege IAM template (`docs/SECURITY_AUDIT.md`, `docs/SECURITY_OPERATIONS.md`). **Phase 4 (connect the end-to-end pipeline) is next and has not been started.** It still needs the maintainer decisions recorded in §9 — do not start it until it is explicitly assigned.
 
 ---
 
