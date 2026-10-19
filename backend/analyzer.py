@@ -4,12 +4,21 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+from decimal import Decimal
 from dotenv import load_dotenv
 
+from config import get_settings
+from detections import (
+    AnalysisParseError,
+    FrameAnalysis,
+    failed_analysis,
+    parse_frame_analysis,
+)
 from prompts import SYSTEM_PROMPT
 
 # Load configurations
@@ -43,117 +52,250 @@ dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
 bedrock_runtime = boto3.client('bedrock-runtime', region_name=AWS_REGION)
 table = dynamodb.Table(DYNAMO_TABLE)
 
-def analyze_frame_with_nova(image_bytes):
+# ---------------------------------------------------------------------------
+# Model configuration, in one place
+# ---------------------------------------------------------------------------
+
+# The model this pipeline is built and prompted for. Switching it changes
+# detection behaviour, so it is a single named constant rather than a literal
+# repeated at each call site. It is NOT read from the environment: an operator
+# silently pointing this at a different model would invalidate every stored
+# result without the pipeline version changing.
+MODEL_ID = "amazon.nova-pro-v1:0"
+
+MAX_OUTPUT_TOKENS = 1000
+
+# Stored alongside each result so a detection can be traced to the code that
+# produced it. Kept in step with video_repo.PIPELINE_VERSION.
+PIPELINE_VERSION = "4.0"
+
+# Safety bound on scan pagination.
+MAX_SCAN_PAGES = 50
+
+# Bedrock error codes worth retrying. Everything else (validation,
+# authorization, model-not-found) is permanent and must fail immediately
+# rather than burning the attempt budget.
+RETRYABLE_ERROR_CODES = frozenset(
+    {
+        "ThrottlingException",
+        "TooManyRequestsException",
+        "ServiceUnavailableException",
+        "ServiceUnavailable",
+        "InternalServerException",
+        "ModelTimeoutException",
+        "ModelNotReadyException",
+    }
+)
+
+# Permanent failures. Named so a reader can see they are deliberately not
+# retried.
+PERMANENT_ERROR_CODES = frozenset(
+    {
+        "ValidationException",
+        "AccessDeniedException",
+        "UnrecognizedClientException",
+        "ResourceNotFoundException",
+        "ModelErrorException",
+    }
+)
+
+
+def _error_code(exc: Exception) -> str:
+    response = getattr(exc, "response", None) or {}
+    return (response.get("Error") or {}).get("Code") or type(exc).__name__
+
+
+def build_request_body(image_bytes: bytes) -> str:
+    """Build the Bedrock invoke_model body for one frame.
+
+    Nova's native message format: an image part carrying base64 bytes plus a
+    text instruction, with the compliance contract supplied as a system
+    prompt. Kept as its own function so the request shape is testable without
+    a Bedrock call.
     """
-    Analyzes a given image using Amazon Nova 2 Pro via Bedrock.
-    """
-    model_id = "amazon.nova-pro-v1:0"
-    
-    # Construct the multimodal message for Nova
-    body = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1000,
-        "system": SYSTEM_PROMPT,
+    payload = {
+        "schemaVersion": "messages-v1",
         "messages": [
             {
                 "role": "user",
                 "content": [
                     {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_bytes
+                        "image": {
+                            "format": "jpeg",
+                            "source": {
+                                "bytes": base64.b64encode(image_bytes).decode("utf-8")
+                            },
                         }
                     },
                     {
-                        "type": "text",
-                        "text": "Analyze this image for brand safety and compliance violations."
-                    }
-                ]
-            }
-        ]
-    }
-    
-    # Note: Nova 2 Pro schema might differ slightly from Anthropic on Bedrock
-    # Adapting to Nova specific request structure if needed
-    # (Using the standardized Bedrock invoke format)
-    
-    # Nova Pro on Bedrock expects its own native message format.
-    
-    nova_payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"image": {"format": "jpeg", "source": {"bytes": base64.b64encode(image_bytes).decode('utf-8')}}},
-                    {"text": "Analyze this image carefully for brand safety violations."}
-                ]
+                        "text": (
+                            "Analyze this video frame for brand-compliance "
+                            "violations. Respond with only the JSON object "
+                            "described in your instructions."
+                        )
+                    },
+                ],
             }
         ],
         "system": [{"text": SYSTEM_PROMPT}],
-        "inferenceConfig": {"maxNewTokens": 1000}
+        "inferenceConfig": {"maxNewTokens": MAX_OUTPUT_TOKENS},
     }
+    return json.dumps(payload)
 
+
+def _read_model_text(response) -> str:
+    """Pull the assistant text out of a Bedrock invoke_model response."""
+    body = json.loads(response.get("body").read())
     try:
-        response = bedrock_runtime.invoke_model(
-            modelId=model_id,
-            body=json.dumps(nova_payload)
-        )
-        
-        response_body = json.loads(response.get('body').read())
-        raw_text = response_body['output']['message']['content'][0]['text']
-        
-        # Extract the JSON object from the response text.
-        # NOTE: this greedy pattern spans the first '{' to the last '}' and is
-        # unreliable when a response contains several JSON objects. Replacing it
-        # with schema-validated parsing is tracked for a later phase; for now a
-        # parse failure is reported as a failure rather than as a clean frame.
-        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(0))
-            except json.JSONDecodeError:
-                logger.warning("Model response was not valid JSON; frame will not be audited")
-                return {"scene_description": raw_text, "violations": [], "error": "JSON_PARSE_FAILED"}
-        logger.warning("Model response contained no JSON object; frame will not be audited")
-        return {
-            "scene_description": raw_text,
-            "violations": [],
-            "raw_report": raw_text,
-            "error": "NO_JSON_IN_RESPONSE",
-        }
-    except (BotoCoreError, ClientError) as e:
-        # Log the exception type, not its body: Bedrock errors can echo request
-        # content, which includes user frame data.
-        logger.error("Bedrock invocation failed: %s", type(e).__name__)
-        return {"error": f"{type(e).__name__}: {e}", "violations": []}
-    except (KeyError, IndexError, TypeError) as e:
-        logger.error("Unexpected Bedrock response shape: %s", type(e).__name__)
-        return {"error": f"MALFORMED_RESPONSE: {type(e).__name__}", "violations": []}
+        return body["output"]["message"]["content"][0]["text"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise AnalysisParseError(
+            "the model response did not contain assistant text"
+        ) from exc
 
-def _record_frame_result(video_id, frame_number, status, analysis):
-    """Write a single frame's terminal audit state to DynamoDB.
+def analyze_frame_with_nova(image_bytes: bytes) -> FrameAnalysis:
+    """Analyse one frame with Amazon Nova Pro and validate the result.
 
-    Preserves the existing attribute contract: `status`, `analysis_report`
-    (a JSON string), `detections` (a list) and `updated_at`.
+    Returns a FrameAnalysis either way. `result.ok` is False when the frame
+    could not be audited, which the caller must keep distinct from "audited
+    with zero detections" - conflating them would report unanalysed footage as
+    compliant.
+
+    Retries are bounded (`BEDROCK_MAX_ATTEMPTS`, default 3) with exponential
+    backoff, and only for the error codes in RETRYABLE_ERROR_CODES. Validation
+    and authorization failures are permanent and fail on the first attempt.
     """
+    settings = get_settings()
+    max_attempts = settings.bedrock_max_attempts
+    body = build_request_body(image_bytes)
+
+    last_reason = "analysis did not complete"
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = bedrock_runtime.invoke_model(modelId=MODEL_ID, body=body)
+            raw_text = _read_model_text(response)
+            return parse_frame_analysis(raw_text)
+
+        except ClientError as exc:
+            code = _error_code(exc)
+            if code in RETRYABLE_ERROR_CODES and attempt < max_attempts:
+                delay = _backoff_seconds(attempt)
+                logger.warning(
+                    "Bedrock %s on attempt %d/%d; retrying in %.1fs",
+                    code, attempt, max_attempts, delay,
+                )
+                time.sleep(delay)
+                last_reason = f"{code} after {attempt} attempt(s)"
+                continue
+            # Permanent, or the budget is spent. Log the code only: a Bedrock
+            # error body can echo request content, which includes frame data.
+            logger.error("Bedrock call failed with %s", code)
+            return failed_analysis(f"{code}")
+
+        except BotoCoreError as exc:
+            code = type(exc).__name__
+            if attempt < max_attempts:
+                delay = _backoff_seconds(attempt)
+                logger.warning(
+                    "Bedrock transport error %s on attempt %d/%d; retrying in %.1fs",
+                    code, attempt, max_attempts, delay,
+                )
+                time.sleep(delay)
+                last_reason = f"{code} after {attempt} attempt(s)"
+                continue
+            logger.error("Bedrock transport error: %s", code)
+            return failed_analysis(code)
+
+        except AnalysisParseError as exc:
+            # The model answered but not usably. Retrying rarely helps and
+            # costs another call, so record the failure.
+            logger.warning("Unusable model response: %s", exc)
+            return failed_analysis(f"MALFORMED_RESPONSE: {exc}")
+
+        except Exception as exc:
+            logger.exception("Unexpected failure analysing a frame")
+            return failed_analysis(f"UNEXPECTED: {type(exc).__name__}")
+
+    return failed_analysis(last_reason)
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Exponential backoff with a small deterministic jitter.
+
+    Jitter is derived from the attempt number rather than `random`, so tests
+    are reproducible while concurrent workers still stagger slightly.
+    """
+    base = min(2.0 ** (attempt - 1), 8.0)
+    return base + (attempt % 3) * 0.1
+
+
+
+def _detection_item(detection) -> dict:
+    """Serialise one validated detection for DynamoDB.
+
+    Optional fields are omitted entirely when absent rather than written as
+    null or a default, so a reader can tell "the model gave no confidence"
+    from "the model said zero".
+    """
+    item = {
+        "category": detection.category,
+        "description": detection.description,
+    }
+    if detection.risk_level is not None:
+        item["risk_level"] = detection.risk_level
+    if detection.confidence is not None:
+        # DynamoDB has no float type; Decimal round-trips exactly.
+        item["confidence"] = Decimal(str(detection.confidence))
+    if detection.bounding_box is not None:
+        item["bounding_box"] = [Decimal(str(v)) for v in detection.bounding_box]
+    return item
+
+
+def _record_frame_result(
+    video_id: str, frame_number, status: str, analysis: FrameAnalysis
+) -> int:
+    """Write one frame's terminal audit state to DynamoDB.
+
+    Idempotent: the same frame audited twice produces the same item, so a
+    retry overwrites rather than appending. Returns the number of detections
+    stored.
+
+    Keeps the established attribute contract (`status`, `analysis_report`,
+    `detections`, `updated_at`) and adds traceability fields.
+    """
+    audited = status == STATUS_AUDITED
+
+    # Only an audited frame contributes detections. A failed frame stores an
+    # empty list, so a reader can never mistake a failure for "no violations".
+    detections = [_detection_item(d) for d in analysis.detections] if audited else []
+
+    report = {
+        "scene_description": analysis.scene_description if audited else "",
+        "recommendation": analysis.recommendation if audited else "",
+        "detection_count": len(detections),
+        "discarded_entries": analysis.discarded_entries,
+    }
+    if analysis.error:
+        report["error"] = analysis.error
+
     table.update_item(
-        Key={'video_id': video_id, 'frame_number': frame_number},
+        Key={"video_id": video_id, "frame_number": frame_number},
         UpdateExpression=(
-            "SET #s = :s, analysis_report = :r, detections = :d, updated_at = :t"
+            "SET #s = :s, analysis_report = :r, detections = :d, "
+            "updated_at = :t, model_id = :m, pipeline_version = :p"
         ),
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={
             ":s": status,
-            ":r": json.dumps(analysis),
-            # Only an audited frame contributes detections. A failed frame
-            # stores an empty list, so a reader can never mistake a failure
-            # for "no violations found".
-            ":d": analysis.get('violations', []) if status == STATUS_AUDITED else [],
-            ":t": datetime.now().isoformat(),
+            ":r": json.dumps(report),
+            ":d": detections,
+            ":t": datetime.now(timezone.utc).isoformat(),
+            ":m": MODEL_ID,
+            ":p": PIPELINE_VERSION,
         },
     )
+    return len(detections)
 
 
 def check_pending_frames(video_id=None):
@@ -181,8 +323,24 @@ def check_pending_frames(video_id=None):
         scan_kwargs['FilterExpression'] &= Attr('video_id').eq(video_id)
 
     try:
-        response = table.scan(**scan_kwargs)
-        pending_frames = response.get('Items', [])
+        # DynamoDB returns at most 1 MB per page, so one scan call is not the
+        # whole queue. Page until exhausted, bounded so a runaway table cannot
+        # spin forever.
+        pending_frames = []
+        pages = 0
+        while True:
+            response = table.scan(**scan_kwargs)
+            pending_frames.extend(response.get('Items', []))
+            cursor = response.get('LastEvaluatedKey')
+            pages += 1
+            if not cursor or pages >= MAX_SCAN_PAGES:
+                if cursor:
+                    logger.warning(
+                        "Stopped scanning pending frames after %d page(s); "
+                        "more may remain", pages,
+                    )
+                break
+            scan_kwargs['ExclusiveStartKey'] = cursor
         pending_frames.sort(key=lambda x: int(x['frame_number']))
     except Exception as e:
         # A scan failure means the batch is unknown, not that there is nothing
@@ -191,7 +349,12 @@ def check_pending_frames(video_id=None):
             f"Could not scan {DYNAMO_TABLE} for pending frames: {type(e).__name__}"
         ) from e
 
-    summary = {"pending": len(pending_frames), "audited": 0, "failed": 0}
+    summary = {
+        "pending": len(pending_frames),
+        "audited": 0,
+        "failed": 0,
+        "detections": 0,
+    }
 
     if not pending_frames:
         logger.info(
@@ -215,8 +378,8 @@ def check_pending_frames(video_id=None):
             s3_obj = s3_client.get_object(Bucket=bucket, Key=s3_key)
             frame_bytes = s3_obj['Body'].read()
 
-            # 2. Analyse the frame. This returns a dict either way; an "error"
-            #    key means no usable report was produced.
+            # 2. Analyse the frame. Returns a FrameAnalysis either way;
+            #    `ok` False means no usable report was produced.
             analysis = analyze_frame_with_nova(frame_bytes)
         except Exception as e:
             # No result could be obtained for this frame at all (missing S3
@@ -225,17 +388,17 @@ def check_pending_frames(video_id=None):
             logger.error(
                 "Frame %s/%s could not be analysed: %s", vid, fnum, type(e).__name__
             )
-            analysis = {"error": f"{type(e).__name__}: {e}", "violations": []}
+            analysis = failed_analysis(type(e).__name__)
 
-        if analysis.get("error"):
-            status = STATUS_FAILED
-            summary["failed"] += 1
-        else:
+        if analysis.ok:
             status = STATUS_AUDITED
             summary["audited"] += 1
+        else:
+            status = STATUS_FAILED
+            summary["failed"] += 1
 
         try:
-            _record_frame_result(vid, fnum, status, analysis)
+            stored = _record_frame_result(vid, fnum, status, analysis)
         except Exception as e:
             # The result could not be persisted, so do not report an audit
             # that was never stored.
@@ -251,9 +414,9 @@ def check_pending_frames(video_id=None):
         # Log counts only. The analysis body contains scene descriptions of
         # user video content and must not be written to logs.
         if status == STATUS_AUDITED:
+            summary["detections"] += stored
             logger.info(
-                "Frame %s/%s audited: %d detection(s) stored",
-                vid, fnum, len(analysis.get('violations', [])),
+                "Frame %s/%s audited: %d detection(s) stored", vid, fnum, stored
             )
         else:
             logger.warning("Frame %s/%s marked %s", vid, fnum, STATUS_FAILED)
@@ -274,7 +437,7 @@ if __name__ == "__main__":
             with open(target, "rb") as f:
                 result = analyze_frame_with_nova(f.read())
             # Explicit local CLI inspection of a developer-supplied file.
-            print(json.dumps(result, indent=2))
+            print(result.model_dump_json(indent=2))
         # Test a specific video ID from DB
         else:
             check_pending_frames(video_id=target)

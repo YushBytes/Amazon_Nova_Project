@@ -22,11 +22,11 @@
 | 1.1 | ☐ A user can sign up and log in; the session persists and is server-validated | 3 | |
 | 1.2 | ☐ A supported video uploads successfully with auth enforced | 3 | |
 | 1.3 | ☐ Unsupported/oversized/over-length files are rejected with a clear message | 3 | |
-| 1.4 | ☐ Upload creates a durable job/audit record | 4 | |
+| 1.4 | ☒ Upload creates a durable job/audit record | 4 | **Closed in Phase 4** - see 2C.1-2C.7 |
 | 1.5 | ☐ Frames are extracted and stored, with a verified count | 4 | |
 | 1.6 | ☐ Frames are analysed by Amazon Nova Pro and **detections are persisted** *(currently impossible — audit §9.1)* | 2, 4 | |
 | 1.7 | ☐ Violations appear in the dashboard with correct bounding boxes, timestamps, and confidence | 4 | |
-| 1.8 | ☐ Job status shown in the UI reflects reality, including failures | 4 | |
+| 1.8 | ☒ Job status shown in the UI reflects reality, including failures | 4 | **Closed in Phase 4** - see 2C.73-2C.86 |
 | 1.9 | ☐ No fabricated status or fictional data in any released view *(currently `/submissions` derives status from `hash()` — audit §9.6)* | 4, 7 | |
 | 1.10 | ☐ A user can request remediation for a selected violation | 8 | |
 | 1.11 | ☐ Remediation performs a **real** edit; output verifiably differs from the input *(currently a disguised mock — audit §9.3)* | 8 | |
@@ -306,6 +306,157 @@ operator action, credentials, or a live environment this phase could not reach.
 | 2B.83 | ☐ Staging smoke test performed | §9.3 — needs real credentials |
 | 2B.84 | ☐ Live AWS/Bedrock/MongoDB verification | **Nothing live was called in Phase 3 or 3.5**; all mocked |
 | 2B.85 | ☐ Remaining 22 frontend lint warnings addressed | 17 unused vars + 5 `<img>`; none security-relevant, left documented rather than suppressed |
+
+---
+
+## 2C. Phase 4 end-to-end pipeline
+
+Added 2026-10-19. Evidence in `docs/PIPELINE_ARCHITECTURE.md` §10 unless
+stated. ☒ = verified by an automated test or recorded command, with every
+external service mocked. ☐ = needs live infrastructure or an operator action.
+
+**A mocked pipeline test is not evidence that live AWS or Bedrock works.**
+
+### Upload and job registration
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.1 | ☒ Authenticated upload creates a durable job record | `test_upload_creates_a_job_in_the_uploaded_state` |
+| 2C.2 | ☒ A new upload is `uploaded`, not `active` | same test (`is_active: false`) |
+| 2C.3 | ☒ Ownership persisted from the token, never the request | Phase 3 tests, still green |
+| 2C.4 | ☒ Failed ownership write leaves no accessible orphan | `test_failed_ownership_write_leaves_no_accessible_upload` |
+| 2C.5 | ☒ Unsupported format / empty / oversized uploads rejected | `test_security_uploads.py` (44), still green |
+| 2C.6 | ☒ Storage keys and filenames fully server-generated | `test_s3_keys_and_frame_numbers_are_server_generated` |
+| 2C.7 | ☐ Source videos stored durably | **Not done**: uploads live on the app host's local disk; a replaced container loses them |
+
+### State model
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.8 | ☒ Six validated states with documented transitions | `test_pipeline_state.py` (28) |
+| 2C.9 | ☒ `completed` reachable only from `analyzing` | `test_completed_is_only_reachable_from_analyzing` |
+| 2C.10 | ☒ Queueing work can never report completion | `test_analyze_queues_the_job_without_claiming_completion` |
+| 2C.11 | ☒ Every non-terminal state can reach `failed` | `test_every_non_terminal_state_can_fail` |
+| 2C.12 | ☒ Illegal transitions refused and persist nothing | `test_illegal_transition_is_refused_and_persists_nothing` |
+| 2C.13 | ☒ Transitions are conditional (no double-advance) | `test_transition_with_a_wrong_expected_state_is_refused` |
+| 2C.14 | ☒ Progress updates cannot change state | `test_record_progress_never_changes_state` |
+| 2C.15 | ☒ Pre-Phase-4 records remain readable | `test_coerce_handles_legacy_and_junk_values`, `test_job_view_of_a_legacy_record_is_safe` |
+| 2C.16 | ☒ Timestamps are UTC ISO strings | `test_timestamps_are_utc_iso_strings` |
+| 2C.17 | ☒ Stages are named, never fabricated percentages | `test_stage_labels_are_not_percentages` |
+| 2C.18 | ☒ `job_view` omits owner and storage details | `test_job_view_omits_server_side_storage_details` |
+
+### Frame extraction
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.19 | ☒ Failure raises instead of returning silently | `test_pipeline_extraction.py` (17) |
+| 2C.20 | ☒ Corrupt input, no video stream, bad duration all fail | 4 tests |
+| 2C.21 | ☒ Over-duration clip reports both lengths | `test_overlong_video_is_rejected_with_a_clear_reason` |
+| 2C.22 | ☒ Frame count capped; truncation recorded | `test_frame_count_is_capped` |
+| 2C.23 | ☒ Zero frames extracted is a failure | `test_no_frames_extracted_is_a_failure` |
+| 2C.24 | ☒ FFmpeg non-zero exit and timeout handled | 2 tests |
+| 2C.25 | ☒ Timestamps map to the source video | `test_frame_timestamps_map_to_the_source_video` |
+| 2C.26 | ☒ S3 failure aborts rather than reusing a frame number | `test_s3_failure_aborts_rather_than_reusing_a_frame_number` |
+| 2C.27 | ☒ Subprocess released on success and failure | 2 tests |
+| 2C.28 | ☒ Error text carries no path or credential | `test_extraction_errors_never_carry_a_path_or_credential` |
+| 2C.29 | ☐ Real FFmpeg extraction | **Not verified**: binary absent. One test marked `requires_ffmpeg` skips |
+
+### Nova Pro analysis
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.30 | ☒ Configured Nova Pro model, centralised, not env-switchable | `test_request_uses_the_configured_nova_model` |
+| 2C.31 | ☒ Request carries the frame and the system prompt | `test_request_body_carries_the_frame_and_the_system_prompt` |
+| 2C.32 | ☒ Responses validated, not blindly trusted | `test_pipeline_analysis.py` (58) |
+| 2C.33 | ☒ Multi-object / fenced / prose-wrapped JSON handled | 3 tests |
+| 2C.34 | ☒ Malformed response is a failure, not a clean frame | `test_malformed_response_is_a_failure_not_a_clean_frame` |
+| 2C.35 | ☒ Unusable bounding boxes dropped, detection kept | 11 parametrised cases |
+| 2C.36 | ☒ Confidence kept only when meaningful | 11 parametrised cases |
+| 2C.37 | ☒ Unknown risk level becomes null, not a guess | `test_unknown_risk_level_becomes_none_not_a_guess` |
+| 2C.38 | ☒ Throttling retried with bounded backoff | `test_throttling_is_retried_then_succeeds`, `test_retries_are_bounded` |
+| 2C.39 | ☒ Permanent errors not retried | 4 parametrised codes |
+| 2C.40 | ☒ Frame content never logged | `test_analysis_failure_never_logs_frame_content` |
+| 2C.41 | ☐ Live Bedrock inference | **Not verified**: no model was invoked |
+| 2C.42 | ☐ Detection accuracy / precision / recall | **Not measured**. No claim is made |
+| 2C.43 | ☐ Configurable brand rules | **Not implemented**: one static prompt; documented as a limitation |
+
+### Persistence
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.44 | ☒ Frame metadata and detections persisted to DynamoDB | `test_successful_analysis_is_persisted_to_dynamodb` |
+| 2C.45 | ☒ Frame images in S3, never in DynamoDB | `_store_frame`; `test_s3_keys_...` |
+| 2C.46 | ☒ Model id and pipeline version stored for traceability | same test |
+| 2C.47 | ☒ Writes idempotent; a retry overwrites, not appends | `test_rerunning_a_completed_job_does_not_duplicate_counts` |
+| 2C.48 | ☒ Failed frame stores an empty detection list | `test_bedrock_error_is_not_recorded_as_a_successful_audit` |
+| 2C.49 | ☒ Absent optional fields omitted, not defaulted | `test_violations_omits_absent_optional_fields` |
+| 2C.50 | ☒ Result queries paginate | `test_violations_paginates`, scan pagination in `check_pending_frames` |
+| 2C.51 | ☒ Persistence failure does not report success | `test_completion_write_failure_does_not_report_success` |
+| 2C.52 | ☒ No new AWS actions needed (IAM template unchanged) | `docs/PIPELINE_OPERATIONS.md` §3 |
+| 2C.53 | ☐ DynamoDB tables created | **No IaC**. Required schema documented in Operations §3 |
+| 2C.54 | ☐ Live S3 / DynamoDB writes | **Not verified**: mocked throughout |
+
+### Execution, failure, retry
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.55 | ☒ Job durably queued before execution begins | `test_analyze_queues_the_job_without_claiming_completion` |
+| 2C.56 | ☒ Worker refuses a job it cannot claim | `test_worker_refuses_a_job_it_cannot_claim` |
+| 2C.57 | ☒ Concurrent duplicate processing prevented | `test_concurrent_workers_cannot_both_run_one_job` |
+| 2C.58 | ☒ Duplicate submission returns 409 | `test_duplicate_analyze_is_refused_with_409` |
+| 2C.59 | ☒ Failure at each stage persists a safe terminal state | 4 stage-failure tests |
+| 2C.60 | ☒ Internal detail never reaches the client | `test_unexpected_extraction_crash_does_not_leak_internals` |
+| 2C.61 | ☒ Retry re-runs and can succeed | `test_retry_of_a_failed_job_reruns_and_can_succeed` |
+| 2C.62 | ☒ Retries bounded by MAX_ATTEMPTS, then 429 | `test_retry_is_bounded_by_max_attempts` |
+| 2C.63 | ☒ Stale error cleared on re-queue | `test_requeue_increments_attempt_and_clears_the_old_error` |
+| 2C.64 | ☒ Stuck jobs are detectable | `test_find_stuck_jobs_reports_orphans` |
+| 2C.65 | ☐ Crash recovery | **Not provided**, and not claimed. In-process worker; see Operations §6 |
+
+### API
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.66 | ☒ 18 routes registered; OpenAPI generates | `python -c "import app"` → 18 paths |
+| 2C.67 | ☒ Every pipeline route authenticates | `test_job_endpoint_requires_authentication` + Phase 3 suite |
+| 2C.68 | ☒ Cross-user access denied with 404, not 403 | 4 cross-user tests |
+| 2C.69 | ☒ Unknown resource indistinguishable from forbidden | same |
+| 2C.70 | ☒ Store failure returns 502 with no provider detail | `test_violations_store_failure_is_reported_safely` |
+| 2C.71 | ☒ Malformed cursor returns 400 | `test_violations_rejects_a_malformed_cursor` |
+| 2C.72 | ☒ No duplicate or conflicting routes | route listing reviewed |
+
+### Frontend
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.73 | ☒ Upload sends authentication and adopts the real job id | `HUDView.test.tsx` (15) |
+| 2C.74 | ☒ Polls the job endpoint while non-terminal | `HUDView.job.test.tsx` (24) |
+| 2C.75 | ☒ Polling stops on completion, failure, and unmount | 3 tests |
+| 2C.76 | ☒ Requests never overlap | `test never issues overlapping job requests` |
+| 2C.77 | ☒ Does not poll before a job exists | `does not poll before a job exists` |
+| 2C.78 | ☒ Shows real stages and counts, never a percentage | `shows real extracted counts, never a percentage` |
+| 2C.79 | ☒ Completed-with-zero-violations shown as complete | `reports a completed audit with zero violations as complete` |
+| 2C.80 | ☒ Failed-with-zero-detections NOT shown as compliant | `does NOT claim completion when analysis failed with zero detections` |
+| 2C.81 | ☒ Results loaded only after the backend reports completion | `does not load results while the job is non-terminal` |
+| 2C.82 | ☒ Backend error summary displayed, not an invented one | `shows the backend's error summary, not an invented one` |
+| 2C.83 | ☒ 401 / 403 / 404 / 429 each handled correctly | 4 tests |
+| 2C.84 | ☒ Network interruption does not fabricate completion | `a network failure does not fabricate completion` |
+| 2C.85 | ☒ Retry offered only when the backend permits it | 4 retry tests |
+| 2C.86 | ☒ No media token persisted in browser storage | dead `localStorage` read removed in Phase 3.5 |
+
+### Checks run
+
+| # | Item | Evidence |
+| :-- | :-- | :-- |
+| 2C.87 | ☒ Backend suite green | **500 passed, 15 skipped** |
+| 2C.88 | ☒ Pipeline suites green | state 28, e2e 34, extraction 17+1 skip, analysis 58 |
+| 2C.89 | ☒ Frontend tests green | **74 passed** (4 files) |
+| 2C.90 | ☒ Frontend typecheck clean | `npm run typecheck` exit 0 |
+| 2C.91 | ☒ Frontend lint: 0 errors | 22 warnings, same as the Phase 3.5 baseline |
+| 2C.92 | ☒ Frontend build succeeds | `npm run build` exit 0, 7/7 pages |
+| 2C.93 | ☒ App imports; OpenAPI generates | 18 paths |
+| 2C.94 | ☒ All 30 env vars documented | automated cross-check against source |
+| 2C.95 | ☐ Live end-to-end run against AWS | **Not performed**. Staging procedure in Operations §8 |
+| 2C.96 | ☐ Deployment | **Not performed** |
 
 ---
 

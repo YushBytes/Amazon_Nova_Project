@@ -23,10 +23,37 @@ const UPLOAD_OK = {
   status: "UPLOADED",
 };
 
+/** Phase 4: a job record, the authoritative progress source. */
+function job(overrides: Record<string, unknown> = {}) {
+  return {
+    video_id: "vid_abc12345",
+    state: "queued",
+    stage: "Queued for analysis",
+    is_terminal: false,
+    is_active: true,
+    attempt: 1,
+    max_attempts: 3,
+    frames_extracted: null,
+    frames_audited: null,
+    frames_failed: null,
+    detections_recorded: null,
+    error_summary: null,
+    model_id: null,
+    pipeline_version: "4.0",
+    original_filename: "campaign-reel.mp4",
+    size_bytes: 1024,
+    created_at: "2026-10-19T00:00:00+00:00",
+    updated_at: "2026-10-19T00:00:00+00:00",
+    completed_at: null,
+    ...overrides,
+  };
+}
+
 const ANALYZE_OK = {
   video_id: "vid_abc12345",
-  status: "ANALYZING",
-  message: "Neural analysis initiated.",
+  status: "queued",
+  job: job(),
+  message: "Analysis queued.",
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -44,6 +71,7 @@ function stubBackend(handlers: {
   upload?: () => Response | Promise<Response>;
   analyze?: () => Response | Promise<Response>;
   violations?: () => Response | Promise<Response>;
+  jobs?: () => Response | Promise<Response>;
 }) {
   const calls: string[] = [];
   const fetchMock = vi.fn(async (url: string) => {
@@ -51,13 +79,25 @@ function stubBackend(handlers: {
     if (url.includes("/upload-reel")) {
       return handlers.upload ? handlers.upload() : jsonResponse(UPLOAD_OK);
     }
+    if (url.includes("/jobs/")) {
+      return handlers.jobs ? handlers.jobs() : jsonResponse(job());
+    }
     if (url.includes("/analyze/")) {
       return handlers.analyze ? handlers.analyze() : jsonResponse(ANALYZE_OK);
     }
     if (url.includes("/violations/")) {
       return handlers.violations
         ? handlers.violations()
-        : jsonResponse({ video_id: UPLOAD_OK.video_id, detections: [], frame_count: 0 });
+        : jsonResponse({
+            video_id: UPLOAD_OK.video_id,
+            detections: [],
+            frame_count: 0,
+            audited_frames: 0,
+            failed_frames: 0,
+            next_cursor: null,
+            has_more: false,
+            job: job(),
+          });
     }
     throw new Error(`unexpected request: ${url}`);
   });
@@ -179,9 +219,10 @@ describe("audit workflow states", () => {
 
     releaseUpload(jsonResponse(UPLOAD_OK));
 
+    // Phase 4: the stage comes from the backend job record.
     await waitFor(() => {
       expect(screen.getByRole("status").textContent).toMatch(
-        /analysis in progress/i
+        /queued for analysis|extracting|analyzing frames/i
       );
     });
   });
@@ -240,7 +281,7 @@ describe("audit workflow states", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("status").textContent).toMatch(
-        /analysis in progress/i
+        /queued for analysis|extracting|analyzing frames/i
       );
     });
 
@@ -270,7 +311,7 @@ describe("audit workflow states", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("status").textContent).toMatch(
-        /analysis in progress/i
+        /queued for analysis|extracting|analyzing frames/i
       );
     });
 
@@ -284,29 +325,51 @@ describe("audit workflow states", () => {
 // --------------------------------------------------------------------------
 
 describe("the UI does not overstate backend progress", () => {
-  it("never claims the audit is complete or verified after queueing", async () => {
-    stubBackend({});
+  it("never claims the audit is complete while the job is non-terminal", async () => {
+    // The job reports "analyzing": work is in flight, so no completion
+    // wording may appear no matter what the results endpoint says.
+    stubBackend({
+      jobs: () =>
+        jsonResponse(
+          job({
+            state: "analyzing",
+            stage: "Analyzing frames",
+            frames_extracted: 5,
+            is_terminal: false,
+          })
+        ),
+    });
     const { container } = render(<HUDView />);
 
     selectVideoFile(container);
     fireEvent.click(launchButton());
 
     await waitFor(() => {
-      expect(screen.getByRole("status").textContent).toMatch(
-        /analysis in progress/i
-      );
+      expect(screen.getByRole("status").textContent).toMatch(/analyzing frames/i);
     });
 
-    // The backend has only accepted a background job. There is no completion
-    // signal, so no completion wording may appear.
     const status = screen.getByRole("status").textContent ?? "";
-    expect(status).not.toMatch(/complete/i);
+    expect(status).not.toMatch(/audit complete/i);
     expect(status).not.toMatch(/verified/i);
-    expect(status).not.toMatch(/\bdone\b/i);
+    expect(status).not.toMatch(/compliant/i);
   });
 
-  it("reports the real frame and violation counts returned by the backend", async () => {
+  it("reports the real frame and violation counts from the completed job", async () => {
     stubBackend({
+      jobs: () =>
+        jsonResponse(
+          job({
+            state: "completed",
+            stage: "Analysis complete",
+            is_terminal: true,
+            is_active: false,
+            frames_extracted: 5,
+            frames_audited: 5,
+            frames_failed: 0,
+            detections_recorded: 2,
+            completed_at: "2026-10-19T00:05:00+00:00",
+          })
+        ),
       violations: () =>
         jsonResponse({
           video_id: UPLOAD_OK.video_id,
@@ -325,6 +388,11 @@ describe("the UI does not overstate backend progress", () => {
             },
           ],
           frame_count: 5,
+          audited_frames: 5,
+          failed_frames: 0,
+          next_cursor: null,
+          has_more: false,
+          job: job({ state: "completed", is_terminal: true }),
         }),
     });
     const { container } = render(<HUDView />);
@@ -334,16 +402,16 @@ describe("the UI does not overstate backend progress", () => {
 
     await waitFor(() => {
       const status = screen.getByRole("status").textContent ?? "";
-      expect(status).toMatch(/5 frame\(s\) recorded/i);
+      expect(status).toMatch(/audit complete/i);
+      expect(status).toMatch(/5 frame\(s\) analyzed/i);
       expect(status).toMatch(/2 violation\(s\) found/i);
     });
   });
 
-  it("shows zero counts rather than inventing progress when nothing is stored", async () => {
-    stubBackend({
-      violations: () =>
-        jsonResponse({ video_id: UPLOAD_OK.video_id, detections: [], frame_count: 0 }),
-    });
+  it("shows a queued job as queued, not as progress it cannot know", async () => {
+    // Nothing has been extracted yet, so the UI shows the stage and no
+    // counts rather than inventing a percentage or a frame total.
+    stubBackend({});
     const { container } = render(<HUDView />);
 
     selectVideoFile(container);
@@ -351,9 +419,11 @@ describe("the UI does not overstate backend progress", () => {
 
     await waitFor(() => {
       const status = screen.getByRole("status").textContent ?? "";
-      expect(status).toMatch(/0 frame\(s\) recorded/i);
-      expect(status).toMatch(/0 violation\(s\) found/i);
+      expect(status).toMatch(/queued for analysis/i);
     });
+    const status = screen.getByRole("status").textContent ?? "";
+    expect(status).not.toMatch(/%/);
+    expect(status).not.toMatch(/frame\(s\) extracted/i);
   });
 
   it("does not poll for violations before analysis has been triggered", async () => {

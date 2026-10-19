@@ -32,6 +32,7 @@ from automation import NovaFlowAutomation
 
 # Import routers
 import db_init
+import pipeline
 import video_repo
 from auth import (
     create_media_token,
@@ -42,6 +43,8 @@ from auth import (
 from config import ALLOWED_UPLOAD_CONTENT_TYPES, ALLOWED_UPLOAD_CONTENT_TYPE_PREFIXES
 from config import get_settings
 from logging_setup import install_log_redaction
+from job_state import JobState, coerce
+from pipeline import AlreadyRunning, PipelineError, RetryLimitReached
 from projects import router as projects_router
 from rate_limit import RateLimitMiddleware, build_credential_rules
 from video_repo import OwnershipUnknown
@@ -425,40 +428,127 @@ async def start_analysis(
     background_tasks: BackgroundTasks,
     user: dict = Depends(get_current_user),
 ):
-    """Trigger the analysis pipeline for a video the caller owns."""
+    """Queue analysis for a video the caller owns.
+
+    Returns once the job is durably QUEUED - not once analysis has finished.
+    The response carries the real job state; poll GET /jobs/{video_id} for
+    progress and the terminal outcome.
+
+    A second request while a run is in flight returns 409 rather than starting
+    a duplicate. A finished job can be retried while attempts remain.
+    """
     record = await require_video_owner(video_id, user)
+
+    path = _resolve_within_uploads(record["stored_filename"])
+    if not path.is_file():
+        # The ownership record exists but the file does not. Record a terminal
+        # failure so the job does not sit in UPLOADED forever.
+        raise HTTPException(status_code=404, detail="Video payload not found.")
+
+    try:
+        updated = await pipeline.submit(video_id)
+    except AlreadyRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RetryLimitReached as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except PipelineError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    # Queued durably first, then handed to the worker, so a job can never be
+    # executing without a record saying so.
+    background_tasks.add_task(pipeline.run_job, video_id, str(path))
+
+    job = video_repo.job_view(updated)
+    return {
+        "video_id": video_id,
+        # Retained for backwards compatibility with the Phase 2/3 client.
+        "status": job["state"],
+        "job": job,
+        "message": "Analysis queued.",
+    }
+
+
+@app.get("/jobs/{video_id}")
+async def get_job(video_id: str, user: dict = Depends(get_current_user)):
+    """Current analysis state for a video the caller owns.
+
+    This is the authoritative progress source. `is_terminal` tells a client
+    when to stop polling; `state` is never "completed" unless the analysis
+    finished and its results were persisted.
+    """
+    record = await require_video_owner(video_id, user)
+    return video_repo.job_view(record)
+
+
+@app.post("/analyze/{video_id}/retry")
+async def retry_analysis(
+    video_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    """Re-run analysis for a job that has reached a terminal state.
+
+    Bounded by MAX_ATTEMPTS so a persistently failing video cannot be retried
+    indefinitely, which would keep spending model capacity.
+    """
+    record = await require_video_owner(video_id, user)
+
+    state = coerce(record.get("status"))
+    if state.is_active:
+        raise HTTPException(
+            status_code=409, detail="Analysis is already running for this video."
+        )
+    if state is JobState.UPLOADED:
+        raise HTTPException(
+            status_code=409,
+            detail="This video has not been analysed yet; start an analysis instead.",
+        )
 
     path = _resolve_within_uploads(record["stored_filename"])
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Video payload not found.")
 
-    from extractor import extract_and_store
-    from analyzer import check_pending_frames
+    try:
+        updated = await pipeline.submit(video_id, allow_retry=True)
+    except AlreadyRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RetryLimitReached as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except PipelineError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
-    def run_pipeline(file_path: str, vid: str):
-        logger.info("Analysis pipeline started for %s", vid)
-        try:
-            extract_and_store(file_path, vid)
-            check_pending_frames(video_id=vid)
-            logger.info("Analysis pipeline finished for %s", vid)
-        except Exception:
-            # Background tasks run after the response; log rather than lose it.
-            logger.exception("Analysis pipeline failed for %s", vid)
+    background_tasks.add_task(pipeline.run_job, video_id, str(path))
 
-    background_tasks.add_task(run_pipeline, str(path), video_id)
-    await video_repo.set_status(video_id, "ANALYZING")
+    job = video_repo.job_view(updated)
+    return {"video_id": video_id, "status": job["state"], "job": job}
 
-    return {
-        "video_id": video_id,
-        "status": "ANALYZING",
-        "message": "Neural analysis initiated. Real-time feedback incoming.",
-    }
+
+# Frames fetched per /violations page. DynamoDB returns at most 1 MB per
+# query regardless, so this bounds the work and the response size.
+VIOLATIONS_PAGE_SIZE = 200
+MAX_VIOLATION_PAGES = 25
 
 
 @app.get("/violations/{video_id}")
-async def get_violations(video_id: str, user: dict = Depends(get_current_user)):
-    """Return detections for a video the caller owns."""
-    await require_video_owner(video_id, user)
+async def get_violations(
+    video_id: str,
+    cursor: Optional[str] = Query(
+        default=None,
+        description="Opaque frame_number cursor from a previous response.",
+    ),
+    limit: int = Query(default=VIOLATIONS_PAGE_SIZE, ge=1, le=1000),
+    user: dict = Depends(get_current_user),
+):
+    """Detections for a video the caller owns, with the job's real state.
+
+    Paginated by frame number: a long video can hold more frames than one
+    DynamoDB query returns, and the previous single-call implementation
+    silently truncated at the 1 MB page boundary.
+
+    `job` carries the authoritative state. A client must not treat an empty
+    `detections` list as "compliant" unless `job.state` is "completed".
+    """
+    record = await require_video_owner(video_id, user)
 
     table_name = os.getenv("DYNAMODB_TABLE_NAME", "NovaFlowFrames")
     dynamodb = boto3.resource(
@@ -466,25 +556,99 @@ async def get_violations(video_id: str, user: dict = Depends(get_current_user)):
     )
     table = dynamodb.Table(table_name)
 
+    query_kwargs = {
+        "KeyConditionExpression": Key("video_id").eq(video_id),
+        "Limit": limit,
+    }
+    if cursor is not None:
+        try:
+            start_frame = int(cursor)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid cursor")
+        query_kwargs["ExclusiveStartKey"] = {
+            "video_id": video_id,
+            "frame_number": start_frame,
+        }
+
     try:
-        response = table.query(KeyConditionExpression=Key("video_id").eq(video_id))
+        response = table.query(**query_kwargs)
     except (BotoCoreError, ClientError):
         # Do not echo botocore detail (table names, ARNs) to the client.
         logger.exception("DynamoDB query failed for video %s", video_id)
         raise HTTPException(status_code=502, detail="Analysis store unavailable")
 
-    items = response.get("Items", [])
+    items = response.get("Items", []) or []
+
     all_detections = []
+    audited_frames = 0
+    failed_frames = 0
     for item in items:
+        status = item.get("status")
+        if status == "audited":
+            audited_frames += 1
+        elif status == "audit_failed":
+            failed_frames += 1
+
+        timestamp = _as_float(item.get("timestamp"))
         for detection in item.get("detections", []) or []:
-            detection["timestamp"] = float(item.get("timestamp", 0))
-            all_detections.append(detection)
+            # Frame context the UI needs to seek and attribute the finding.
+            detection["timestamp"] = timestamp
+            detection["frame_number"] = _as_int(item.get("frame_number"))
+            all_detections.append(_normalise_detection(detection))
+
+    last_key = response.get("LastEvaluatedKey") or None
+    next_cursor = (
+        str(_as_int(last_key.get("frame_number"))) if last_key else None
+    )
 
     return {
         "video_id": video_id,
         "detections": all_detections,
+        # Frames in THIS page. `job.frames_extracted` is the total.
         "frame_count": len(items),
+        "audited_frames": audited_frames,
+        "failed_frames": failed_frames,
+        "next_cursor": next_cursor,
+        "has_more": next_cursor is not None,
+        "job": video_repo.job_view(record),
     }
+
+
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalise_detection(detection: dict) -> dict:
+    """Convert stored values into JSON-friendly types.
+
+    DynamoDB returns numbers as Decimal, which is not JSON serialisable.
+    Optional fields stay absent when the model never supplied them, so the
+    client can tell "no confidence given" from "confidence zero".
+    """
+    out = {
+        "category": str(detection.get("category") or "violation"),
+        "description": str(detection.get("description") or ""),
+        "timestamp": _as_float(detection.get("timestamp")),
+        "frame_number": _as_int(detection.get("frame_number")),
+    }
+    if detection.get("risk_level") is not None:
+        out["risk_level"] = str(detection["risk_level"])
+    if detection.get("confidence") is not None:
+        out["confidence"] = _as_float(detection["confidence"])
+    box = detection.get("bounding_box")
+    if isinstance(box, (list, tuple)) and len(box) == 4:
+        out["bounding_box"] = [_as_float(v) for v in box]
+    return out
 
 
 @app.get("/submissions")

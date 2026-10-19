@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import analyzer
+from detections import Detection, FrameAnalysis, failed_analysis
 
 
 # --------------------------------------------------------------------------
@@ -40,19 +41,22 @@ PENDING_FRAME = {
     "status": "pending_audit",
 }
 
-VALID_ANALYSIS = {
-    "scene_description": "A person holding a beverage can.",
-    "violations": [
-        {
-            "category": "competitor_logo",
-            "description": "Competitor branding visible on can.",
-            "confidence": 0.91,
-            "bounding_box": [100, 200, 300, 400],
-            "risk_level": "High",
-        }
+# Phase 4: analyze_frame_with_nova returns a validated FrameAnalysis rather
+# than a raw dict, so the stand-in is built with the real model. The intent of
+# every test below is unchanged.
+VALID_ANALYSIS = FrameAnalysis(
+    scene_description="A person holding a beverage can.",
+    recommendation="Blur the logo region.",
+    detections=[
+        Detection(
+            category="competitor_logo",
+            description="Competitor branding visible on can.",
+            confidence=0.91,
+            bounding_box=[100.0, 200.0, 300.0, 400.0],
+            risk_level="high",
+        )
     ],
-    "recommendation": "Blur the logo region.",
-}
+)
 
 
 def _mock_table(items):
@@ -122,11 +126,18 @@ def test_successful_analysis_is_persisted_to_dynamodb(frame_jpeg_bytes):
     values = kwargs["ExpressionAttributeValues"]
     assert values[":s"] == "audited"
     # detections is stored as a list for GET /violations/{video_id} to read.
-    assert values[":d"] == VALID_ANALYSIS["violations"]
-    # analysis_report is stored as a JSON string.
-    assert json.loads(values[":r"]) == VALID_ANALYSIS
+    stored = values[":d"]
+    assert len(stored) == 1
+    assert stored[0]["category"] == "competitor_logo"
+    # analysis_report is a JSON summary, not the raw model payload.
+    report = json.loads(values[":r"])
+    assert report["detection_count"] == 1
+    assert report["scene_description"] == VALID_ANALYSIS.scene_description
     assert kwargs["ExpressionAttributeNames"] == {"#s": "status"}
     assert ":t" in values  # updated_at timestamp
+    # Phase 4 traceability.
+    assert values[":m"] == analyzer.MODEL_ID
+    assert values[":p"] == analyzer.PIPELINE_VERSION
 
 
 def test_detections_survive_round_trip_for_violations_endpoint(frame_jpeg_bytes):
@@ -147,13 +158,14 @@ def test_detections_survive_round_trip_for_violations_endpoint(frame_jpeg_bytes)
     assert len(stored) == 1
     detection = stored[0]
     assert detection["category"] == "competitor_logo"
-    assert detection["confidence"] == pytest.approx(0.91)
+    # Stored as Decimal so DynamoDB round-trips it exactly.
+    assert float(detection["confidence"]) == pytest.approx(0.91)
     assert len(detection["bounding_box"]) == 4
 
 
 def test_frame_with_no_violations_is_still_audited(frame_jpeg_bytes):
     """A clean frame is a successful audit with an empty detection list."""
-    clean = {"scene_description": "An empty room.", "violations": []}
+    clean = FrameAnalysis(scene_description="An empty room.", detections=[])
     table = _mock_table([PENDING_FRAME])
     s3 = _mock_s3(frame_jpeg_bytes)
 
@@ -178,7 +190,7 @@ def test_bedrock_error_is_not_recorded_as_a_successful_audit(frame_jpeg_bytes):
     Bedrock call fails. Treating that as a clean audit would report "no
     violations found" for a frame that was never actually analysed.
     """
-    failed = {"error": "ThrottlingException: rate exceeded", "violations": []}
+    failed = failed_analysis("ThrottlingException: rate exceeded")
     table = _mock_table([PENDING_FRAME])
     s3 = _mock_s3(frame_jpeg_bytes)
 
@@ -197,11 +209,7 @@ def test_bedrock_error_is_not_recorded_as_a_successful_audit(frame_jpeg_bytes):
 
 def test_unparseable_model_output_is_not_a_successful_audit(frame_jpeg_bytes):
     """A JSON parse failure is a failure, not a clean frame."""
-    unparseable = {
-        "scene_description": "prose, no JSON",
-        "violations": [],
-        "error": "JSON_PARSE_FAILED",
-    }
+    unparseable = failed_analysis("JSON_PARSE_FAILED")
     table = _mock_table([PENDING_FRAME])
     s3 = _mock_s3(frame_jpeg_bytes)
 
@@ -245,7 +253,7 @@ def test_summary_reports_real_counts(frame_jpeg_bytes):
     table = _mock_table(frames)
     s3 = _mock_s3(frame_jpeg_bytes)
 
-    results = [VALID_ANALYSIS, {"error": "boom", "violations": []}]
+    results = [VALID_ANALYSIS, failed_analysis("boom")]
 
     with patch.object(analyzer, "table", table), \
          patch.object(analyzer, "s3_client", s3), \
@@ -255,6 +263,8 @@ def test_summary_reports_real_counts(frame_jpeg_bytes):
     assert summary["audited"] == 1
     assert summary["failed"] == 1
     assert summary["pending"] == 2
+    # Phase 4 also reports how many detections were stored.
+    assert summary["detections"] == 1
 
 
 def test_no_pending_frames_is_not_an_error():

@@ -17,11 +17,15 @@ import { motion, AnimatePresence } from "framer-motion";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import {
-  uploadReel,
-  startAnalysis,
-  fetchViolations,
+  ApiError,
+  fetchAllViolations,
+  fetchJob,
   isRenderableDetection,
+  retryAnalysis,
+  startAnalysis,
+  uploadReel,
   type Detection,
+  type Job,
 } from "../lib/api";
 
 function cn(...inputs: ClassValue[]) {
@@ -29,19 +33,28 @@ function cn(...inputs: ClassValue[]) {
 }
 
 /**
- * Phases of the real audit workflow.
+ * Local phases for the parts of the flow the UI owns.
  *
- *   idle      nothing submitted yet (or a failure was dismissed)
+ *   idle      nothing submitted yet
  *   uploading POST /upload-reel in flight
  *   starting  POST /analyze/{id} in flight
- *   analyzing the backend accepted the job and is working on it
- *   failed    upload or trigger failed; retry is offered
+ *   tracking  the backend owns the job now; `job.state` is authoritative
+ *   failed    the upload or the trigger failed client-side
  *
- * There is deliberately no 'complete' phase: the backend exposes no
- * completion signal (see app/lib/api.ts), so the UI must not claim an audit
- * has finished. It reports only what has actually been persisted so far.
+ * Phase 4: once a job exists, the backend's validated `job.state` decides
+ * what is displayed. The UI no longer infers progress or completion - it was
+ * previously unable to show completion at all, because no completion signal
+ * existed.
  */
-type AuditPhase = "idle" | "uploading" | "starting" | "analyzing" | "failed";
+type AuditPhase = "idle" | "uploading" | "starting" | "tracking" | "failed";
+
+/** Polling cadence while a job is active, and the bound on how long we wait. */
+const POLL_INTERVAL_MS = 3000;
+const POLL_BACKOFF_MS = 15000;
+const MAX_POLL_FAILURES = 5;
+// ~10 minutes at the normal cadence. A job still active after this is
+// reported as untracked rather than polled forever.
+const MAX_POLLS = 200;
 
 /** The local record shown in this view's recent-uploads list. */
 interface SubmissionSummary {
@@ -61,7 +74,10 @@ export default function HUDView() {
   // Real audit workflow state.
   const [auditPhase, setAuditPhase] = React.useState<AuditPhase>("idle");
   const [auditError, setAuditError] = React.useState<string | null>(null);
-  const [framesAudited, setFramesAudited] = React.useState(0);
+  // The backend's authoritative job record. Null until a job exists.
+  const [job, setJob] = React.useState<Job | null>(null);
+  const [pollNotice, setPollNotice] = React.useState<string | null>(null);
+  const [isRetrying, setIsRetrying] = React.useState(false);
   // Set once the upload succeeds, so a retry after a failed trigger does
   // not re-upload the same file.
   const [uploadedVideoId, setUploadedVideoId] = React.useState<string | null>(null);
@@ -70,7 +86,6 @@ export default function HUDView() {
   const inFlightRef = React.useRef(false);
   const videoInputRef = React.useRef<HTMLInputElement>(null);
   const videoRef = React.useRef<HTMLVideoElement>(null);
-  const pollingRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [videoSrc, setVideoSrc] = React.useState<string | null>(null);
   const [selectedFile, setSelectedFile] = React.useState<File | null>(null);
@@ -87,7 +102,6 @@ export default function HUDView() {
   // previously rendered a fixed, fabricated list ('4096 clusters synced') that
   // reported success regardless of what the backend had done.
   const steps = React.useMemo(() => {
-    const done = (s: AuditPhase[]) => s.includes(auditPhase);
     return [
       {
         title: "Payload Upload",
@@ -111,12 +125,12 @@ export default function HUDView() {
         status:
           auditPhase === "starting"
             ? "active"
-            : done(["analyzing"])
+            : job
               ? "success"
               : auditPhase === "failed" && uploadedVideoId
                 ? "error"
                 : "pending",
-        desc: done(["analyzing"])
+        desc: job
           ? "Backend accepted the analysis job."
           : auditPhase === "starting"
             ? "Requesting frame extraction and audit..."
@@ -124,48 +138,147 @@ export default function HUDView() {
         time: "",
       },
       {
-        title: "Frame Audit",
-        status: auditPhase === "analyzing" ? "active" : "pending",
+        // Stages and counts come from the backend's job record. Nothing here
+        // is inferred, and no percentage is shown, because the frame total is
+        // unknown until extraction finishes.
+        title: "Frame Extraction",
+        status:
+          job?.state === "extracting"
+            ? "active"
+            : job?.frames_extracted
+              ? "success"
+              : job?.state === "failed" && job?.frames_extracted === null
+                ? "error"
+                : "pending",
         desc:
-          auditPhase === "analyzing"
-            ? `${framesAudited} frame(s) recorded, ${detections.length} violation(s) so far.`
-            : "No frames audited yet.",
+          job?.frames_extracted != null
+            ? `${job.frames_extracted} frame(s) extracted.`
+            : job?.state === "extracting"
+              ? "Decoding and sampling frames..."
+              : "Not started.",
+        time: "",
+      },
+      {
+        title: "Frame Audit",
+        status:
+          job?.state === "analyzing"
+            ? "active"
+            : job?.state === "completed"
+              ? "success"
+              : job?.state === "failed" && job?.frames_extracted != null
+                ? "error"
+                : "pending",
+        desc:
+          job?.state === "completed"
+            ? `${job.frames_audited ?? 0} frame(s) audited, ` +
+              `${job.detections_recorded ?? 0} violation(s) recorded.`
+            : job?.state === "analyzing"
+              ? "Sending frames to the model..."
+              : job?.state === "failed"
+                ? job.error_summary ?? "Analysis failed."
+                : "No frames audited yet.",
         time: "",
       },
     ];
-  }, [auditPhase, uploadedVideoId, framesAudited, detections.length]);
+  }, [auditPhase, uploadedVideoId, job]);
 
-  // Poll for persisted results while the backend is working. This is the
-  // only results mechanism the backend offers; it reports progress, never
-  // completion.
+  // Track the backend job. Polls ONLY while the job is non-terminal, and
+  // stops on completion, failure, unmount, or loss of authorization.
+  // Derived outside the effect so the effect does not depend on the whole
+  // `job` object: that identity changes on every poll, which would tear down
+  // and restart polling in a loop.
+  const jobIsTerminal = job?.is_terminal ?? false;
+
   React.useEffect(() => {
-    if (!activeVideoId || auditPhase !== "analyzing") return;
+    if (!activeVideoId || auditPhase !== "tracking") return;
+    if (jobIsTerminal) return;
 
     let cancelled = false;
+    let failures = 0;
+    let polls = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-    const pollViolations = async () => {
+    const loadResults = async (videoId: string) => {
       try {
-        const data = await fetchViolations(activeVideoId);
+        const data = await fetchAllViolations(videoId);
         if (cancelled) return;
         setDetections(data.detections);
-        setFramesAudited(data.frame_count);
       } catch (err) {
-        // A transient poll failure is not an audit failure; surface it
-        // without tearing down the workflow state.
-        console.error("Violation poll failed", err);
+        if (!cancelled) console.error("Could not load results", err);
       }
     };
 
-    void pollViolations();
-    pollingRef.current = setInterval(pollViolations, 3000);
+    const poll = async () => {
+      if (cancelled) return;
+      polls += 1;
+
+      try {
+        const next = await fetchJob(activeVideoId);
+        if (cancelled) return;
+
+        failures = 0;
+        setPollNotice(null);
+        setJob(next);
+
+        if (next.is_terminal) {
+          // Results are only read once the backend says the job finished, so
+          // a partial read can never be shown as a final verdict.
+          if (next.state === "completed") await loadResults(activeVideoId);
+          return; // terminal: stop polling
+        }
+      } catch (err) {
+        if (cancelled) return;
+
+        if (err instanceof ApiError && err.isUnauthorized) {
+          // Session gone: stop rather than hammering a route that will keep
+          // rejecting us.
+          setPollNotice("Your session expired. Please sign in again.");
+          return;
+        }
+        if (err instanceof ApiError && (err.status === 403 || err.status === 404)) {
+          setPollNotice("This video is no longer available.");
+          return;
+        }
+        if (err instanceof ApiError && err.status === 429) {
+          // Throttled: slow down rather than giving up or spinning.
+          failures += 1;
+          setPollNotice("Server is busy; checking less often.");
+          timer = setTimeout(poll, POLL_BACKOFF_MS);
+          return;
+        }
+
+        failures += 1;
+        if (failures >= MAX_POLL_FAILURES) {
+          // A network problem is NOT an audit failure: the job may well be
+          // running. Say exactly that instead of inventing an outcome.
+          setPollNotice(
+            "Lost contact with the server. The analysis may still be running."
+          );
+          return;
+        }
+        setPollNotice("Reconnecting...");
+      }
+
+      if (polls >= MAX_POLLS) {
+        setPollNotice(
+          "Still running after a long time. Reload to check again."
+        );
+        return;
+      }
+
+      // Back off while erroring, and never overlap requests: the next poll is
+      // scheduled only after this one settles.
+      const delay = failures > 0 ? POLL_BACKOFF_MS : POLL_INTERVAL_MS;
+      timer = setTimeout(poll, delay);
+    };
+
+    void poll();
+
     return () => {
       cancelled = true;
-      if (pollingRef.current !== null) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
+      if (timer !== null) clearTimeout(timer);
     };
-  }, [activeVideoId, auditPhase]);
+  }, [activeVideoId, auditPhase, jobIsTerminal]);
 
   return (
     <motion.div 
@@ -282,33 +395,96 @@ export default function HUDView() {
                 </div>
               </div>
 
-              {/* Real workflow status. Never reports completion: the backend
-                  has no completion signal (see app/lib/api.ts). */}
-              {auditPhase !== "idle" && (
+              {/* Workflow status. Every value below comes from the backend's
+                  validated job record: "Audit complete" appears only when the
+                  server reports state === "completed", which it sets solely
+                  after analysis finished AND its results were persisted. */}
+              {(auditPhase !== "idle" || job) && (
                 <div
                   role="status"
                   aria-live="polite"
+                  data-testid="audit-status"
                   className={cn(
-                    "rounded-2xl border px-5 py-4 text-[10px] font-bold uppercase tracking-widest",
-                    auditPhase === "failed"
+                    "rounded-2xl border px-5 py-4 text-[10px] font-bold uppercase tracking-widest space-y-1",
+                    auditPhase === "failed" || job?.state === "failed"
                       ? "border-critical/40 bg-critical/10 text-critical"
-                      : "border-accent/30 bg-accent/5 text-accent"
+                      : job?.state === "completed"
+                        ? "border-success/40 bg-success/10 text-success"
+                        : "border-accent/30 bg-accent/5 text-accent"
                   )}
                 >
-                  {auditPhase === "uploading" && "Uploading payload..."}
-                  {auditPhase === "starting" && "Starting analysis..."}
-                  {auditPhase === "analyzing" && (
+                  {auditPhase === "uploading" && <div>Uploading payload...</div>}
+                  {auditPhase === "starting" && <div>Starting analysis...</div>}
+
+                  {auditPhase === "failed" && (
+                    <div>Audit failed: {auditError ?? "unknown error"}</div>
+                  )}
+
+                  {job && auditPhase === "tracking" && (
                     <>
-                      Analysis in progress — {framesAudited} frame(s) recorded,{" "}
-                      {detections.length} violation(s) found so far
+                      {job.state === "completed" ? (
+                        <div>
+                          Audit complete — {job.frames_audited ?? 0} frame(s)
+                          analyzed, {job.detections_recorded ?? 0} violation(s)
+                          found
+                        </div>
+                      ) : job.state === "failed" ? (
+                        <div>
+                          Audit failed: {job.error_summary ?? "unknown error"}
+                        </div>
+                      ) : (
+                        <div>
+                          {job.stage}
+                          {job.frames_extracted != null && (
+                            <> — {job.frames_extracted} frame(s) extracted</>
+                          )}
+                        </div>
+                      )}
+                      {job.attempt > 1 && (
+                        <div className="opacity-60">
+                          Attempt {job.attempt} of {job.max_attempts}
+                        </div>
+                      )}
                     </>
                   )}
-                  {auditPhase === "failed" && (
-                    <>
-                      Audit failed: {auditError ?? "unknown error"}
-                    </>
+
+                  {pollNotice && (
+                    <div data-testid="poll-notice" className="opacity-70">
+                      {pollNotice}
+                    </div>
                   )}
                 </div>
+              )}
+
+              {/* Retry is offered only for a job the backend says has
+                  finished unsuccessfully, and only while attempts remain. */}
+              {job?.state === "failed" && job.attempt < job.max_attempts && (
+                <button
+                  data-testid="retry-audit"
+                  disabled={isRetrying}
+                  onClick={async () => {
+                    if (isRetrying || !activeVideoId) return;
+                    setIsRetrying(true);
+                    setPollNotice(null);
+                    try {
+                      const next = await retryAnalysis(activeVideoId);
+                      setDetections([]);
+                      setJob(next);
+                      setAuditPhase("tracking");
+                    } catch (err) {
+                      setPollNotice(
+                        err instanceof Error
+                          ? err.message
+                          : "Could not retry the analysis."
+                      );
+                    } finally {
+                      setIsRetrying(false);
+                    }
+                  }}
+                  className="w-full h-12 rounded-2xl border border-white/10 bg-white/5 hover:bg-white/10 text-white font-bold text-xs uppercase tracking-widest transition-all"
+                >
+                  {isRetrying ? "Retrying..." : "Retry Analysis"}
+                </button>
               )}
 
               <button
@@ -317,7 +493,9 @@ export default function HUDView() {
                   !selectedFile ||
                   auditPhase === "uploading" ||
                   auditPhase === "starting" ||
-                  auditPhase === "analyzing"
+                  // Locked while the backend still owns a non-terminal job, so
+                  // a second run cannot be started over the first.
+                  (auditPhase === "tracking" && !job?.is_terminal)
                 }
                 onClick={async () => {
                   if (!selectedFile) return;
@@ -359,8 +537,11 @@ export default function HUDView() {
                     // call was missing entirely, so no upload was ever
                     // analysed.
                     setAuditPhase("starting");
-                    await startAnalysis(videoId);
-                    setAuditPhase("analyzing");
+                    const started = await startAnalysis(videoId);
+                    // Adopt the job the backend returned; its state - not a
+                    // local guess - drives everything from here.
+                    if (started.job) setJob(started.job);
+                    setAuditPhase("tracking");
                   } catch (err) {
                     setAuditError(
                       err instanceof Error ? err.message : String(err)
@@ -375,14 +556,15 @@ export default function HUDView() {
                   selectedFile &&
                     auditPhase !== "uploading" &&
                     auditPhase !== "starting" &&
-                    auditPhase !== "analyzing"
+                    !(auditPhase === "tracking" && !job?.is_terminal)
                     ? "bg-accent text-white shadow-xl hover:translate-y-[-2px]"
                     : "bg-white/5 text-white/10"
                 )}
               >
                 {auditPhase === "uploading" && "Uploading..."}
                 {auditPhase === "starting" && "Starting..."}
-                {auditPhase === "analyzing" && "Analyzing..."}
+                {auditPhase === "tracking" &&
+                  (job?.is_terminal ? "Launch Audit" : "Analyzing...")}
                 {auditPhase === "failed" && "Retry Audit"}
                 {auditPhase === "idle" && "Launch Audit"}
               </button>

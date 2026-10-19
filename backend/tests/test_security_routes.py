@@ -314,10 +314,13 @@ def test_submissions_no_longer_fabricates_status(client, fake_db, alice_client):
     """Status must come from the ownership record, not hash(video_id)."""
     import anyio
 
+    from job_state import JobState
+
     anyio.run(_own_video, fake_db, "alice", "vid_aaaa1111")
     body = client.get("/submissions", headers=alice_client).json()["submissions"][0]
 
-    assert body["status"] == "UPLOADED"
+    # Phase 4 replaced the free-text status with the validated job state.
+    assert body["status"] == JobState.UPLOADED.value
     assert "agent" not in body, "the fabricated agent field should be gone"
     assert body["created_at"] is not None
 

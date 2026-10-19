@@ -14,6 +14,17 @@ Environment variables (names only; never commit values):
                             Optional. Default 1440 (24h), preserving the
                             previous session lifetime.
     MAX_UPLOAD_BYTES        Optional. Default 104857600 (100 MiB).
+    MAX_VIDEO_DURATION_SECONDS
+                            Optional. Longest clip accepted for analysis.
+                            Default 60.
+    FRAME_SAMPLE_FPS        Optional. Frames extracted per second of video.
+                            Default 1.
+    MAX_FRAMES_PER_VIDEO    Optional. Hard cap on extracted frames, so a long
+                            or high-rate video cannot run unbounded. Default 120.
+    FFMPEG_TIMEOUT_SECONDS  Optional. Wall-clock limit for one FFmpeg run.
+                            Default 300.
+    BEDROCK_MAX_ATTEMPTS    Optional. Bounded retries per frame for retryable
+                            Bedrock errors. Default 3.
     MEDIA_TOKEN_TTL_MINUTES Optional. Lifetime of the video playback token
                             carried in the ?access_token query parameter.
                             Default 15. Keep it short: it appears in URLs.
@@ -215,6 +226,44 @@ def load_max_upload_bytes() -> int:
     return _int_env("MAX_UPLOAD_BYTES", 100 * 1024 * 1024, minimum=1024)
 
 
+def load_max_video_duration_seconds() -> int:
+    """Longest clip accepted for analysis.
+
+    Bounds both FFmpeg work and Bedrock spend: at FRAME_SAMPLE_FPS frames per
+    second, duration directly determines how many model calls a video costs.
+    """
+    return _int_env("MAX_VIDEO_DURATION_SECONDS", 60, minimum=1)
+
+
+def load_frame_sample_fps() -> int:
+    """Frames extracted per second of source video.
+
+    1 fps is the pre-existing behaviour and is retained as the default so
+    results stay comparable with earlier runs.
+    """
+    return _int_env("FRAME_SAMPLE_FPS", 1, minimum=1)
+
+
+def load_max_frames_per_video() -> int:
+    """Hard cap on extracted frames.
+
+    Duration and fps already bound this, but a malformed container can report
+    a short duration and still yield far more frames. The cap is the backstop
+    that keeps one upload from costing an unbounded number of model calls.
+    """
+    return _int_env("MAX_FRAMES_PER_VIDEO", 120, minimum=1)
+
+
+def load_ffmpeg_timeout_seconds() -> int:
+    """Wall-clock limit for one FFmpeg invocation."""
+    return _int_env("FFMPEG_TIMEOUT_SECONDS", 300, minimum=5)
+
+
+def load_bedrock_max_attempts() -> int:
+    """Bounded retries per frame for retryable Bedrock failures."""
+    return _int_env("BEDROCK_MAX_ATTEMPTS", 3, minimum=1)
+
+
 def load_allowed_video_extensions() -> frozenset[str]:
     raw = os.getenv("ALLOWED_VIDEO_EXTENSIONS")
     if raw is None or not raw.strip():
@@ -359,6 +408,11 @@ class Settings:
         self.media_token_ttl_minutes = load_media_token_ttl_minutes()
         self.max_upload_bytes = load_max_upload_bytes()
         self.allowed_video_extensions = load_allowed_video_extensions()
+        self.max_video_duration_seconds = load_max_video_duration_seconds()
+        self.frame_sample_fps = load_frame_sample_fps()
+        self.max_frames_per_video = load_max_frames_per_video()
+        self.ffmpeg_timeout_seconds = load_ffmpeg_timeout_seconds()
+        self.bedrock_max_attempts = load_bedrock_max_attempts()
         self.cors_origins = load_cors_origins()
         self.rate_limit_enabled = load_rate_limit_enabled()
         self.rate_limit_login = load_rate_limit_login()
@@ -380,6 +434,11 @@ class Settings:
             f"media_token_ttl_minutes={self.media_token_ttl_minutes}, "
             f"max_upload_bytes={self.max_upload_bytes}, "
             f"allowed_video_extensions={sorted(self.allowed_video_extensions)}, "
+            f"max_video_duration_seconds={self.max_video_duration_seconds}, "
+            f"frame_sample_fps={self.frame_sample_fps}, "
+            f"max_frames_per_video={self.max_frames_per_video}, "
+            f"ffmpeg_timeout_seconds={self.ffmpeg_timeout_seconds}, "
+            f"bedrock_max_attempts={self.bedrock_max_attempts}, "
             f"cors_origins={self.cors_origins}, "
             f"rate_limit_enabled={self.rate_limit_enabled}, "
             f"rate_limit_login={self.rate_limit_login!r}, "

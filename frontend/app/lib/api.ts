@@ -64,7 +64,9 @@ export interface UploadReelResponse {
 
 export interface StartAnalysisResponse {
   video_id: string;
+  /** Mirrors `job.state`; retained for backwards compatibility. */
   status: string;
+  job?: Job;
   message?: string;
 }
 
@@ -83,7 +85,80 @@ export interface Detection {
 export interface ViolationsResponse {
   video_id: string;
   detections: Detection[];
+  /** Frames in THIS page. `job.frames_extracted` is the total. */
   frame_count: number;
+  audited_frames: number;
+  failed_frames: number;
+  next_cursor: string | null;
+  has_more: boolean;
+  /** Authoritative job state. Never infer completion from an empty list. */
+  job: Job;
+}
+
+/**
+ * Analysis job state, as reported by GET /jobs/{video_id}.
+ *
+ * `state` is the backend's validated job state. The server only sets
+ * "completed" once analysis finished AND its results were persisted, so this
+ * is the one field a client may use to decide an audit is done.
+ */
+export type JobState =
+  | "uploaded"
+  | "queued"
+  | "extracting"
+  | "analyzing"
+  | "completed"
+  | "failed";
+
+export interface Job {
+  video_id: string;
+  state: JobState;
+  /** Human-readable stage name. Deliberately not a percentage. */
+  stage: string;
+  is_terminal: boolean;
+  is_active: boolean;
+  attempt: number;
+  max_attempts: number;
+  frames_extracted: number | null;
+  frames_audited: number | null;
+  frames_failed: number | null;
+  detections_recorded: number | null;
+  /** Safe summary written by the backend; never an exception string. */
+  error_summary: string | null;
+  model_id: string | null;
+  pipeline_version: string | null;
+  original_filename: string | null;
+  size_bytes: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+  completed_at: string | null;
+}
+
+/** Fetch the authoritative job state for a video. */
+export async function fetchJob(videoId: string): Promise<Job> {
+  const res = await fetch(
+    `${apiBaseUrl()}/jobs/${encodeURIComponent(videoId)}`,
+    { headers: authHeaders() }
+  );
+
+  if (!res.ok) {
+    throw await readError(res, `Could not fetch job status (HTTP ${res.status})`);
+  }
+  return (await res.json()) as Job;
+}
+
+/** Re-run analysis for a job that has reached a terminal state. */
+export async function retryAnalysis(videoId: string): Promise<Job> {
+  const res = await fetch(
+    `${apiBaseUrl()}/analyze/${encodeURIComponent(videoId)}/retry`,
+    { method: "POST", headers: authHeaders() }
+  );
+
+  if (!res.ok) {
+    throw await readError(res, `Could not retry analysis (HTTP ${res.status})`);
+  }
+  const data = await res.json();
+  return data.job as Job;
 }
 
 /** An error carrying the backend's HTTP status and `detail` message. */
@@ -159,9 +234,17 @@ export async function startAnalysis(videoId: string): Promise<StartAnalysisRespo
 }
 
 /** Fetch whatever detections have been persisted for a video so far. */
-export async function fetchViolations(videoId: string): Promise<ViolationsResponse> {
+export async function fetchViolations(
+  videoId: string,
+  options: { cursor?: string | null; limit?: number } = {}
+): Promise<ViolationsResponse> {
+  const params = new URLSearchParams();
+  if (options.cursor) params.set("cursor", options.cursor);
+  if (options.limit) params.set("limit", String(options.limit));
+  const query = params.toString();
+
   const res = await fetch(
-    `${apiBaseUrl()}/violations/${encodeURIComponent(videoId)}`,
+    `${apiBaseUrl()}/violations/${encodeURIComponent(videoId)}${query ? `?${query}` : ""}`,
     { headers: authHeaders() }
   );
 
@@ -174,6 +257,52 @@ export async function fetchViolations(videoId: string): Promise<ViolationsRespon
     video_id: data?.video_id ?? videoId,
     detections: Array.isArray(data?.detections) ? data.detections : [],
     frame_count: typeof data?.frame_count === "number" ? data.frame_count : 0,
+    audited_frames: typeof data?.audited_frames === "number" ? data.audited_frames : 0,
+    failed_frames: typeof data?.failed_frames === "number" ? data.failed_frames : 0,
+    next_cursor: data?.next_cursor ?? null,
+    has_more: Boolean(data?.has_more),
+    job: data?.job,
+  };
+}
+
+/**
+ * Fetch every page of detections for a video.
+ *
+ * A long clip holds more frames than one DynamoDB query returns. `maxPages`
+ * bounds the walk so a pathological response cannot loop forever.
+ */
+export async function fetchAllViolations(
+  videoId: string,
+  maxPages = 20
+): Promise<ViolationsResponse> {
+  let cursor: string | null = null;
+  let pages = 0;
+  const detections: Detection[] = [];
+  let frameCount = 0;
+  let audited = 0;
+  let failed = 0;
+  let job: Job | undefined;
+
+  do {
+    const page: ViolationsResponse = await fetchViolations(videoId, { cursor });
+    detections.push(...page.detections);
+    frameCount += page.frame_count;
+    audited += page.audited_frames;
+    failed += page.failed_frames;
+    job = page.job;
+    cursor = page.next_cursor;
+    pages += 1;
+  } while (cursor && pages < maxPages);
+
+  return {
+    video_id: videoId,
+    detections,
+    frame_count: frameCount,
+    audited_frames: audited,
+    failed_frames: failed,
+    next_cursor: cursor,
+    has_more: Boolean(cursor),
+    job: job as Job,
   };
 }
 

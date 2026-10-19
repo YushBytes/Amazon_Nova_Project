@@ -146,7 +146,42 @@ class FakeCollection:
         self._counter = 0
 
     def _matches(self, doc, query):
-        return all(doc.get(key) == value for key, value in query.items())
+        """Match a document against a query.
+
+        Supports plain equality plus the handful of operators the backend
+        actually uses, so a query that works against the real driver also
+        works here.
+        """
+        for key, expected in query.items():
+            actual = doc.get(key)
+            if isinstance(expected, dict):
+                for op, operand in expected.items():
+                    if op == "$in":
+                        if actual not in operand:
+                            return False
+                    elif op == "$nin":
+                        if actual in operand:
+                            return False
+                    elif op == "$ne":
+                        if actual == operand:
+                            return False
+                    elif op == "$exists":
+                        if (key in doc) is not bool(operand):
+                            return False
+                    elif op == "$gt":
+                        if not (actual is not None and actual > operand):
+                            return False
+                    elif op == "$lt":
+                        if not (actual is not None and actual < operand):
+                            return False
+                    else:
+                        raise NotImplementedError(
+                            f"FakeCollection does not implement {op!r}; add it "
+                            f"here rather than changing the query under test"
+                        )
+            elif actual != expected:
+                return False
+        return True
 
     async def find_one(self, query):
         for doc in self.docs:

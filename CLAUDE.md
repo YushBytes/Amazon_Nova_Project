@@ -53,8 +53,13 @@ reintroduced.
 | async `decode_token` called without `await` | `backend/projects.py` | `get_current_user` is async and awaits it; Phase 3 then centralised it in `auth.py`. |
 | Remediation returned its input unchanged | `backend/audit_manager.py` | The disguised mock was removed. Real Nova Canvas remediation is a later phase and is **not** implemented — do not re-add a stub that reports success. |
 
-**Still true:** the pipeline has never been run end to end against live AWS, so
-detection accuracy is unverified. See §3 for what has and has not been executed.
+**Phase 4** connected the pipeline end to end: a validated job state machine,
+real extraction/analysis stages, validated model output, and persisted results.
+See `docs/PIPELINE_ARCHITECTURE.md`.
+
+**Still true:** the pipeline has never been run against live AWS or Bedrock.
+Every external service is mocked in tests, so detection accuracy is
+**unmeasured** and no claim is made about it. See §3.
 
 ### 1.4 The README is materially inaccurate **[VERIFIED]**
 
@@ -219,6 +224,11 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **Never return exception text to a client.** The catch-all handler in `app.py` logs the traceback and returns a flat `{"detail": "Internal server error"}`. Catch `BotoCoreError`/`ClientError` around AWS calls and return a generic 502.
 - **Never log a password, hash, token, signing key, or model analysis body.** Log counts, ids, and exception *types*. Tests assert this.
 - **Never put a secret in a `NEXT_PUBLIC_*` variable** — those are compiled into the browser bundle and are public.
+- **A job is `completed` only when analysis finished AND its results were persisted.** Never set that state from anywhere but `pipeline.run_job`'s final transition, and never infer it on the client. An empty detections list means nothing unless `job.state === "completed"` - that distinction is the whole point of the state machine.
+- **Add new job states to `job_state.py`'s transition table**, not as free-text. `video_repo.transition` validates every move and is conditional on the current state, which is what prevents two workers advancing one job.
+- **Report named stages, never percentages.** The frame total is unknown until extraction finishes, so any earlier percentage is invented.
+- **Treat model output as untrusted.** Parse it through `detections.parse_frame_analysis`. A missing confidence or an invalid box must stay absent rather than being defaulted - a fabricated `0.0` is worse than nothing.
+- **A pipeline stage must raise, not return `None`, on failure.** `extractor.ExtractionError` messages are shown to the video's owner, so they must carry no path, bucket, or exception text.
 - **Media access uses a scoped token.** A browser `<video>` element cannot send an `Authorization` header, so `GET /uploads/{file}` takes a short-lived token (`MEDIA_TOKEN_TTL_MINUTES`, default 15) bound to one `video_id`. Session tokens and media tokens are not interchangeable.
 - **Never log a full URL or request target.** Playback URLs carry a token in the query string. `backend/logging_setup.py` redacts sensitive query values on the request-emitting loggers; if you add a logger that prints a URL, register it there. Log `request.url.path`, never `request.url`.
 - **Rate-limit new credential-style endpoints** by adding a rule in `rate_limit.build_credential_rules`. Use middleware, not a route decorator: a decorator runs after request validation, so a malformed body bypasses the counter entirely (measured, see `rate_limit.py`). Counters are per-process.
@@ -231,6 +241,10 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **Rate limiting is per-process.** `/auth/login` and `/auth/signup` are throttled, but counters live in process memory, so the effective limit is multiplied by the worker count. Accurate for the single-process Dockerfile; **not** distributed protection. No per-account throttle either.
 - **No token revocation.** Tokens live in `localStorage` and are valid until expiry; rotating `JWT_SECRET_KEY` is the only break-glass.
 - **Media tokens travel in URLs.** Redacted from this process's logs, but still reach browser history, `Referer`, and any proxy/CDN log — which this application cannot redact.
+- **Analysis runs in an in-process `BackgroundTasks` worker, so there is no crash recovery.** A restart orphans running jobs in `extracting`/`analyzing`; `pipeline.find_stuck_jobs()` detects them but nothing resumes them. A durable queue is the real fix and is out of scope.
+- **Source videos live on the application host's local disk**, not S3. A replaced container loses them.
+- **Frame sampling is 1 fps**, so a violation visible for under ~1 second can be missed.
+- **There is no brand-rule configuration** - one static prompt in `prompts.py`. No per-client policies, and no legal/regulatory evaluation.
 - **Pre-Phase-3 uploads have no ownership record** and are therefore inaccessible. The uploader was never recorded, so it cannot be recovered from the data. Options in `docs/SECURITY_OPERATIONS.md` §6.
 - **AWS hardening is a template, not applied.** `infra/iam_policy_least_privilege.json` has placeholders; the bucket naming conflict (`novaflow-media` vs `brand-guardian-*`) is unresolved, and no bucket hardening is configured.
 - **Real-MongoDB integration tests are unverified.** Written and safety-guarded in `tests/test_integration_mongodb.py`, but never executed — no database or Docker daemon was available. Run `pytest -m requires_mongodb`.
@@ -260,7 +274,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0, 1, 2, 3 and 3.5 are **complete, committed, and pushed**: the repository is correctly rooted, flattened, private and tracking `origin/main`; the four critical Phase 1 defects are fixed with regression tests; authentication, authorization, resource ownership and upload handling are hardened, and Phase 3.5 added credential-endpoint rate limiting, safe database initialization, media-token log redaction, and a least-privilege IAM template (`docs/SECURITY_AUDIT.md`, `docs/SECURITY_OPERATIONS.md`). **Phase 4 (connect the end-to-end pipeline) is next and has not been started.** It still needs the maintainer decisions recorded in §9 — do not start it until it is explicitly assigned.
+Phases 0, 1, 2, 3, 3.5 and 4 are **complete, committed, and pushed**: the repository is correctly rooted, flattened, private and tracking `origin/main`; the four critical Phase 1 defects are fixed with regression tests; authentication, authorization, resource ownership and upload handling are hardened, and Phase 3.5 added credential-endpoint rate limiting, safe database initialization, media-token log redaction, and a least-privilege IAM template (`docs/SECURITY_AUDIT.md`, `docs/SECURITY_OPERATIONS.md`). Phase 4 connected the end-to-end pipeline (`docs/PIPELINE_ARCHITECTURE.md`, `docs/PIPELINE_OPERATIONS.md`). **Phase 5 has not been started**, and the roadmap's remaining phases (cleanup, reliability, frontend completion, remediation, reconstruction, tests/CI/release) are still open. It still needs the maintainer decisions recorded in §9 — do not start it until it is explicitly assigned.
 
 ---
 
