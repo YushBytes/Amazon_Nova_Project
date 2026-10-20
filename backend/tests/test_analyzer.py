@@ -60,9 +60,17 @@ VALID_ANALYSIS = FrameAnalysis(
 
 
 def _mock_table(items):
-    """A stand-in for the module-level DynamoDB Table resource."""
+    """A stand-in for the module-level DynamoDB Table resource.
+
+    Phase 6 moved the per-video read from Scan to Query, so `query` is what
+    the pipeline path calls. `scan` is still stubbed because the maintenance
+    path (no video id) legitimately uses it. Neither returns a
+    `LastEvaluatedKey`, so both are single-page.
+    """
     table = MagicMock()
-    table.scan.return_value = {"Items": list(items)}
+    page = {"Items": list(items)}
+    table.query.return_value = dict(page)
+    table.scan.return_value = dict(page)
     return table
 
 
@@ -279,9 +287,10 @@ def test_no_pending_frames_is_not_an_error():
     assert not table.update_item.called
 
 
-def test_scan_failure_is_surfaced_not_swallowed():
-    """If the DynamoDB scan itself fails, that must be reported, not ignored."""
+def test_frame_enumeration_failure_is_surfaced_not_swallowed():
+    """If reading the frame table fails, that must be reported, not ignored."""
     table = MagicMock()
+    table.query.side_effect = RuntimeError("ResourceNotFoundException")
     table.scan.side_effect = RuntimeError("ResourceNotFoundException")
 
     with patch.object(analyzer, "table", table):

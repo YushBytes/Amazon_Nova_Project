@@ -195,6 +195,22 @@ class FakeS3:
 
 
 @pytest.fixture(autouse=True)
+def _reset_aws_client_memo():
+    """Drop aws_clients' memoized clients around every test.
+
+    Phase 6 made clients process-wide and memoized. Without this, a test that
+    injects a fake through `aws_clients.get_client` could leak it into the next
+    test, or a real client built before a patch took effect could be reused
+    afterwards - either way the test would pass or fail for the wrong reason.
+    """
+    import aws_clients
+
+    aws_clients.reset()
+    yield
+    aws_clients.reset()
+
+
+@pytest.fixture(autouse=True)
 def fake_s3(monkeypatch):
     """Give every test an in-memory S3 for source-video storage.
 
@@ -241,6 +257,13 @@ class FakeFramesTable:
         self.deleted = []
         self.fail_query = None
         self.fail_delete = None
+        # Items read per Query page. None means "everything in one page".
+        # Set it to force the multi-page path a real table takes at 1 MB.
+        self.page_size = None
+        # Call records, so a test can assert HOW the table was read - which is
+        # the point of the Phase 6 scan-to-query change, not just the result.
+        self.query_calls = []
+        self.scan_calls = []
 
     # -- helpers for tests --------------------------------------------------
 
@@ -317,21 +340,53 @@ class FakeFramesTable:
             item[target] = values[placeholder.strip()]
         return {}
 
-    def query(self, KeyConditionExpression=None, **kwargs):
+    def query(self, KeyConditionExpression=None, FilterExpression=None, **kwargs):
+        """Query, with the paging semantics the real service has.
+
+        Phase 6 moved `check_pending_frames` from Scan to Query, so this has
+        to model the parts of Query that change the caller's correctness:
+
+        * `FilterExpression` is applied AFTER the key condition, exactly as
+          DynamoDB does - which is why a filtered page can come back empty and
+          still carry a `LastEvaluatedKey`. A fake that ignored the filter
+          would make the new query look correct whatever it asked for.
+        * `Limit` bounds items READ, before filtering, and a truncated read
+          returns `LastEvaluatedKey`. Code that stops at the first empty page
+          silently loses frames; `page_size` below lets a test force that.
+        * `ExclusiveStartKey` resumes after a given key.
+        """
         if self.fail_query is not None:
             raise self.fail_query
-        matched = [
-            dict(item)
-            for item in self.items.values()
-            if self._satisfies(item, KeyConditionExpression)
-        ]
-        matched.sort(key=lambda i: int(i["frame_number"]))
-        limit = kwargs.get("Limit")
-        if limit:
-            matched = matched[: int(limit)]
-        return {"Items": matched}
+
+        ordered = sorted(self.items.values(), key=lambda i: int(i["frame_number"]))
+        ordered = [i for i in ordered if self._satisfies(i, KeyConditionExpression)]
+
+        start = kwargs.get("ExclusiveStartKey")
+        if start:
+            after = int(start["frame_number"])
+            ordered = [i for i in ordered if int(i["frame_number"]) > after]
+
+        # Items read, which is what Limit and page_size bound.
+        budget = kwargs.get("Limit") or self.page_size
+        truncated = False
+        if budget and len(ordered) > int(budget):
+            ordered = ordered[: int(budget)]
+            truncated = True
+
+        self.query_calls.append(dict(kwargs, KeyConditionExpression=KeyConditionExpression))
+
+        page = [dict(i) for i in ordered if self._satisfies(i, FilterExpression)]
+        response = {"Items": page}
+        if truncated and ordered:
+            last = ordered[-1]
+            response["LastEvaluatedKey"] = {
+                "video_id": last["video_id"],
+                "frame_number": last["frame_number"],
+            }
+        return response
 
     def scan(self, FilterExpression=None, **kwargs):
+        self.scan_calls.append(dict(kwargs, FilterExpression=FilterExpression))
         matched = [
             dict(item)
             for item in self.items.values()
@@ -574,11 +629,29 @@ class FakeCollection:
 class FakeDatabase:
     def __init__(self):
         self.collections = {}
+        # Set to an exception to make the readiness ping fail, which is how a
+        # test simulates an unreachable database without touching the network.
+        self.fail_command = None
 
     def __getitem__(self, name):
         if name not in self.collections:
             self.collections[name] = FakeCollection(name)
         return self.collections[name]
+
+    async def command(self, name, *args, **kwargs):
+        """The admin-command surface, which the readiness probe uses to ping.
+
+        Mirrors motor: `command("ping")` returns `{"ok": 1}` when the server
+        answers, and raises otherwise. Without this the probe would fail with
+        AttributeError and the "ready" test would pass for the wrong reason -
+        reporting not-ready because the fake was incomplete rather than
+        because a dependency was down.
+        """
+        if self.fail_command is not None:
+            raise self.fail_command
+        if name == "ping":
+            return {"ok": 1}
+        return {"ok": 1, "command": name}
 
 
 @pytest.fixture

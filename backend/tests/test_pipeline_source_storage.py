@@ -101,6 +101,14 @@ async def _record_for(fake_db, video_id):
 # upload puts the source in S3
 # ---------------------------------------------------------------------------
 
+def _source_doc(fake_db, video_id):
+    """The raw stored record, for fields job_view deliberately hides."""
+    for doc in fake_db["videos"].docs:
+        if doc["video_id"] == video_id:
+            return doc
+    raise AssertionError(f"no record for {video_id}")
+
+
 def test_upload_stores_the_source_in_s3(
     client, fake_db, upload_dir, alice, fake_s3
 ):
@@ -413,9 +421,16 @@ def test_missing_source_object_fails_the_job_truthfully(
     assert "no longer available" in job["error_summary"].lower()
 
 
-def test_s3_read_timeout_fails_the_job_without_leaking_detail(
+def test_s3_read_timeout_is_retried_without_leaking_detail(
     client, fake_db, upload_dir, alice, no_background, fake_s3
 ):
+    """A transport timeout is retryable; its message still leaks nothing.
+
+    Phase 6 changed the outcome from terminal failure to a requeue with a
+    backoff - a timeout is the textbook case where the same input succeeds on
+    a later attempt. The redaction property is unchanged and is what this
+    still guards: no endpoint, no bucket, no botocore class name.
+    """
     body = _upload(client, alice).json()
     vid = body["video_id"]
     client.post(f"/analyze/{vid}", headers=alice)
@@ -423,11 +438,40 @@ def test_s3_read_timeout_fails_the_job_without_leaking_detail(
 
     result = pipeline.run_job(vid)
 
-    assert result["state"] == JobState.FAILED.value
+    assert result.get("retry_scheduled") is True
     job = client.get(f"/jobs/{vid}", headers=alice).json()
+    assert job["state"] == JobState.QUEUED.value
+
+    reason = _source_doc(fake_db, vid)["last_retry_reason"]
+    assert "could not be retrieved" in reason.lower()
+    assert "amazonaws" not in reason
+    assert "example.invalid" not in reason
+    assert aws_resources.media_bucket() not in reason
+    assert "ReadTimeout" not in reason
+
+
+def test_s3_read_timeout_fails_terminally_once_attempts_run_out(
+    client, fake_db, upload_dir, alice, no_background, fake_s3
+):
+    """Bounded: a timeout that never clears ends FAILED, still redacted."""
+    from job_state import MAX_ATTEMPTS
+
+    body = _upload(client, alice).json()
+    vid = body["video_id"]
+    client.post(f"/analyze/{vid}", headers=alice)
+    fake_s3.fail_get = ReadTimeoutError(endpoint_url="https://example.invalid")
+
+    with patch("pipeline.retry_delay_seconds", return_value=0):
+        for _ in range(MAX_ATTEMPTS + 2):
+            _source_doc(fake_db, vid)["not_before"] = None
+            pipeline.run_job(vid)
+
+    job = client.get(f"/jobs/{vid}", headers=alice).json()
+    assert job["state"] == JobState.FAILED.value
+    assert job["attempt"] <= MAX_ATTEMPTS
     summary = job["error_summary"]
-    assert "could not be retrieved" in summary.lower()
-    assert "amazonaws" not in summary
+    assert "No attempts remain" in summary
+    assert "example.invalid" not in summary
     assert aws_resources.media_bucket() not in summary
     assert "ReadTimeout" not in summary
 

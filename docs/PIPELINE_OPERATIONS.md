@@ -39,17 +39,45 @@ pytest -m requires_aws        # not used by any current test
 ### Running the app locally
 
 ```bash
-# Backend. Leave JWT_SECRET_KEY unset in development: an ephemeral per-process
-# key is generated, so sessions end at restart.
+# 1. API. Leave JWT_SECRET_KEY unset in development: an ephemeral per-process
+#    key is generated, so sessions end at restart.
 cd backend && ../.venv/Scripts/python.exe -m uvicorn app:app --reload --port 8000
 
-# Frontend
+# 2. Worker — a SECOND terminal. Only needed when JOB_EXECUTION_MODE=worker.
+#    In development the default is `inline`, so the API runs jobs itself and
+#    you can skip this while getting started.
+cd backend && ../.venv/Scripts/python.exe worker.py
+
+# 3. Frontend
 cd frontend && npm run dev
 ```
+
+Which processes you need depends on `JOB_EXECUTION_MODE`:
+
+| Mode | Processes | Durable? |
+| :-- | :-- | :-- |
+| `inline` (dev default) | API only | No — killing the API strands the running job until a sweep |
+| `worker` (prod default) | API **and** at least one worker | Yes — acceptance is a database write |
 
 The pipeline needs real AWS and FFmpeg to actually process a video. Without
 them, upload and job registration work, and analysis fails with a truthful
 terminal state — which is itself worth seeing.
+
+### Health probes
+
+```bash
+curl localhost:8000/health/live     # process is up; touches no dependency
+curl localhost:8000/health/ready    # config + MongoDB; 503 when not serveable
+curl localhost:8000/health/worker   # queue depth and abandoned count
+```
+
+`/health/live` deliberately checks nothing external: if it depended on
+MongoDB, a brief outage would fail every replica's liveness probe and get them
+all restarted, turning degradation into guaranteed downtime. Use
+`/health/ready` to decide whether to send traffic.
+
+`/health/worker` is **inferred from the queue** — it does not contact the
+worker process, which may be on another host.
 
 ---
 
@@ -196,43 +224,103 @@ grep -iE "Bedrock .* failed with|Rate limit exceeded|FFmpeg exited" <log>
 
 ---
 
-## 6. Stuck jobs — the known gap
+## 6. Running the worker, and recovering stuck jobs
 
-Analysis runs in an in-process `BackgroundTasks` worker. **If the process dies
-mid-run, the job stays `extracting` or `analyzing` forever.** Nothing resumes
-it. This is a real limitation, not a bug to be worked around.
+**Phase 6 changed this section materially.** Analysis no longer runs inside the
+API process, and recovery is no longer startup-only.
 
-Find them:
+### 6.1 Start a worker
 
 ```bash
 cd backend
+python worker.py                  # run until stopped (SIGTERM/SIGINT = graceful)
+python worker.py --once           # drain what is claimable, then exit (cron-style)
+python worker.py --status         # queue depth + abandoned count, then exit
+```
+
+Requires `MONGODB_URL` (the queue lives there) and the same AWS credentials and
+`S3_BUCKET_NAME` as the API. Run one or more; they coordinate through
+conditional claims, so extra workers are always safe to add.
+
+```bash
+# Is anything consuming the queue?
+curl -s localhost:8000/health/worker | python -m json.tool
+```
+
+⚠️ **With `JOB_EXECUTION_MODE=worker` and no worker running, submissions still
+succeed and jobs accumulate in `queued`.** That is the most likely
+misconfiguration in a new deployment. `GET /health/worker` is how you see it:
+`queued` climbing with `active: 0`.
+
+### 6.2 How a dead worker's job comes back
+
+A worker heartbeats while it works, so a lapsed `lease_expires_at` means the
+process holding the job is gone. Three things sweep for those:
+
+| Mechanism | Frequency | Configure with |
+| :-- | :-- | :-- |
+| Inside every worker | every 60s | `WORKER_RECOVERY_INTERVAL_SECONDS` (0 disables) |
+| API startup | once per boot | `RECOVER_JOBS_ON_STARTUP` |
+| Operator / scheduler | on demand | `python backend/recover_jobs.py --apply` |
+
+A sweep returns the job to `queued` (incrementing `attempt`) or, once the
+attempt budget is spent, moves it to `failed` with a truthful summary. It never
+touches a job whose lease is still live, and two concurrent sweeps cannot both
+reclaim one job — the write is conditional on the stale claim.
+
+**Recovery is therefore continuous while at least one worker is up**, which is
+the honest scope: if every worker is down, nothing sweeps until one starts or
+an operator runs the CLI. This is no longer "a job stays stuck forever", which
+is what Phases 4–4.1 had to say here.
+
+### 6.3 Find jobs that look wrong
+
+```bash
+cd backend
+python worker.py --status          # counts by state + abandoned count
+
+# The long-horizon view: non-terminal with no update for 30 minutes,
+# including jobs whose lease is still live but which are making no progress.
 python -c "
 import anyio, pipeline
-rows = anyio.run(pipeline.find_stuck_jobs)
-for r in rows:
+for r in anyio.run(pipeline.find_stuck_jobs):
     print(r['video_id'], r['status'], r.get('updated_at'))
 "
 ```
 
-Reports any non-terminal job with no update for 30 minutes. It **only
-reports** — nothing is failed automatically, because a slow legitimate run must
-not be killed.
+`find_stuck_jobs` **only reports**. Nothing is failed automatically, because a
+slow legitimate run must not be killed.
 
-To recover one, re-queue it (this increments `attempt`, so it is bounded):
+### 6.4 A job waiting on a retry backoff
 
-```
-POST /analyze/{video_id}/retry      # as the owner
-```
-
-If the attempt budget is exhausted, an operator can reset the record
-deliberately:
+A retryable failure requeues the job with `not_before` set, so it is `queued`
+but deliberately not yet claimable. That is **not** stuck:
 
 ```javascript
-// Deliberate operator action. Confirm the job really is orphaned first.
+db.videos.findOne({video_id: "<id>"}, {status: 1, attempt: 1, not_before: 1,
+                                       last_retry_reason: 1})
+```
+
+A future `not_before` with a `last_retry_reason` is a job correctly waiting.
+The recovery sweep skips these, so one failure cannot increment `attempt`
+twice.
+
+### 6.5 Manual intervention, when the budget is spent
+
+```
+POST /analyze/{video_id}/retry      # as the owner; bounded by MAX_ATTEMPTS
+```
+
+If attempts are exhausted and the job genuinely is orphaned:
+
+```javascript
+// Deliberate operator action. Confirm it really is orphaned first:
+// check that no worker holds a live lease.
 db.videos.updateOne(
   {video_id: "<id>", status: {$in: ["queued","extracting","analyzing"]}},
   {$set: {status: "failed", error_summary: "Abandoned by a server restart.",
-          failed_stage: "worker", completed_at: new Date()}}
+          failed_stage: "worker", completed_at: new Date(),
+          claim_id: null, lease_expires_at: null}}
 )
 ```
 
@@ -240,7 +328,9 @@ db.videos.updateOne(
 finished and results were persisted"; asserting it without the results makes
 the UI report compliance that was never established.
 
-A durable queue is the real fix, and is out of Phase 4 scope.
+**Do not** clear `claim_id` on a job a live worker is running — that is exactly
+what the fencing token prevents, and doing it by hand lets two attempts write
+to one job.
 
 ---
 
@@ -327,18 +417,21 @@ Stated plainly so none is mistaken for solved.
 
 | Limitation | Impact |
 | :-- | :-- |
-| **In-process worker; no crash recovery** | A restart orphans running jobs (§6) |
-| **Source videos on local disk** | A replaced container loses them; the ownership record then points at a missing file |
-| **No backpressure** | Many submissions run many background tasks at once |
+| **Polling, not push** | A job waits up to one poll interval (default 5s) before a worker claims it |
+| **Not at-most-once** | A job interrupted mid-analysis re-runs from the start. Frame writes are idempotent, but Bedrock is billed again for frames already analysed |
+| **Recovery needs a live worker** | Sweeps run inside workers and at API startup. With every worker down, nothing sweeps until one starts or an operator runs `recover_jobs.py` |
+| **No backpressure** | Submissions are accepted regardless of queue depth. `/health/worker` exposes depth; nothing throttles on it |
+| **One job per worker** | Concurrency is per-process — run more workers. Deliberate: Bedrock is billed per frame, so cost stays visible to whoever provisions processes |
+| **Rate limiting is per-process** | The effective limit multiplies by instance count |
 | **1 fps sampling** | Violations under ~1 second can be missed |
 | **No brand-rule configuration** | One static prompt; no per-client policies, and no legal/regulatory evaluation |
-| **No remediation** | Nova Canvas, corrected-video export are out of scope and not implemented |
-| **Partial audits fail the job** | Deliberate: a partly-analysed video is not "compliant". One throttled frame fails the whole job; retry is the path |
-| **`Scan` in the analysis path** | Cost grows with table size; a GSI on `status` would fix it |
+| **No remediation** | Nova Canvas and corrected-video export are out of scope and not implemented |
+| **Partial audits fail the job** | Deliberate: a partly-analysed video is not "compliant". One throttled frame fails the whole job after its own bounded retries; job retry is the path |
+| **`Scan` remains for the all-videos CLI** | `check_pending_frames()` with no video id. The request path is a Query (Phase 6); a GSI on `status` would remove the CLI scan too |
+| **`/projects/marketplace` still scans** | Filters on `status`, which is not a key and has no GSI. The route is unused by the frontend, so an index was not added for it |
 | **No per-user quota** | One user can submit many videos and spend model capacity |
-| **`uploads/` is never pruned** | Disk grows without bound |
-| **No metrics** | Logs and the database only |
-| **Detection quality unmeasured** | No live model call was made. Nothing here says anything about accuracy, precision, or recall |
+| **No metrics exporter** | Structured logs and the database only. Nothing is shipped to a monitoring platform |
+| **Detection quality unmeasured** | No live model call was ever made. Nothing here says anything about accuracy, precision, or recall |
 
 ---
 
@@ -348,11 +441,20 @@ Stated plainly so none is mistaken for solved.
 orchestration and state transitions, persistence call shapes, API contract and
 status codes, ownership enforcement, retry and idempotency, extraction failure
 modes, model-response validation, Bedrock retry classification, frontend
-polling and results.
+polling and results. Phase 6 adds: durable acceptance before the response, a
+worker with no knowledge of the submission running the job, two workers racing
+(in turns and in real threads) producing exactly one run, a stale worker unable
+to write, retry classification and bounded exhaustion, backoff interaction with
+the recovery sweep, graceful stop, liveness independent of MongoDB, readiness
+failing and timing out, and Query pagination including the empty-filtered-page
+case.
 
 **Not verified:** live S3 or DynamoDB writes, live Bedrock inference or
 detection quality, real FFmpeg extraction, real MongoDB, and any deployment.
-No AWS call was made at any point in Phase 4.
+No AWS call has been made in any phase. In particular, no worker has been run
+against real infrastructure and no process has actually been SIGKILLed — crash
+recovery is verified as *logic* (a lapsed lease and its conditional reclaim),
+not as observed behaviour under a real crash.
 
 ---
 

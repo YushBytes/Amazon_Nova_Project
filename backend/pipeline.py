@@ -189,6 +189,9 @@ def _run_claimed(sync, video_id, record, claim_id, file_path):
     from extractor import ExtractionError, extract_and_store
 
     failed = {"video_id": video_id, "state": JobState.FAILED.value}
+    # The attempt this run represents. Read before stage 1 because a retryable
+    # failure in stage 1 needs it to decide between requeueing and failing.
+    attempt = int(record.get("attempt") or 0)
 
     # --- stage 1: fetch the source and extract ---------------------------
     # `materialise` yields a local path - downloaded from S3 into a unique
@@ -208,6 +211,13 @@ def _run_claimed(sync, video_id, record, claim_id, file_path):
         _fail(sync, video_id, claim_id, str(exc), stage="source")
         return failed
     except source_store.SourceStoreError as exc:
+        # `retryable` is set at the raise site: True for transport failures,
+        # False for deterministic ones like an object that breaches the size
+        # ceiling, which would fail identically on every attempt.
+        if getattr(exc, "retryable", False):
+            return _retry_or_fail(
+                sync, video_id, claim_id, attempt, str(exc), stage="source"
+            )
         _fail(sync, video_id, claim_id, str(exc), stage="source")
         return failed
     except ExtractionError as exc:
@@ -225,7 +235,6 @@ def _run_claimed(sync, video_id, record, claim_id, file_path):
     # so pruning would be a pointless pair of DynamoDB calls on the common
     # path. Done only now that the new extraction has succeeded, so a failed
     # retry never destroys the results a previous attempt established.
-    attempt = int(record.get("attempt") or 0)
     if attempt > 1:
         try:
             removed = _prune_stale_frames(video_id, extraction.frames_stored)
@@ -296,9 +305,15 @@ def _run_claimed(sync, video_id, record, claim_id, file_path):
         logger.warning("Abandoning %s mid-analysis: the lease was taken over", video_id)
         return {"video_id": video_id, "skipped": True, "reason": "claim_lost"}
     except FrameAuditError:
+        # The frame table could not be read, so the batch is unknown rather
+        # than empty. That is a dependency failure, not a verdict on the
+        # video, so it backs off and retries instead of failing the job.
         logger.exception("Frame enumeration failed for %s", video_id)
-        _fail(sync, video_id, claim_id, "The analysis store is unavailable.", stage="analysis")
-        return failed
+        return _retry_or_fail(
+            sync, video_id, claim_id, attempt,
+            "The analysis store was unavailable.",
+            stage="analysis",
+        )
     except Exception:
         logger.exception("Unexpected analysis failure for %s", video_id)
         _fail(sync, video_id, claim_id, "Frame analysis failed.", stage="analysis")
@@ -388,6 +403,73 @@ def _prune_stale_frames(video_id: str, keep_count: int) -> int:
     import analyzer
 
     return analyzer.delete_frames_from(video_id, keep_count)
+
+
+def retry_delay_seconds(attempt: int) -> int:
+    """Backoff before a retried attempt may run, in seconds.
+
+    Exponential in the attempt number and capped. The point is not politeness
+    to the dependency - it is that without a delay the worker reclaims the job
+    on its next poll and spends the whole MAX_ATTEMPTS budget within seconds
+    of a dependency blip, turning a recoverable outage into a terminal
+    failure.
+    """
+    from config import get_settings
+
+    settings = get_settings()
+    base = settings.retry_backoff_seconds
+    if base <= 0:
+        return 0
+    delay = base * (2 ** max(0, attempt - 1))
+    return int(min(delay, settings.retry_backoff_cap_seconds))
+
+
+def _retry_or_fail(sync, video_id, claim_id, attempt, summary, *, stage):
+    """Requeue a job after a RETRYABLE failure, or fail it terminally.
+
+    Retryable means "the same input could succeed later": a throttle, a
+    timeout, a dependency briefly unreachable. Permanent failures do not come
+    here at all - they go straight to `_fail`, because retrying a missing
+    object or an unreadable video only delays the same answer three times over
+    while billing for it.
+
+    When the attempt budget is spent the job becomes FAILED with a summary
+    that says so, so an exhausted retry is never reported as anything other
+    than a failure.
+
+    Returns:
+        The result dict to return from the pipeline.
+    """
+    if attempt >= MAX_ATTEMPTS:
+        _fail(
+            sync, video_id, claim_id,
+            f"{summary} No attempts remain.",
+            stage=stage,
+        )
+        return {"video_id": video_id, "state": JobState.FAILED.value}
+
+    delay = retry_delay_seconds(attempt)
+    updated = sync(
+        video_repo.schedule_retry,
+        video_id,
+        claim_id=claim_id,
+        delay_seconds=delay,
+        summary=summary,
+    )
+    if updated is None:
+        # Fenced: a newer attempt owns the job, so there is nothing to retry.
+        return {"video_id": video_id, "skipped": True, "reason": "claim_lost"}
+
+    logger.warning(
+        "Job %s hit a retryable failure during %s; requeued for attempt %d "
+        "of %d in %ds", video_id, stage, attempt + 1, MAX_ATTEMPTS, delay,
+    )
+    return {
+        "video_id": video_id,
+        "state": JobState.QUEUED.value,
+        "retry_scheduled": True,
+        "retry_in_seconds": delay,
+    }
 
 
 def _fail(sync, video_id, claim_id, summary: str, *, stage: str, fields: dict | None = None):

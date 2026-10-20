@@ -128,6 +128,11 @@ async def ensure_indexes() -> None:
     await col.create_index("video_id", unique=True)
     await col.create_index("owner")
     await col.create_index("status")
+    # The worker's queue poll is find({status}).sort(updated_at), and the
+    # recovery sweep filters the same states by time. One compound index
+    # serves both, so neither degrades into a collection scan as the table
+    # grows (Phase 6).
+    await col.create_index([("status", 1), ("updated_at", 1)])
 
 
 def _now() -> datetime:
@@ -191,6 +196,9 @@ async def record_video(
         "recovered_count": 0,
         "claim_id": None,
         "lease_expires_at": None,
+        # Earliest instant a worker may claim this job. Set when a retryable
+        # failure schedules a backoff (Phase 6); None means "claimable now".
+        "not_before": None,
         "frames_extracted": None,
         "frames_audited": None,
         "frames_failed": None,
@@ -321,6 +329,10 @@ async def transition(
         update["completed_at"] = None
         update["claim_id"] = None
         update["lease_expires_at"] = None
+        # Claimable immediately unless the caller passes a `not_before` in
+        # `fields` - which is how a retry backoff is applied. A user-requested
+        # retry deliberately has no delay.
+        update["not_before"] = None
     if target is JobState.EXTRACTING:
         update["started_at"] = now
     if target in (JobState.COMPLETED, JobState.FAILED):
@@ -490,6 +502,99 @@ async def record_progress(
 # Recovery
 # ---------------------------------------------------------------------------
 
+async def find_queued_jobs(limit: int = 10) -> list[dict]:
+    """Jobs ready for a worker to claim, oldest first.
+
+    Phase 6. This is the read that makes the `videos` collection usable as a
+    durable queue: `submit()` persists QUEUED before the API answers, and a
+    worker polls here. Nothing is held in process memory, so the API and the
+    worker restart independently and an accepted job survives either.
+
+    Oldest first (`updated_at` ascending) so a job cannot be starved by newer
+    arrivals. Jobs with a future `not_before` are skipped - that is the retry
+    backoff, and without honouring it a worker would reclaim a just-failed job
+    instantly and spend the whole attempt budget in a few seconds.
+
+    This does not claim anything. The caller claims with `claim()`, whose
+    conditional update is what actually resolves a race between two workers,
+    so two workers reading the same list is expected and safe.
+    """
+    col = await _collection()
+    now = _now()
+
+    ready: list[dict] = []
+    cursor = col.find({"status": JobState.QUEUED.value}).sort("updated_at", 1)
+    async for record in cursor:
+        not_before = _aware(record.get("not_before"))
+        if not_before is not None and not_before > now:
+            continue
+        ready.append(record)
+        if len(ready) >= limit:
+            break
+    return ready
+
+
+async def schedule_retry(
+    video_id: str,
+    *,
+    claim_id: str,
+    delay_seconds: int,
+    summary: str | None = None,
+) -> dict | None:
+    """Return a job to the queue after a retryable failure, with a backoff.
+
+    Distinct from `transition(..., FAILED)`: this is for a failure that may
+    succeed later (a throttle, a timeout, a dependency briefly unreachable),
+    where terminal failure would be a lie about what happened. The attempt
+    counter still increments via the QUEUED transition, so retries stay
+    bounded by MAX_ATTEMPTS and this cannot loop forever.
+
+    Fenced on `claim_id`, so a worker that has already been reclaimed cannot
+    push a newer attempt back into the queue.
+
+    Returns:
+        The updated record, or None if the claim no longer holds.
+    """
+    not_before = _now() + timedelta(seconds=max(0, int(delay_seconds)))
+    fields: dict[str, Any] = {"not_before": not_before}
+    if summary:
+        # Kept visible to the owner while the retry is pending, so a job that
+        # is waiting does not look idle for no reason.
+        fields["last_retry_reason"] = summary
+
+    try:
+        updated = await transition(
+            video_id,
+            JobState.QUEUED,
+            claim_id=claim_id,
+            fields=fields,
+        )
+    except ClaimLost:
+        logger.warning(
+            "Not scheduling a retry for %s: the lease was taken over", video_id
+        )
+        return None
+
+    logger.info(
+        "Retry scheduled for %s in %ss (attempt %s of %s)",
+        video_id, delay_seconds, updated.get("attempt"), MAX_ATTEMPTS,
+    )
+    return updated
+
+
+async def count_by_state() -> dict[str, int]:
+    """How many jobs sit in each state. For the readiness probe and operators.
+
+    Counts only - never ids, owners or filenames - so it is safe to log and
+    safe to expose on an operational endpoint.
+    """
+    col = await _collection()
+    counts: dict[str, int] = {}
+    for state in JobState:
+        counts[state.value] = await col.count_documents({"status": state.value})
+    return counts
+
+
 async def find_expired_leases() -> list[dict]:
     """Jobs in a non-terminal worked state whose lease has lapsed.
 
@@ -518,6 +623,14 @@ async def find_expired_leases() -> list[dict]:
 
     cursor = col.find({"status": JobState.QUEUED.value})
     async for record in cursor:
+        # A job deliberately waiting out a retry backoff is NOT abandoned.
+        # Without this, a backoff longer than one lease period (the cap is
+        # 600s against a 300s lease) would be reclaimed as if its worker had
+        # died, incrementing `attempt` a second time for one failure and
+        # burning the budget at twice the intended rate.
+        not_before = _aware(record.get("not_before"))
+        if not_before is not None and not_before > now:
+            continue
         updated = _aware(record.get("updated_at"))
         if updated is None or updated < now - grace:
             abandoned.append(record)
@@ -611,8 +724,8 @@ def job_view(record: dict) -> dict:
     """Project a stored record into the client-facing job shape.
 
     Deliberately omits `owner`, `stored_filename`, `s3_bucket`, `s3_key`,
-    `claim_id`, and `lease_expires_at` - everything that describes server-side
-    storage or internal worker bookkeeping. `error_summary` is written by the
+    `claim_id`, `lease_expires_at`, and `not_before` - everything that
+    describes server-side storage or internal worker bookkeeping. `error_summary` is written by the
     pipeline and is already a safe message, never an exception string.
 
     `recovered_count` IS exposed: a user whose analysis was interrupted and

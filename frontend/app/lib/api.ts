@@ -9,14 +9,20 @@
  * assumed:
  *
  *   POST /upload-reel        -> { video_id, video_url, filename, status, message }
- *   POST /analyze/{video_id} -> { video_id, status, message }   404 if not found
+ *   POST /analyze/{video_id} -> { video_id, status, job }      404 if not found
+ *   GET  /jobs/{video_id}    -> the job view: state, stage, counts, attempt
  *   GET  /violations/{id}    -> { video_id, detections[], frame_count }
  *
- * KNOWN CONTRACT GAP: the backend exposes no job-status or completion endpoint.
- * `/analyze` returns as soon as the work is queued as a FastAPI BackgroundTask,
- * and `/violations` reports whatever has been written so far with no "finished"
- * flag. The UI therefore cannot truthfully claim an audit has completed; it
- * reports progress only. Adding durable job records is a later-phase task.
+ * The contract gap noted here previously - no way to know whether an audit had
+ * finished - was closed by the backend job state machine. `GET /jobs/{id}` is
+ * authoritative: treat an empty `detections` list as "compliant" ONLY when
+ * `state === "completed"`, because that state means analysis finished AND its
+ * results were persisted. Any other state means the picture is incomplete.
+ *
+ * How the backend executes the job is deliberately invisible here. It queues
+ * the job durably before responding, and either a separate worker process or
+ * an in-process task runs it depending on server configuration; the response
+ * shape is identical either way, so nothing in this file depends on it.
  */
 
 export function apiBaseUrl(): string {

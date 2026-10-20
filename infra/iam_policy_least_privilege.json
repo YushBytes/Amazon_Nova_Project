@@ -215,6 +215,97 @@
     "logs:CreateLogGroup": "Create the log group once, out of band, so the running role cannot create arbitrary groups."
   },
 
+  "_ROLE_SEPARATION_API_VS_WORKER": {
+    "_comment": [
+      "Phase 6 split execution into two processes: the API accepts and queues",
+      "jobs, and `python backend/worker.py` runs them. They need DIFFERENT",
+      "permissions, and giving both the union of the two is not least",
+      "privilege - the API is the internet-facing process, so it is the one",
+      "that must not be able to invoke a billed model or write frames.",
+      "",
+      "Build TWO roles from the statements above by including only the Sids",
+      "listed below. The statement bodies are unchanged; nothing here grants",
+      "anything new.",
+      "",
+      "Both roles keep DenyUnencryptedTransport and CloudWatchLogs."
+    ],
+
+    "ApiRole": {
+      "_comment": [
+        "The API reads results and serves media. It never analyses a frame,",
+        "so it needs NO bedrock:InvokeModel - the single most important line",
+        "in this file. If the API is compromised, the attacker cannot spend",
+        "model budget.",
+        "",
+        "S3: GetObject on sources/ for playback, PutObject on sources/ for",
+        "upload, DeleteObject on sources/ for orphan rollback. It does not",
+        "read or write frames/.",
+        "",
+        "DynamoDB: Query on the frames table for GET /violations, and the",
+        "projects table for the /projects routes."
+      ],
+      "include_sids": [
+        "DenyUnencryptedTransport",
+        "S3FrameAndReelObjects",
+        "S3DeleteOrphanedSourcesOnly",
+        "S3ListOnlyUsedPrefixes",
+        "DynamoDbFramesTable",
+        "DynamoDbProjectsTable",
+        "CloudWatchLogs"
+      ],
+      "omit": [
+        "BedrockInvokeNovaProOnly - the API never invokes a model."
+      ],
+      "tighten_further_if_you_split_the_statements": [
+        "S3FrameAndReelObjects currently covers sources/, frames/ and raw/ in",
+        "one statement. Splitting it per prefix would let the API role drop",
+        "frames/ entirely and the worker role drop raw/. Worth doing; it needs",
+        "the statement split, not a new permission."
+      ]
+    },
+
+    "WorkerRole": {
+      "_comment": [
+        "The worker extracts frames and analyses them. It is not reachable",
+        "from the internet and serves no requests.",
+        "",
+        "It needs bedrock:InvokeModel, GetObject on sources/ to download the",
+        "video, PutObject on frames/ to store extracted frames, and the frames",
+        "table for metadata and for the stale-row prune on a re-run.",
+        "",
+        "It does NOT need the projects table, and does not need",
+        "s3:DeleteObject - orphan rollback happens on the upload path, in the",
+        "API."
+      ],
+      "include_sids": [
+        "DenyUnencryptedTransport",
+        "BedrockInvokeNovaProOnly",
+        "S3FrameAndReelObjects",
+        "S3ListOnlyUsedPrefixes",
+        "DynamoDbFramesTable",
+        "CloudWatchLogs"
+      ],
+      "omit": [
+        "S3DeleteOrphanedSourcesOnly - rollback is an API-path action.",
+        "DynamoDbProjectsTable - the worker never touches projects."
+      ]
+    },
+
+    "_NO_NEW_RESOURCES": [
+      "The Phase 6 worker introduced NO new AWS resource and therefore no new",
+      "permission: the job queue is the existing MongoDB `videos` collection,",
+      "not SQS. Both roles are subsets of the single-process policy that",
+      "preceded them. If a queue service is adopted later, that is when",
+      "sqs:* (ReceiveMessage/DeleteMessage/ChangeMessageVisibility on one",
+      "queue ARN, plus SendMessage for the API) would be added here."
+    ],
+
+    "_NOT_VERIFIED": [
+      "No role was created, attached, or tested against AWS. These are",
+      "annotations on a template."
+    ]
+  },
+
   "_BUCKET_HARDENING_NOT_EXPRESSIBLE_HERE": {
     "_comment": [
       "These are bucket and account settings, not identity-policy statements.",

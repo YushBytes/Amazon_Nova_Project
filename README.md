@@ -18,12 +18,24 @@ evidence base, and `CLAUDE.md` records the current phase.
 Browser (Next.js, :3000)
         │  JWT in Authorization header
         ▼
-FastAPI backend (:8000)
-        ├── MongoDB ......... user accounts, video ownership, job state
-        ├── S3 .............. source videos AND extracted frames (one bucket)
-        ├── DynamoDB ........ per-frame metadata and detections
+FastAPI API (:8000)  ─── accepts uploads, queues jobs, serves results
+        │                  (never runs analysis in worker mode)
+        ├── MongoDB ......... accounts, ownership, job state AND the job queue
+        ├── S3 .............. source videos and extracted frames (one bucket)
+        └── DynamoDB ........ per-frame metadata and detections
+
+Worker process  ─── python backend/worker.py
+        │             polls the queue, claims a job under a lease, runs it
+        ├── S3 .............. downloads the source, uploads frames
+        ├── DynamoDB ........ writes frame metadata and detections
         └── Bedrock ......... amazon.nova-pro-v1:0, one call per frame
 ```
+
+The API and the worker are separate processes over shared storage. Acceptance
+is a database write that happens **before** the API responds, so an accepted
+job survives an API restart — there is no in-memory handoff to lose. The queue
+is the `videos` collection itself, not a separate queue service; see
+`docs/PIPELINE_ARCHITECTURE.md` §8 for why, including why SQS was rejected.
 
 **Frontend** — Next.js 16.1.6, React 19.2.3, TypeScript 5.9.3 (`strict`),
 Tailwind CSS v4, Framer Motion, lucide-react. Tests run on Vitest.
@@ -56,6 +68,11 @@ restarted or superseded worker cannot corrupt a newer attempt. A job is
 `completed` only once results are persisted; an empty detections list means
 nothing unless the state is `completed`.
 
+A dead worker's lease lapses and the next recovery sweep requeues the job.
+Retryable failures (a timeout, a throttle, an unreadable frame table) back off
+and retry within a bounded attempt budget; deterministic failures fail
+immediately rather than billing three times for the same answer.
+
 Details: `docs/PIPELINE_ARCHITECTURE.md`. Operations: `docs/PIPELINE_OPERATIONS.md`.
 
 ### API surface
@@ -68,7 +85,16 @@ GET  /auth/me                      POST /analyze/{video_id}/retry
 GET  /status                       GET  /violations/{video_id}
 GET  /submissions                  GET  /uploads/{file}?access_token=...
 POST /execute                      (6 routes under /projects/)
+
+GET  /health/live                  liveness; touches no dependency
+GET  /health/ready                 config + MongoDB; 503 when not serveable
+GET  /health/worker                queue depth and abandoned-job count
 ```
+
+`/health/live` deliberately checks nothing external - if it depended on
+MongoDB, a brief outage would fail every replica's liveness probe and get them
+all restarted, turning degradation into guaranteed downtime. `/health/worker`
+is inferred from the queue and does not contact the worker process.
 
 Every route that touches user data requires a JWT and checks ownership; a
 missing ownership record is a denial, and unauthorized access returns 404 rather
@@ -110,7 +136,8 @@ default, and whether it is required. The ones you cannot skip in production:
 | `S3_BUCKET_NAME` | **Required in production.** Validated against the S3 naming rules at startup. |
 | `NOVAFLOW_ENV` | Set to `production` to enforce the above. Defaults to `development`. |
 | `CORS_ALLOWED_ORIGINS` | Set in production; `*` is rejected. |
-| `MONGODB_URL` | The only MongoDB connection-string variable. |
+| `MONGODB_URL` | The only MongoDB connection-string variable. It holds the job queue, so the worker needs it too. |
+| `JOB_EXECUTION_MODE` | `worker` or `inline`. Defaults to `worker` in production. |
 
 With `NOVAFLOW_ENV=production`, a missing `JWT_SECRET_KEY` or `S3_BUCKET_NAME`
 raises `ConfigurationError` and the application refuses to start. That is
@@ -144,16 +171,34 @@ whose `${PLACEHOLDER}` values must be substituted first.
 ### Running
 
 ```bash
-# Backend
+# API
 cd backend
 pip install -r requirements.txt -r requirements-dev.txt
 uvicorn app:app --host 0.0.0.0 --port 8000
+
+# Worker - a second process. Required when JOB_EXECUTION_MODE=worker (the
+# production default). In development the default is `inline`, where the API
+# runs jobs itself, so you can skip this while getting started.
+cd backend && python worker.py
 
 # Frontend
 cd frontend
 npm install
 npm run dev            # http://localhost:3000
 ```
+
+| `JOB_EXECUTION_MODE` | Processes needed | Durable? |
+| :-- | :-- | :-- |
+| `inline` (dev default) | API only | No - killing the API strands the running job until a sweep requeues it |
+| `worker` (prod default) | API **and** at least one worker | Yes - acceptance is a database write |
+
+With `worker` mode and no worker running, uploads and submissions still
+succeed and jobs accumulate in `queued`. `GET /health/worker` is how you see
+that: `queued` climbing with `active: 0`.
+
+Worker CLI: `python worker.py --once` drains what is claimable and exits
+(cron-style); `--status` prints queue depth and the abandoned-job count.
+SIGTERM/SIGINT finish the current job, then exit.
 
 There is **no seed script**, so no users exist on a fresh database. Create one
 through `POST /auth/signup`. Public signup always assigns the `client` role; the
@@ -165,7 +210,7 @@ through `POST /auth/signup`. Public signup always assigns the `client` role; the
 
 ```bash
 # Backend
-cd backend && pytest                      # 624 passed, 42 skipped by default
+cd backend && pytest                      # 679 passed, 42 skipped by default
 pytest -m requires_mongodb                # needs MONGODB_TEST_URL
 pytest -m requires_ffmpeg                 # needs ffmpeg on PATH
 
@@ -191,11 +236,18 @@ These are current and deliberate to state plainly.
   service is mocked in tests. **Detection accuracy is unmeasured** and no claim
   is made about it. S3, DynamoDB, Bedrock and the CloudFormation template are
   unverified against the live services.
-- **Analysis runs in an in-process `BackgroundTasks` worker.** There is no
-  durable queue. A crash mid-job is detected by the lease mechanism and the job
-  is requeued at the next startup sweep or by
-  `python backend/recover_jobs.py --apply`, but recovery is **not continuous**:
-  a job abandoned while the process stays up waits for the next sweep.
+- **Execution is a polling worker over MongoDB, not a queue service.** It is
+  durable (acceptance is a database write) and recovery runs continuously while
+  a worker is up, but it is **not at-most-once**: a job interrupted mid-analysis
+  re-runs from the start, so Bedrock is billed again for frames already
+  analysed. Delivery is polled, not pushed, so a job waits up to one poll
+  interval. With every worker down, nothing sweeps until one starts or an
+  operator runs `python backend/recover_jobs.py --apply`.
+- **No backpressure.** Submissions are accepted regardless of queue depth;
+  `/health/worker` exposes the depth but nothing throttles on it.
+- **No worker has ever run against real infrastructure**, and no process has
+  been SIGKILLed. Crash recovery is verified as logic - a lapsed lease and its
+  conditional reclaim - not as observed behaviour under a real crash.
 - **Rate limiting is per-process**, so the effective limit multiplies by worker
   count. There is no distributed limiter and no per-account throttle.
 - **No token revocation.** Tokens are valid until expiry; rotating
@@ -214,8 +266,10 @@ These are current and deliberate to state plainly.
   **not implemented**.
 - The AWS IAM hardening is a reviewed template, not an applied configuration.
 
-Removing dead code and reconciling configuration — the most recent work — makes
-the architecture coherent. It does **not** make the application production-ready.
+Making job execution durable — the most recent work — removes a real class of
+data loss. It does **not** make the application production-ready: nothing here
+has run against real AWS, and the infrastructure template has never been
+deployed.
 
 ---
 
@@ -223,6 +277,7 @@ the architecture coherent. It does **not** make the application production-ready
 
 ```
 backend/            FastAPI service and the pipeline
+backend/worker.py   the durable analysis worker (run as its own process)
 backend/tests/      pytest suite
 frontend/           Next.js dashboard (the live one)
 infra/              CloudFormation storage template + IAM policy template

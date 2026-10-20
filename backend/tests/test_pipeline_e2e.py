@@ -232,6 +232,23 @@ def _run_worker(fake_db, video_id, upload_dir, filename):
     return pipeline.run_job(video_id, str(upload_dir / filename))
 
 
+def _job_doc(fake_db, video_id):
+    """The raw stored record, for asserting on fields job_view hides."""
+    for doc in fake_db["videos"].docs:
+        if doc["video_id"] == video_id:
+            return doc
+    raise AssertionError(f"no record for {video_id}")
+
+
+def _clear_backoff(fake_db, video_id):
+    """Make a job waiting on a retry backoff immediately claimable.
+
+    These tests assert the attempt budget, not wall-clock behaviour, so the
+    backoff is cleared rather than slept through.
+    """
+    _job_doc(fake_db, video_id)["not_before"] = None
+
+
 def test_successful_run_reaches_completed_with_real_counts(
     client, fake_db, upload_dir, alice, no_background
 ):
@@ -373,9 +390,17 @@ def test_unexpected_extraction_crash_does_not_leak_internals(
     assert "RuntimeError" not in job["error_summary"]
 
 
-def test_frame_store_unavailable_is_reported_safely(
+def test_frame_store_unavailable_is_retried_not_failed(
     client, fake_db, upload_dir, alice, no_background
 ):
+    """A dependency outage is retryable, and must not look like a verdict.
+
+    Phase 6. This previously failed the job on its first occurrence. An
+    unreadable frame table says nothing about the video, so the job is
+    requeued with a backoff; it becomes FAILED only once the attempt budget is
+    spent (next test). What must NOT change is that the stored summary never
+    carries the table name or the botocore class.
+    """
     from analyzer import FrameAuditError
 
     body = _upload(client, alice).json()
@@ -388,8 +413,44 @@ def test_frame_store_unavailable_is_reported_safely(
         _run_worker(fake_db, vid, upload_dir, body["filename"])
 
     job = client.get(f"/jobs/{vid}", headers=alice).json()
+    assert job["state"] == JobState.QUEUED.value, "a retryable failure must requeue"
+    assert job["is_terminal"] is False
+
+    doc = _job_doc(fake_db, vid)
+    assert doc["not_before"] is not None, "a retry must carry a backoff"
+    reason = doc["last_retry_reason"]
+    assert reason == "The analysis store was unavailable."
+    assert "TableName" not in reason
+    assert "ClientError" not in reason
+
+
+def test_frame_store_outage_fails_terminally_once_attempts_run_out(
+    client, fake_db, upload_dir, alice, no_background
+):
+    """Retries are bounded: an outage that never clears ends as FAILED."""
+    from analyzer import FrameAuditError
+    from job_state import MAX_ATTEMPTS
+
+    body = _upload(client, alice).json()
+    vid = body["video_id"]
+    client.post(f"/analyze/{vid}", headers=alice)
+
+    with patch("extractor.extract_and_store", return_value=_extraction(2)), \
+         patch("analyzer.check_pending_frames",
+               side_effect=FrameAuditError("Could not scan TableName: ClientError")), \
+         patch("pipeline.retry_delay_seconds", return_value=0):
+        # One run per attempt, clearing the backoff each time so the job is
+        # immediately claimable. The attempt budget, not the clock, is what
+        # has to stop this.
+        for _ in range(MAX_ATTEMPTS + 2):
+            _clear_backoff(fake_db, vid)
+            pipeline.run_job(vid)
+
+    job = client.get(f"/jobs/{vid}", headers=alice).json()
     assert job["state"] == JobState.FAILED.value
-    assert job["error_summary"] == "The analysis store is unavailable."
+    assert job["is_terminal"] is True
+    assert job["attempt"] <= MAX_ATTEMPTS, "retries must stay bounded"
+    assert "No attempts remain" in job["error_summary"]
     assert "TableName" not in job["error_summary"]
 
 
@@ -620,7 +681,7 @@ def test_violations_reports_the_job_state_alongside_results(
 
     dynamo = MagicMock()
     dynamo.Table.return_value.query.return_value = _dynamo_page([])
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         response = client.get(f"/violations/{vid}", headers=alice)
 
     assert response.status_code == 200
@@ -652,7 +713,7 @@ def test_violations_normalises_stored_detections(
     dynamo.Table.return_value.query.return_value = _dynamo_page(
         [_frame_item(2, detections=stored)]
     )
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         payload = client.get(f"/violations/{vid}", headers=alice).json()
 
     detection = payload["detections"][0]
@@ -675,7 +736,7 @@ def test_violations_omits_absent_optional_fields(client, fake_db, upload_dir, al
     dynamo.Table.return_value.query.return_value = _dynamo_page(
         [_frame_item(0, detections=stored)]
     )
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         payload = client.get(
             f"/violations/{body['video_id']}", headers=alice
         ).json()
@@ -694,14 +755,14 @@ def test_violations_paginates(client, fake_db, upload_dir, alice):
     dynamo.Table.return_value.query.return_value = _dynamo_page(
         [_frame_item(i) for i in range(3)], last_key=2
     )
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         first = client.get(f"/violations/{vid}", headers=alice).json()
 
     assert first["has_more"] is True
     assert first["next_cursor"] == "2"
 
     dynamo.Table.return_value.query.return_value = _dynamo_page([_frame_item(3)])
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         second = client.get(
             f"/violations/{vid}?cursor={first['next_cursor']}", headers=alice
         ).json()
@@ -716,7 +777,7 @@ def test_violations_paginates(client, fake_db, upload_dir, alice):
 def test_violations_rejects_a_malformed_cursor(client, fake_db, upload_dir, alice):
     body = _upload(client, alice).json()
     dynamo = MagicMock()
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         response = client.get(
             f"/violations/{body['video_id']}?cursor=not-a-number", headers=alice
         )
@@ -735,7 +796,7 @@ def test_violations_counts_failed_frames_separately(
             _frame_item(2, status="pending_audit"),
         ]
     )
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         payload = client.get(
             f"/violations/{body['video_id']}", headers=alice
         ).json()
@@ -757,7 +818,7 @@ def test_violations_store_failure_is_reported_safely(
                    "Message": "Table NovaFlowFrames not found"}},
         "Query",
     )
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         response = client.get(f"/violations/{body['video_id']}", headers=alice)
 
     assert response.status_code == 502

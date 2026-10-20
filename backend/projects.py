@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
 import aws_resources
+import aws_clients
 from auth import get_current_user, require_roles
 
 logger = logging.getLogger(__name__)
@@ -22,9 +23,11 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 REGION = aws_resources.aws_region()
 TABLE_NAME = aws_resources.projects_table_name()
 
-# Initialize DynamoDB
-dynamodb = boto3.resource('dynamodb', region_name=REGION)
-table = dynamodb.Table(TABLE_NAME)
+# AWS clients come from aws_clients (Phase 6), which applies finite connect and
+# read timeouts plus a bounded retry budget. Built at module scope as before, so
+# the names below stay patchable by the test fakes.
+dynamodb = aws_clients.get_resource("dynamodb")
+table = aws_clients.dynamodb_table(TABLE_NAME)
 
 # --- Schemas ---
 
@@ -161,7 +164,7 @@ async def initialize_upload(project_id: str, user: dict = Depends(require_agent)
         raise HTTPException(status_code=404, detail="Project not found")
 
     # 2. Generate S3 Pre-signed URL
-    s3_client = boto3.client('s3', region_name=REGION)
+    s3_client = aws_clients.get_client("s3")
     BUCKET_NAME = aws_resources.media_bucket()
     s3_key = aws_resources.raw_reel_key(project_id, user['sub'])
     

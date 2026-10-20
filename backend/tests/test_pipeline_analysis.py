@@ -411,3 +411,166 @@ def test_frame_analysis_failure_helper_is_not_ok():
     assert result.ok is False
     assert result.detection_count == 0
     assert isinstance(result, FrameAnalysis)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: the per-video frame read is a Query, not a Scan
+# ---------------------------------------------------------------------------
+#
+# `check_pending_frames(video_id=...)` was a Scan with a filter on both
+# `status` and `video_id`, so finding one video's frames read the whole table
+# and got slower and more expensive with every video ever uploaded. The table
+# is keyed (video_id HASH, frame_number RANGE), so one partition is exactly
+# that video's frames and Query answers it directly. No index was added and
+# no IAM permission changed - Query was already granted.
+#
+# `fake_frames_table` models the parts of Query that affect correctness:
+# filters apply after the key condition, Limit bounds items READ rather than
+# returned, and a truncated read carries LastEvaluatedKey.
+
+def _pending(video_id, number):
+    return {
+        "video_id": video_id,
+        "frame_number": number,
+        "status": analyzer.STATUS_PENDING,
+        "s3_key": f"frames/{video_id}/frame_{number:04d}.jpg",
+        "s3_bucket": "test-bucket",
+    }
+
+
+def test_per_video_read_uses_query_and_never_scans(fake_frames_table):
+    """The point of the change: no Scan on the pipeline path."""
+    for number in range(3):
+        fake_frames_table.put_item(Item=_pending("vid_aaaa1111", number))
+
+    frames = analyzer._query_pending_frames("vid_aaaa1111")
+
+    assert len(frames) == 3
+    assert fake_frames_table.query_calls, "the per-video read must use Query"
+    assert fake_frames_table.scan_calls == [], "it must not Scan"
+
+
+def test_query_is_scoped_to_the_requested_video(fake_frames_table):
+    """Another video's frames must never appear in this video's batch."""
+    for number in range(3):
+        fake_frames_table.put_item(Item=_pending("vid_aaaa1111", number))
+    for number in range(2):
+        fake_frames_table.put_item(Item=_pending("vid_bbbb2222", number))
+
+    frames = analyzer._query_pending_frames("vid_aaaa1111")
+
+    assert {f["video_id"] for f in frames} == {"vid_aaaa1111"}
+    assert len(frames) == 3
+
+
+def test_query_returns_only_pending_frames(fake_frames_table):
+    """The status filter still applies, now over one partition."""
+    fake_frames_table.put_item(Item=_pending("vid_aaaa1111", 0))
+    audited = _pending("vid_aaaa1111", 1) | {"status": analyzer.STATUS_AUDITED}
+    failed = _pending("vid_aaaa1111", 2) | {"status": analyzer.STATUS_FAILED}
+    fake_frames_table.put_item(Item=audited)
+    fake_frames_table.put_item(Item=failed)
+
+    frames = analyzer._query_pending_frames("vid_aaaa1111")
+
+    assert [f["frame_number"] for f in frames] == [0]
+
+
+def test_query_pages_through_every_frame(fake_frames_table):
+    """Pagination must not stop at the first page.
+
+    One Query call returns at most 1 MB, so a video with many frames spans
+    several pages. Reading only the first would silently analyse a prefix of
+    the video and then report the job complete.
+    """
+    for number in range(25):
+        fake_frames_table.put_item(Item=_pending("vid_aaaa1111", number))
+    fake_frames_table.page_size = 4
+
+    frames = analyzer._query_pending_frames("vid_aaaa1111")
+
+    assert [f["frame_number"] for f in frames] == list(range(25))
+    assert len(fake_frames_table.query_calls) >= 6, "it must have paged"
+
+
+def test_query_continues_past_a_page_with_no_matches(fake_frames_table):
+    """A filtered page can be empty while more frames remain.
+
+    Limit bounds items read, and the filter runs afterwards, so a page of
+    already-audited frames comes back empty with a LastEvaluatedKey set.
+    Treating empty as "done" would skip every pending frame behind it - the
+    subtle bug this test exists to prevent.
+    """
+    # Frames 0-3 are already audited; 4-7 are still pending.
+    for number in range(4):
+        fake_frames_table.put_item(
+            Item=_pending("vid_aaaa1111", number) | {"status": analyzer.STATUS_AUDITED}
+        )
+    for number in range(4, 8):
+        fake_frames_table.put_item(Item=_pending("vid_aaaa1111", number))
+    fake_frames_table.page_size = 4
+
+    frames = analyzer._query_pending_frames("vid_aaaa1111")
+
+    assert [f["frame_number"] for f in frames] == [4, 5, 6, 7], (
+        "an empty filtered page must not end pagination"
+    )
+
+
+def test_query_frames_arrive_in_sort_key_order(fake_frames_table):
+    """Query returns items in sort-key order, so frames need no re-sorting."""
+    for number in (7, 2, 9, 0, 4):
+        fake_frames_table.put_item(Item=_pending("vid_aaaa1111", number))
+
+    frames = analyzer._query_pending_frames("vid_aaaa1111")
+
+    assert [f["frame_number"] for f in frames] == [0, 2, 4, 7, 9]
+
+
+def test_query_pagination_is_bounded(fake_frames_table, monkeypatch):
+    """A runaway table cannot make one read spin forever."""
+    for number in range(40):
+        fake_frames_table.put_item(Item=_pending("vid_aaaa1111", number))
+    fake_frames_table.page_size = 1
+    monkeypatch.setattr(analyzer, "MAX_QUERY_PAGES", 3)
+
+    frames = analyzer._query_pending_frames("vid_aaaa1111")
+
+    assert len(fake_frames_table.query_calls) == 3
+    assert len(frames) == 3
+
+
+def test_an_empty_partition_returns_nothing_without_error(fake_frames_table):
+    assert analyzer._query_pending_frames("vid_nothing") == []
+    assert fake_frames_table.scan_calls == []
+
+
+def test_the_maintenance_path_still_scans_every_video(fake_frames_table):
+    """With no video id there is no key to query on, so Scan is correct.
+
+    `status` is not a key and there is no GSI on it. This path is only the
+    maintenance CLI; adding an index for it would be infrastructure and cost
+    for a convenience no request uses.
+    """
+    fake_frames_table.put_item(Item=_pending("vid_aaaa1111", 0))
+    fake_frames_table.put_item(Item=_pending("vid_bbbb2222", 0))
+
+    frames = analyzer._scan_pending_frames()
+
+    assert len(frames) == 2
+    assert fake_frames_table.scan_calls, "the all-videos path legitimately scans"
+
+
+def test_check_pending_frames_routes_by_whether_a_video_is_given(fake_frames_table):
+    """The public entry point picks the right access pattern."""
+    fake_frames_table.put_item(Item=_pending("vid_aaaa1111", 0))
+
+    with patch.object(analyzer, "_query_pending_frames", return_value=[]) as query, \
+         patch.object(analyzer, "_scan_pending_frames", return_value=[]) as scan:
+        analyzer.check_pending_frames(video_id="vid_aaaa1111")
+        assert query.called and not scan.called
+
+    with patch.object(analyzer, "_query_pending_frames", return_value=[]) as query, \
+         patch.object(analyzer, "_scan_pending_frames", return_value=[]) as scan:
+        analyzer.check_pending_frames()
+        assert scan.called and not query.called

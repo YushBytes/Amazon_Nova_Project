@@ -8,15 +8,18 @@ from datetime import datetime
 load_dotenv()
 
 import aws_resources
+import aws_clients
 
 S3_BUCKET = aws_resources.media_bucket()
 DYNAMO_TABLE = aws_resources.frames_table_name()
 AWS_REGION = aws_resources.aws_region()
 
-# Initialize AWS clients
-s3_client = boto3.client('s3', region_name=AWS_REGION)
-dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-table = dynamodb.Table(DYNAMO_TABLE)
+# AWS clients come from aws_clients (Phase 6), which applies finite connect and
+# read timeouts plus a bounded retry budget. Built at module scope as before, so
+# the names below stay patchable by the test fakes.
+s3_client = aws_clients.get_client("s3")
+dynamodb = aws_clients.get_resource("dynamodb")
+table = aws_clients.dynamodb_table(DYNAMO_TABLE)
 
 def reconstruct_video(video_id, output_filename="final_compliant_video.mp4"):
     """

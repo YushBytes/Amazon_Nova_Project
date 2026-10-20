@@ -371,28 +371,122 @@ generic, never an exception string.
 
 ---
 
-## 8. Job execution and its limitations
+## 8. Job execution: the durable worker
 
-Execution uses FastAPI's in-process `BackgroundTasks`. This is what the
-deployment has, and the limitations are real:
+**Phase 6 replaced in-process execution.** Sections 8.1–8.5 describe what runs
+now; 8.6 records the architecture that was rejected and why.
 
-* **No crash recovery.** If the process dies mid-run, the job stays
-  `extracting` or `analyzing` forever. Nothing resumes it. `pipeline.find_stuck_jobs()`
-  *detects* these (non-terminal, no update for 30 minutes) so an operator can
-  retry them; it never fails a job automatically, because a slow legitimate run
-  must not be killed.
-* **Concurrency control is a conditional state transition**, not a lock. The
-  `queued → extracting` claim does hold across processes, which is what stops
-  duplicate processing; it is a mitigation, not a mutex.
-* **No backpressure.** Many simultaneous submissions run many background tasks
-  in the server threadpool.
-* **Durability of source videos.** Uploads sit on the application host's local
-  disk. A replaced container loses them, and the ownership record then points at
-  a file that no longer exists (`/analyze` returns 404 for that).
+### 8.1 Two processes
 
-A durable queue (SQS, Celery, Step Functions) is the real fix and is
-deliberately out of Phase 4 scope. Nothing in the code or docs claims queue
-semantics it does not have.
+```
+POST /analyze/{id}
+      │
+      │  1. validate + ownership check
+      │  2. persist status=queued          <-- durable HERE, before the response
+      ▼
+   202-style response {video_id, status: "queued", job: {...}}
+
+   ... the API's involvement ends ...
+
+python backend/worker.py
+      │  poll   find_queued_jobs()         indexed (status, updated_at)
+      │  claim  claim() conditional update + claim_id + lease
+      │  run    extract -> analyse -> persist
+      ▼  sweep  recover_abandoned_jobs() every WORKER_RECOVERY_INTERVAL_SECONDS
+```
+
+The API no longer executes analysis. `JOB_EXECUTION_MODE=worker` (the
+production default) makes the API queue-and-return; `inline` keeps the Phase 4
+in-process behaviour for single-process local development and the test suite.
+**The HTTP response shape is identical in both modes** — a test asserts this,
+so the frontend cannot tell which is configured.
+
+### 8.2 The queue is the job record
+
+There is no SQS, no Celery, no Redis. The MongoDB `videos` collection was
+already a durable work queue before this phase:
+
+| Queue concept | How it already exists |
+| :-- | :-- |
+| Durable enqueue | `pipeline.submit()` persists `queued` **before** the API responds |
+| Exactly-one receive | `video_repo.claim()` — a conditional update; the loser matches zero documents |
+| Visibility timeout | `lease_expires_at`, extended by `heartbeat()` |
+| Fencing | `claim_id`, required by every later write — *stronger* than a queue offers: a superseded worker's writes are **rejected**, not merely duplicated |
+| Redrive policy | `attempt` against `MAX_ATTEMPTS` |
+| Dead-letter | the `failed` state, queryable in the same store |
+| Backoff | `not_before`, set by `schedule_retry()` |
+
+So durability did not need to be added — it needed a process to consume it.
+
+### 8.3 What this guarantees
+
+* **An accepted job survives an API restart.** Acceptance is a database write,
+  not an in-memory handoff, so there is nothing to lose. A worker started later
+  — which has never seen the request — picks it up.
+* **Duplicate execution cannot corrupt a result.** A terminal job is not
+  re-claimable, and a re-run overwrites frame rows keyed
+  `(video_id, frame_number)` rather than appending. `_prune_stale_frames`
+  removes rows a *longer* previous attempt left behind, so a shorter re-run
+  cannot report a stale frame as current.
+* **A dead worker's job is recovered, continuously.** Its lease lapses and the
+  next sweep requeues it. Recovery now runs inside every worker on an interval,
+  not only at API startup.
+* **Retries are bounded and classified.** Only failures that could plausibly
+  succeed later are retried — a transport timeout, a throttle, an unreadable
+  frame table. Deterministic failures (a missing object, an over-size object,
+  an unreadable video) fail immediately rather than billing three times for the
+  same answer. `source_store` carries an explicit `retryable` flag set at each
+  raise site, not inferred from the message.
+* **A graceful stop is graceful.** SIGTERM/SIGINT finish the current job, then
+  exit. A hard kill leaves the lease to lapse; the job is requeued, never
+  reported complete.
+
+### 8.4 What it does NOT guarantee
+
+* **Not at-most-once.** A job interrupted mid-analysis is re-run from the
+  start. Safe because frame writes are idempotent, but Bedrock is billed again
+  for the frames already analysed.
+* **Not push delivery.** The worker polls (default 5s), so a job waits up to
+  one poll interval. One poll is a single indexed query.
+* **Not multi-host fairness** beyond "oldest `queued` first".
+* **No backpressure.** Submissions are accepted regardless of queue depth.
+  `GET /health/worker` exposes the depth; nothing throttles on it.
+* **One job at a time per worker.** Concurrency is per-process — run more
+  workers — so the cost stays visible to whoever provisions them.
+
+### 8.5 Timeouts
+
+Every boto3 client is built by `backend/aws_clients.py` with a finite connect
+and read timeout and a bounded retry budget. This is load-bearing for the lease
+model: a call that could hang forever would keep a dead-in-the-water worker
+heartbeating, so its job would never look abandoned and would never be
+recovered.
+
+⚠️ **The two retry budgets multiply.** `AWS_MAX_ATTEMPTS` (botocore, per API
+call) × `BEDROCK_MAX_ATTEMPTS` (the analyzer, per frame) is the worst case per
+frame, and every attempt is billed. Raise one, not both.
+
+### 8.6 Why not SQS
+
+SQS was the obvious candidate and was rejected for this phase:
+
+1. **It would add a second source of truth for pending work.** A message whose
+   job is already `completed`, or a `queued` job whose message was lost, is a
+   divergence the current design cannot have — there is one record.
+2. **It duplicates what leases already do.** Visibility timeout and redrive
+   restate `lease_expires_at` and `attempt`, and SQS has no equivalent of the
+   `claim_id` fencing token.
+3. **It needs a deployment-target decision the project has not made** —
+   `CLAUDE.md` §9 question 9. The worker as built runs anywhere the API image
+   runs.
+4. **It could not be tested deterministically** without real AWS or a new local
+   dependency. Every guarantee in §8.3 is covered by a test today.
+
+SQS becomes the right answer when there are multiple worker hosts and
+throughput matters more than simplicity. At that point the changes are
+localised: `find_queued_jobs` and the worker's poll are the only things that
+move, and `infra/iam_policy_least_privilege.json` records which permissions
+would be added.
 
 ---
 

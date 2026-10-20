@@ -75,7 +75,7 @@ Every external service is mocked in tests, so detection accuracy is
 
 ```
 Amazon Nova/                         <- project root (flattened in Phase 0; holds .gitignore)
-├── backend/          FastAPI service, 23 Python modules + tests/
+├── backend/          FastAPI API + durable worker, 25 Python modules + tests/
 ├── frontend/         Next.js 16 App Router dashboard (the live one)
 ├── infra/            CloudFormation storage template + IAM policy template (not deployed)
 ├── docs/             planning.md (aspirational) + the audit deliverables
@@ -95,7 +95,7 @@ Amazon Nova/                         <- project root (flattened in Phase 0; hold
 - **AI:** Amazon Bedrock, model `amazon.nova-pro-v1:0`. *(Docs say "Nova 2 Pro"; code says `nova-pro-v1:0`. Unresolved.)*
 - **Storage:** S3 for **both** source videos (`sources/`) and frame JPEGs (`frames/`), one bucket named by `S3_BUCKET_NAME`; DynamoDB (`NovaFlowFrames`, `NovaFlowProjects`) for metadata; MongoDB for accounts (`novaflow.users`) and ownership plus job state (`novaflow.videos`). Local `backend/uploads/` is **read-only legacy** — pre-Phase-4.1 records only; new uploads never land there.
 - **Video:** `ffmpeg-python` + the FFmpeg binary, 1 fps extraction.
-- **Deploy:** AWS Amplify (frontend only); `backend/Dockerfile` exists with no deployment definition.
+- **Deploy:** AWS Amplify (frontend only); `backend/Dockerfile` exists with no deployment definition. **Two backend processes** now: the API (`uvicorn app:app`) and the worker (`python backend/worker.py`). Both run from the same image; neither has a deployment definition. §9 question 9 is still open.
 
 ### 2.3 Storage reality vs. documentation **[VERIFIED]**
 
@@ -114,7 +114,9 @@ Browser (:3000)
   ├─ POST /auth/signup|login ──► MongoDB novaflow.users (Argon2id, rate-limited)
   ├─ GET  /auth/me
   ├─ POST /upload-reel ───────► S3 sources/{id}/source.{ext} + ownership record
-  ├─ POST /analyze/{id}[/retry] ► job queued, run by a leased worker
+  ├─ POST /analyze/{id}[/retry] ► job queued DURABLY, then the API is done
+  │                               (a separate worker process claims and runs it)
+  ├─ GET  /health/live|ready|worker ► probes; live touches no dependency
   ├─ GET  /jobs/{id} ─────────► job state, stage, counts
   ├─ GET  /violations/{id} ───► DynamoDB NovaFlowFrames (paginated)
   ├─ GET  /submissions ───────► the caller's own videos
@@ -149,7 +151,7 @@ and `frontend/node_modules` is installed. Use the venv interpreter.
 git rev-parse --show-toplevel                      # ALWAYS run before committing
 python -m py_compile backend/*.py analyzer_nova.py prompts.py
 
-# Backend tests — 624 passed, 42 skipped
+# Backend tests — 679 passed, 42 skipped
 ./.venv/Scripts/python.exe -m pytest backend/tests -q
 
 # Frontend — all four pass; lint reports 0 errors / 18 warnings
@@ -176,6 +178,8 @@ cd backend && python extractor.py <video.mp4> [video_id]
 cd backend && python analyzer.py <image.jpg | video_id>
 cd backend && python video_stitcher.py <video_id> [out.mp4]
 cd backend && python recover_jobs.py            # dry run; --apply to requeue
+cd backend && python worker.py                  # the durable worker
+cd backend && python worker.py --status         # queue depth; needs MongoDB
 ```
 
 ### Does not exist **[VERIFIED 2026-10-20]**
@@ -228,6 +232,15 @@ Pre-existing application configuration:
 | `MONGODB_DB_NAME` | `db.py` | `novaflow` |
 | `JOB_LEASE_SECONDS` | `video_repo` | `300` |
 | `RECOVER_JOBS_ON_STARTUP` | `app.py` | `true` |
+| `JOB_EXECUTION_MODE` | `config.load_job_execution_mode()` | `worker` in production, `inline` in development |
+| `WORKER_POLL_INTERVAL_SECONDS` | `worker` | `5` |
+| `WORKER_RECOVERY_INTERVAL_SECONDS` | `worker` | `60` (0 disables) |
+| `WORKER_SHUTDOWN_GRACE_SECONDS` | `worker` | `30` |
+| `RETRY_BACKOFF_SECONDS` / `_CAP_SECONDS` | `pipeline.retry_delay_seconds` | `30` / `600` |
+| `READINESS_TIMEOUT_SECONDS` | `app.py` health probes | `3` |
+| `AWS_CONNECT_TIMEOUT_SECONDS` / `AWS_READ_TIMEOUT_SECONDS` / `AWS_MAX_ATTEMPTS` | `aws_clients.client_config()` | `10` / `60` / `3` |
+
+⚠️ **`AWS_MAX_ATTEMPTS` and `BEDROCK_MAX_ATTEMPTS` multiply.** Their product is the worst-case model invocations for one frame, and every attempt is billed. Raise one, not both.
 | `API_URL` | `app.py:82` | `http://localhost:8000` |
 | `BEDROCK_GUARDRAIL_ID` | `safety.py:13` | **none** |
 | `BEDROCK_GUARDRAIL_VERSION` | `safety.py:14` | `1` |
@@ -268,6 +281,10 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **A pipeline stage must raise, not return `None`, on failure.** `extractor.ExtractionError` messages are shown to the video's owner, so they must carry no path, bucket, or exception text.
 - **Media access uses a scoped token.** A browser `<video>` element cannot send an `Authorization` header, so `GET /uploads/{file}` takes a short-lived token (`MEDIA_TOKEN_TTL_MINUTES`, default 15) bound to one `video_id`. Session tokens and media tokens are not interchangeable.
 - **Never log a full URL or request target.** Playback URLs carry a token in the query string. `backend/logging_setup.py` redacts sensitive query values on the request-emitting loggers; if you add a logger that prints a URL, register it there. Log `request.url.path`, never `request.url`.
+- **Build every boto3 client through `aws_clients`** (Phase 6). A bare `boto3.client(...)` has no timeout, and an unbounded call keeps a dead-in-the-water worker heartbeating so its job is never recovered — the timeout is what makes the lease mean anything. `test_no_module_builds_an_unconfigured_boto3_client` fails on a direct call.
+- **Classify a failure before retrying it.** Only a failure that could succeed later is retryable: a timeout, a throttle, an unreadable frame table. A missing object, an over-size object, or an unreadable video is deterministic and must fail immediately — retrying bills three times for the same answer. `source_store` carries an explicit `retryable` flag set **at each raise site**, never inferred from the message.
+- **A retry must set a backoff.** `video_repo.schedule_retry` sets `not_before`; without it the worker reclaims the job on its next poll and spends the whole attempt budget within seconds of a blip. The recovery sweep skips a job whose `not_before` is in the future, so one failure cannot increment `attempt` twice.
+- **Never make `/health/live` depend on an external service.** If it did, a brief MongoDB outage would fail every replica's liveness probe and get them all restarted — turning degradation into guaranteed downtime. Readiness is where dependencies belong, each under a finite timeout.
 - **Rate-limit new credential-style endpoints** by adding a rule in `rate_limit.build_credential_rules`. Use middleware, not a route decorator: a decorator runs after request validation, so a malformed body bypasses the counter entirely (measured, see `rate_limit.py`). Counters are per-process.
 - **Never trust `X-Forwarded-For`** unless `TRUSTED_PROXY_COUNT` is set to the real proxy depth; read the chain from the right, never the client-controlled left.
 - **Database initialization must stay non-destructive.** `backend/db_init.py` detects duplicates before creating a unique index, reports counts only (never usernames), and skips rather than failing. Never delete or merge accounts to make a migration succeed.
@@ -278,8 +295,8 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **Rate limiting is per-process.** `/auth/login` and `/auth/signup` are throttled, but counters live in process memory, so the effective limit is multiplied by the worker count. Accurate for the single-process Dockerfile; **not** distributed protection. No per-account throttle either.
 - **No token revocation.** Tokens live in `localStorage` and are valid until expiry; rotating `JWT_SECRET_KEY` is the only break-glass.
 - **Media tokens travel in URLs.** Redacted from this process's logs, but still reach browser history, `Referer`, and any proxy/CDN log — which this application cannot redact.
-- **Analysis runs in an in-process `BackgroundTasks` worker, so there is no crash recovery.** A restart orphans running jobs in `extracting`/`analyzing`; `pipeline.find_stuck_jobs()` detects them but nothing resumes them. A durable queue is the real fix and is out of scope.
-- **Source videos live on the application host's local disk**, not S3. A replaced container loses them.
+- ~~**Analysis runs in an in-process `BackgroundTasks` worker**~~ **ADDRESSED in Phase 6.** Execution moved to a separate polling worker (`backend/worker.py`) over the MongoDB `videos` collection, which was already a durable queue (conditional claim, lease, fencing token, bounded attempts). Acceptance is a database write made **before** the API responds, so an accepted job survives an API restart, and recovery sweeps run inside every worker on an interval rather than only at API startup. Remaining honest limits: delivery is **polled, not pushed** (default 5s); execution is **not at-most-once**, so an interrupted job re-runs from the start and re-bills Bedrock for frames already analysed; with every worker down nothing sweeps until one starts; and there is **no backpressure** — `/health/worker` exposes queue depth but nothing throttles on it. **No worker has run against real infrastructure and no process has been SIGKILLed** — crash recovery is verified as logic, not observed behaviour.
+- ~~**Source videos live on the application host's local disk**~~ **FIXED in Phase 4.1** — they are in S3 under `sources/`, which is what lets any worker on any host run any job.
 - **Frame sampling is 1 fps**, so a violation visible for under ~1 second can be missed.
 - **There is no brand-rule configuration** - one static prompt in `prompts.py`. No per-client policies, and no legal/regulatory evaluation.
 - **Pre-Phase-3 uploads have no ownership record** and are therefore inaccessible. The uploader was never recorded, so it cannot be recovered from the data. Options in `docs/SECURITY_OPERATIONS.md` §6.
@@ -311,7 +328,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0 through 5 are **complete, committed, and pushed**.
+Phases 0 through 6 are **complete, committed, and pushed**.
 
 | Phase | What landed |
 | :-- | :-- |
@@ -322,12 +339,15 @@ Phases 0 through 5 are **complete, committed, and pushed**.
 | 4 | End-to-end pipeline and job state machine. |
 | 4.1 | Durable S3 source storage, worker leases, crash recovery, CloudFormation storage template. |
 | 5 | Dead code removed, storage configuration reconciled to one contract, README rewritten. |
+| 6 | Durable worker process, AWS client timeouts, retry classification with backoff, health/readiness probes, Scan replaced by Query on the request path. |
 
 **Phase 5 detail.** Deleted: the orphaned MongoDB/GridFS pipeline (`audit_manager.py`, `verifier.py`, `check_count.py`), `debug_probe.py`, `aws_config.py`, `frontend_backup/` (72 files), the stray `frontend/Video Compliance Dashboard/`, the orphan `/agents` and `/logs` duplicate routes, `infra/init_s3.py`, and `infra/iam_policy.yaml` — 82 files. `S3_BUCKET_NAME` is now required in production and validated; `MONGO_URI` and `Pillow` are gone with their only consumer. Regression tests assert the deleted modules stay deleted, that nothing imports `gridfs`, and that nothing reimplements the bucket fallback.
 
-**Phase 5 did NOT make the application production-ready.** It made the architecture coherent. Everything in §5 "Known remaining gaps" still stands, and nothing has still ever run against real AWS or Bedrock.
+**Phases 5 and 6 did NOT make the application production-ready.** Phase 5 made the architecture coherent; Phase 6 made job execution durable and removed a real class of data loss. Everything still open in §5 "Known remaining gaps" stands, and **nothing has ever run against real AWS or Bedrock** — no worker has run against real infrastructure and no process has been SIGKILLed, so crash recovery is verified as logic, not as observed behaviour.
 
-**Phase 6 has not been started.** Remaining: 6 (backend reliability / durable worker), 7 (frontend completion), 8 (remediation — needs §9 q4), 9 (reconstruction — needs §9 q3), 10 (tests, CI, docs, release). Do not start one until it is explicitly assigned.
+**Phase 6 detail.** Execution split into two processes: the API queues durably and returns; `backend/worker.py` polls, claims under a lease, and runs. The durable queue is the existing MongoDB `videos` collection — **no SQS, no new AWS resource, no new IAM permission** (`docs/PIPELINE_ARCHITECTURE.md` §8.6 records why SQS was rejected). Also added: `backend/aws_clients.py` so every boto3 client has a finite timeout and a bounded retry budget (only `source_store` had one before); retryable-vs-permanent failure classification with exponential backoff via `not_before`; `/health/live`, `/health/ready` and `/health/worker`; and the per-video frame read moved from a full-table `Scan` to a key-based `Query`. The API response contract is unchanged in both execution modes, and a test asserts it.
+
+**Phase 7 has not been started.** Remaining: 7 (frontend completion), 8 (remediation — needs §9 q4), 9 (reconstruction — needs §9 q3), 10 (tests, CI, docs, release). Do not start one until it is explicitly assigned.
 
 ---
 
@@ -379,7 +399,7 @@ These block specific phases. Do not decide them unilaterally.
 6. Correct model ID — `amazon.nova-pro-v1:0`, or a "Nova 2 Pro" id? Docs and code disagree.
 7. Is Nova Act / browser automation in scope at all? If not, `automation.py`, `orchestrator.py`, `/execute`, and the "Neural Command" UI panel can all go. *(Still open, so Phase 5 retained all of them. `backend/safety.py` is retained for the same reason: it is never imported, but its `intercept_action` is the human-in-the-loop gate for exactly this feature, so deleting it would pre-empt this decision. `backend/s3_trigger.py`, an unreferenced Lambda stub with no deployment definition, was retained as uncertain rather than deleted.)*
 8. ~~Are the `brand-guardian-*` buckets in `infra/` intentional, or leftovers?~~ **RESOLVED in Phase 5 — leftovers.** No application code has ever read them. The two files that created and granted them (`infra/init_s3.py`, `infra/iam_policy.yaml`) were deleted. ⚠️ **No AWS bucket was touched.** If such buckets were ever created in a real account, deleting them there is a separate operator action.
-9. Backend deployment target — ECS, Lambda, App Runner? Only the frontend has a deployment config.
+9. Backend deployment target — ECS, Lambda, App Runner? Only the frontend has a deployment config. *(Phase 6 made this sharper rather than resolving it: there are now **two** long-running processes to place, the API and the worker. The worker is a plain process over MongoDB specifically so this decision stays open — it needs no managed queue. Lambda would not fit the worker as written, since it polls and holds a lease for the length of a job.)*
 
 ---
 

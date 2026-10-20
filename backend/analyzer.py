@@ -13,6 +13,7 @@ from decimal import Decimal
 from dotenv import load_dotenv
 
 import aws_resources
+import aws_clients
 from config import get_settings
 from detections import (
     AnalysisParseError,
@@ -50,11 +51,13 @@ S3_BUCKET = aws_resources.media_bucket()
 DYNAMO_TABLE = aws_resources.frames_table_name()
 AWS_REGION = aws_resources.aws_region()
 
-# Initialize AWS clients
-s3_client = boto3.client('s3', region_name=AWS_REGION)
-dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-bedrock_runtime = boto3.client('bedrock-runtime', region_name=AWS_REGION)
-table = dynamodb.Table(DYNAMO_TABLE)
+# AWS clients come from aws_clients (Phase 6), which applies finite connect and
+# read timeouts plus a bounded retry budget. Built at module scope as before, so
+# the names below stay patchable by the test fakes.
+s3_client = aws_clients.get_client("s3")
+dynamodb = aws_clients.get_resource("dynamodb")
+bedrock_runtime = aws_clients.get_client("bedrock-runtime")
+table = aws_clients.dynamodb_table(DYNAMO_TABLE)
 
 # ---------------------------------------------------------------------------
 # Model configuration, in one place
@@ -74,7 +77,12 @@ MAX_OUTPUT_TOKENS = 1000
 PIPELINE_VERSION = "4.0"
 
 # Safety bound on scan pagination.
-MAX_SCAN_PAGES = 50
+# Page bound for the paged reads below, so a runaway table cannot make one
+# call spin forever. Named for pages, not for Scan: Phase 6 moved the
+# per-video read to Query and this bounds both.
+MAX_QUERY_PAGES = 50
+# Retained name for anything importing it.
+MAX_SCAN_PAGES = MAX_QUERY_PAGES
 
 # Bedrock error codes worth retrying. Everything else (validation,
 # authorization, model-not-found) is permanent and must fail immediately
@@ -362,6 +370,90 @@ def delete_frames_from(video_id: str, keep_count: int) -> int:
     return deleted
 
 
+def _query_pending_frames(video_id):
+    """Pending frames for one video, read by partition key.
+
+    Phase 6. This was a Scan with a filter on both `status` and `video_id`,
+    which read the whole table to find the frames of one video - cost and
+    latency growing with every video ever uploaded, for a lookup the key
+    schema already answers. The table is keyed (video_id HASH, frame_number
+    RANGE), so one partition IS exactly this video's frames.
+
+    `status` is not part of the key and there is no GSI on it, so it stays a
+    FilterExpression. That is still strictly better than before: the filter now
+    runs over one video's frames rather than the entire table, and the result
+    is identical.
+
+    Two consequences of Query that the paging below has to respect:
+
+    * Query returns items in sort-key order, so frames arrive already ordered
+      by `frame_number` and no post-sort is needed.
+    * `Limit` and the 1 MB page bound apply to items READ, before the filter.
+      A page can therefore come back with zero items and still have more to
+      read, so stopping at the first empty page would silently skip frames.
+      Only `LastEvaluatedKey` says whether to continue.
+    """
+    from boto3.dynamodb.conditions import Attr, Key
+
+    kwargs = {
+        "KeyConditionExpression": Key("video_id").eq(video_id),
+        "FilterExpression": Attr("status").eq(STATUS_PENDING),
+    }
+
+    frames = []
+    pages = 0
+    while True:
+        response = table.query(**kwargs)
+        frames.extend(response.get("Items", []))
+        cursor = response.get("LastEvaluatedKey")
+        pages += 1
+        if not cursor or pages >= MAX_QUERY_PAGES:
+            if cursor:
+                logger.warning(
+                    "Stopped reading pending frames for %s after %d page(s); "
+                    "more may remain", video_id, pages,
+                )
+            break
+        kwargs["ExclusiveStartKey"] = cursor
+
+    return frames
+
+
+def _scan_pending_frames():
+    """Pending frames across every video. Unavoidably a Scan.
+
+    Only the maintenance CLI (`python analyzer.py` with no video id) takes
+    this path; the pipeline always passes a video id. `status` is not a key
+    and there is no GSI on it, so there is no key-based way to ask "every
+    pending frame in the table". A GSI on `status` would remove this, and is
+    deliberately NOT added here: nothing on a request path uses it, so it
+    would be infrastructure and cost for a CLI convenience.
+    """
+    from boto3.dynamodb.conditions import Attr
+
+    logger.info("Scanning every video for pending frames (maintenance path)")
+
+    kwargs = {"FilterExpression": Attr("status").eq(STATUS_PENDING)}
+    frames = []
+    pages = 0
+    while True:
+        response = table.scan(**kwargs)
+        frames.extend(response.get("Items", []))
+        cursor = response.get("LastEvaluatedKey")
+        pages += 1
+        if not cursor or pages >= MAX_QUERY_PAGES:
+            if cursor:
+                logger.warning(
+                    "Stopped scanning pending frames after %d page(s); "
+                    "more may remain", pages,
+                )
+            break
+        kwargs["ExclusiveStartKey"] = cursor
+
+    frames.sort(key=lambda item: int(item["frame_number"]))
+    return frames
+
+
 def check_pending_frames(video_id=None, on_progress=None, attempt=None):
     """Audit every frame currently marked `pending_audit`.
 
@@ -386,41 +478,17 @@ def check_pending_frames(video_id=None, on_progress=None, attempt=None):
     Raises:
         FrameAuditError: if the pending frames cannot be enumerated at all.
     """
-    from boto3.dynamodb.conditions import Attr
-
-    logger.info("Checking for pending frames in %s", DYNAMO_TABLE)
-
-    # At scale this should use a GSI on `status`; the scan is retained to
-    # preserve existing behaviour and is tracked for a later phase.
-    scan_kwargs = {'FilterExpression': Attr('status').eq(STATUS_PENDING)}
-    if video_id:
-        scan_kwargs['FilterExpression'] &= Attr('video_id').eq(video_id)
-
     try:
-        # DynamoDB returns at most 1 MB per page, so one scan call is not the
-        # whole queue. Page until exhausted, bounded so a runaway table cannot
-        # spin forever.
-        pending_frames = []
-        pages = 0
-        while True:
-            response = table.scan(**scan_kwargs)
-            pending_frames.extend(response.get('Items', []))
-            cursor = response.get('LastEvaluatedKey')
-            pages += 1
-            if not cursor or pages >= MAX_SCAN_PAGES:
-                if cursor:
-                    logger.warning(
-                        "Stopped scanning pending frames after %d page(s); "
-                        "more may remain", pages,
-                    )
-                break
-            scan_kwargs['ExclusiveStartKey'] = cursor
-        pending_frames.sort(key=lambda x: int(x['frame_number']))
+        if video_id:
+            pending_frames = _query_pending_frames(video_id)
+        else:
+            pending_frames = _scan_pending_frames()
     except Exception as e:
-        # A scan failure means the batch is unknown, not that there is nothing
-        # to do. Surface it instead of returning as if the queue were empty.
+        # Failing to enumerate means the batch is UNKNOWN, not empty. Surface
+        # it rather than returning as if there were nothing to do, which would
+        # let the pipeline record a clean result for an unexamined video.
         raise FrameAuditError(
-            f"Could not scan {DYNAMO_TABLE} for pending frames: {type(e).__name__}"
+            f"Could not read {DYNAMO_TABLE} for pending frames: {type(e).__name__}"
         ) from e
 
     summary = {

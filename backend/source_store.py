@@ -43,23 +43,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-import boto3
-from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+import aws_clients
 import aws_resources
 from config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Bounded so a hung S3 call cannot pin a worker thread forever. The read
-# timeout applies per read, not to the whole transfer, so a slow-but-moving
-# download of a large object still succeeds.
-_S3_TIMEOUT_CONFIG = Config(
-    connect_timeout=10,
-    read_timeout=60,
-    retries={"max_attempts": 3, "mode": "standard"},
-)
+# Timeouts and the retry budget now come from aws_clients (Phase 6), so the
+# whole application shares one configurable policy instead of this module
+# being the only one with a bound. The values are unchanged by default.
 
 # Error codes that mean "this object will never appear", as opposed to a
 # transport problem that may succeed on retry.
@@ -77,11 +71,7 @@ def s3_client():
     """
     global _client
     if _client is None:
-        _client = boto3.client(
-            "s3",
-            region_name=aws_resources.aws_region(),
-            config=_S3_TIMEOUT_CONFIG,
-        )
+        _client = aws_clients.get_client("s3")
     return _client
 
 
@@ -96,16 +86,32 @@ class SourceStoreError(RuntimeError):
 
     The message is written to be shown to the video's owner: no bucket name,
     object key, filesystem path, credential, or botocore string.
+
+    `retryable` says whether the SAME input could plausibly succeed later.
+    It is set explicitly at each raise site rather than inferred from the
+    message, because the two kinds are not distinguishable by text and
+    guessing wrong is expensive in both directions: retrying a permanent
+    failure bills three times for one answer, and failing a transient one
+    turns a momentary outage into a dead job. Default False - a new raise site
+    has to opt in to being retried.
     """
+
+    retryable = False
+
+    def __init__(self, *args, retryable: bool = False):
+        super().__init__(*args)
+        self.retryable = retryable
 
 
 class SourceMissing(SourceStoreError):
     """The source object does not exist.
 
-    Distinct from a transport failure because the outcomes differ: a missing
-    object is permanent and must fail the job, while a transport failure may
-    succeed on a later attempt.
+    Permanent by definition: no amount of retrying conjures an object back, so
+    this never sets `retryable`.
     """
+
+    def __init__(self, *args):
+        super().__init__(*args, retryable=False)
 
 
 @dataclass(frozen=True)
@@ -175,7 +181,8 @@ def upload_source(
     except (BotoCoreError, ClientError) as exc:
         logger.exception("Could not store the source video for %s", video_id)
         raise SourceStoreError(
-            "The video could not be stored. Please try the upload again."
+            "The video could not be stored. Please try the upload again.",
+            retryable=True,
         ) from exc
     except OSError as exc:
         logger.exception("Could not read the staged upload for %s", video_id)
@@ -350,13 +357,13 @@ def _download_to(bucket: str, key: str, destination: Path, limit: int) -> None:
             ) from exc
         logger.exception("Could not download a source video")
         raise SourceStoreError(
-            "The video could not be retrieved for analysis."
+            "The video could not be retrieved for analysis.", retryable=True
         ) from exc
     except BotoCoreError as exc:
         # Connection and read timeouts land here.
         logger.exception("Transport failure downloading a source video")
         raise SourceStoreError(
-            "The video could not be retrieved for analysis."
+            "The video could not be retrieved for analysis.", retryable=True
         ) from exc
 
     body = response.get("Body")
@@ -375,6 +382,8 @@ def _download_to(bucket: str, key: str, destination: Path, limit: int) -> None:
                 if written > limit:
                     # The upload route enforces the same ceiling, so this can
                     # only trigger if the object was replaced out of band.
+                    # Deterministic, so NOT retryable: the same object would
+                    # breach the same limit on every attempt.
                     raise SourceStoreError(
                         "The stored video is larger than this service accepts."
                     )
@@ -384,7 +393,7 @@ def _download_to(bucket: str, key: str, destination: Path, limit: int) -> None:
     except (BotoCoreError, ClientError, OSError) as exc:
         logger.exception("Failed while writing a downloaded source video")
         raise SourceStoreError(
-            "The video could not be retrieved for analysis."
+            "The video could not be retrieved for analysis.", retryable=True
         ) from exc
     finally:
         try:

@@ -20,6 +20,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
     status,
 )
@@ -34,6 +35,8 @@ from orchestrator import NovaFlowOrchestrator
 from automation import NovaFlowAutomation
 
 # Import routers
+import aws_clients
+import config
 import aws_resources
 import db_init
 import pipeline
@@ -96,6 +99,27 @@ def _dispatch_recovered_job(video_id: str) -> None:
         name=f"novaflow-recovery-{video_id}",
         daemon=True,
     ).start()
+
+
+def _dispatch_analysis(background_tasks: BackgroundTasks, video_id: str) -> str:
+    """Hand a durably-queued job to an executor, according to the mode.
+
+    The job is ALREADY persisted as `queued` before this is called, so this
+    function cannot lose work: in `worker` mode it deliberately does nothing
+    and a separate `python backend/worker.py` process claims the job on its
+    next poll. That is what lets the API restart, or be redeployed, without
+    stranding accepted jobs - there is no in-process handoff to drop.
+
+    `inline` mode keeps the Phase 4 behaviour of running the job in a
+    FastAPI background thread, which is convenient for single-process local
+    development and for the test suite but is not durable.
+
+    Returns the mode used, for the response and the log line.
+    """
+    mode = settings.job_execution_mode
+    if mode == config.INLINE_MODE:
+        background_tasks.add_task(pipeline.run_job, video_id)
+    return mode
 
 
 @asynccontextmanager
@@ -212,8 +236,159 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/status")
 async def get_status():
-    """Public liveness probe. Deliberately reveals no configuration."""
+    """Public liveness probe. Deliberately reveals no configuration.
+
+    Retained unchanged for backward compatibility. `/health/live` and
+    `/health/ready` are the Phase 6 probes and are what an orchestrator
+    should use; this one is an unauthenticated banner and nothing more.
+    """
     return {"status": "online", "agent": "NovaFlow", "version": "2.0-aws"}
+
+
+# ---------------------------------------------------------------------------
+# Health and readiness (Phase 6)
+# ---------------------------------------------------------------------------
+#
+# Liveness and readiness answer different questions and must not be the same
+# endpoint:
+#
+#   /health/live   Can this process still serve? Touches NOTHING external, so
+#                  a MongoDB outage cannot make every replica fail its
+#                  liveness probe and get killed - which would turn a
+#                  recoverable dependency blip into a cluster-wide restart
+#                  loop and guarantee downtime instead of degradation.
+#
+#   /health/ready  Should this process receive traffic? Checks the
+#                  dependencies a request actually needs, each with a short
+#                  finite timeout. 503 when it cannot serve correctly, so a
+#                  load balancer drains it while leaving it running.
+#
+# Neither reveals a bucket name, connection string, credential, or exception
+# text: a probe endpoint is usually unauthenticated.
+
+async def _check_with_timeout(name: str, coro_factory, timeout: float) -> dict:
+    """Run one dependency check under a hard timeout.
+
+    A readiness probe that can hang is worse than one reporting a dependency
+    as down: the orchestrator's own probe timeout fires, which it may treat as
+    a failure of the whole pod rather than of one dependency. Every check here
+    therefore returns within `timeout` whatever the dependency does.
+
+    The returned detail is a fixed phrase per outcome, never the exception
+    text, which for a driver error can contain the connection string.
+    """
+    import anyio
+
+    try:
+        with anyio.fail_after(timeout):
+            await coro_factory()
+    except TimeoutError:
+        logger.warning("Readiness check %s timed out", name)
+        return {"name": name, "ok": False, "detail": "timed out"}
+    except Exception as exc:
+        # Type only. A pymongo error renders the full URI in its message.
+        logger.warning("Readiness check %s failed: %s", name, type(exc).__name__)
+        return {"name": name, "ok": False, "detail": "unreachable"}
+    return {"name": name, "ok": True, "detail": "ok"}
+
+
+async def _check_mongodb() -> None:
+    """Ping the database that holds accounts, ownership and the job queue."""
+    from db import get_database
+
+    database = await get_database()
+    await database.command("ping")
+
+
+@app.get("/health/live")
+async def health_live():
+    """Liveness: this process is up and the event loop is responsive.
+
+    Deliberately checks no dependency. A 200 here means only "do not restart
+    me"; it is NOT a statement that the application can serve a request. Use
+    /health/ready for that.
+    """
+    return {"status": "alive", "mode": settings.job_execution_mode}
+
+
+@app.get("/health/ready")
+async def health_ready(response: Response):
+    """Readiness: the dependencies a request needs are usable.
+
+    Checks, each under READINESS_TIMEOUT_SECONDS:
+
+    * configuration - already validated at startup, so this reports the fact
+      rather than re-deriving it;
+    * MongoDB - required by every authenticated route, since accounts,
+      ownership and job state all live there.
+
+    S3, DynamoDB and Bedrock are deliberately NOT probed. They are needed by
+    the worker, not by the API's request path, and probing them would mean a
+    network call per probe against services billed per request - and would
+    make the API drain itself for an outage it can still serve reads during.
+    `/health/worker` covers whether work is actually progressing.
+
+    Returns 503 with the same body shape when any check fails, so a caller can
+    always read `checks` rather than having to parse an error.
+    """
+    checks = [
+        {"name": "configuration", "ok": True, "detail": "validated at startup"},
+        await _check_with_timeout(
+            "mongodb", _check_mongodb, settings.readiness_timeout_seconds
+        ),
+    ]
+    ready = all(check["ok"] for check in checks)
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"status": "ready" if ready else "not_ready", "checks": checks}
+
+
+@app.get("/health/worker")
+async def health_worker(response: Response):
+    """Whether analysis work is actually being consumed.
+
+    INFERRED FROM THE QUEUE, NOT PROBED. The worker is a separate process -
+    possibly on another host - and this endpoint does not contact it. What it
+    can say truthfully is whether the queue looks like something is draining
+    it:
+
+    * `abandoned` counts jobs whose lease lapsed. A worker that died leaves
+      these behind, and a healthy deployment returns them to `queued` within
+      one recovery interval.
+    * `queued` with a persistently non-zero value and no `extracting` or
+      `analyzing` is the signature of no worker running at all - the common
+      misconfiguration when JOB_EXECUTION_MODE is `worker` and nobody started
+      one.
+
+    Counts only, never ids or owners. 503 when jobs are abandoned, so this can
+    drive an alert; a queue backlog alone is NOT unhealthy, because a backlog
+    is the normal state of a queue under load.
+    """
+    try:
+        counts = await video_repo.count_by_state()
+        abandoned = len(await video_repo.find_expired_leases())
+    except Exception as exc:
+        logger.warning("Worker health could not be read: %s", type(exc).__name__)
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "unknown", "detail": "job store unreachable"}
+
+    active = counts.get(JobState.EXTRACTING.value, 0) + counts.get(
+        JobState.ANALYZING.value, 0
+    )
+    healthy = abandoned == 0
+    if not healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return {
+        "status": "ok" if healthy else "degraded",
+        "execution_mode": settings.job_execution_mode,
+        "counts": counts,
+        "active": active,
+        "abandoned": abandoned,
+        "note": (
+            "Inferred from the job queue; the worker process is not contacted."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -579,11 +754,12 @@ async def start_analysis(
     except PipelineError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    # Queued durably first, then handed to the worker, so a job can never be
+    # Queued durably first, then handed to an executor, so a job can never be
     # executing without a record saying so. No path is passed: the worker
     # fetches the source from S3 using the stored reference, which is what
     # lets a different instance - or this one after a restart - run the job.
-    background_tasks.add_task(pipeline.run_job, video_id)
+    mode = _dispatch_analysis(background_tasks, video_id)
+    logger.info("Job accepted for %s (execution mode %s)", video_id, mode)
 
     job = video_repo.job_view(updated)
     return {
@@ -642,7 +818,8 @@ async def retry_analysis(
     except PipelineError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    background_tasks.add_task(pipeline.run_job, video_id)
+    mode = _dispatch_analysis(background_tasks, video_id)
+    logger.info("Retry accepted for %s (execution mode %s)", video_id, mode)
 
     job = video_repo.job_view(updated)
     return {"video_id": video_id, "status": job["state"], "job": job}
@@ -675,9 +852,11 @@ async def get_violations(
     """
     record = await require_video_owner(video_id, user)
 
+    # Shared, timed client (Phase 6). Previously a fresh untimed resource was
+    # built per request, so a hung DynamoDB call blocked the request worker
+    # with no bound and every call paid client construction.
     table_name = aws_resources.frames_table_name()
-    dynamodb = boto3.resource("dynamodb", region_name=aws_resources.aws_region())
-    table = dynamodb.Table(table_name)
+    table = aws_clients.dynamodb_table(table_name)
 
     query_kwargs = {
         "KeyConditionExpression": Key("video_id").eq(video_id),

@@ -248,7 +248,7 @@ def test_owner_can_read_their_own_violations(client, fake_db, alice_client):
 
     dynamo = MagicMock()
     dynamo.Table.return_value.query.return_value = {"Items": []}
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         response = client.get("/violations/vid_abcd1234", headers=alice_client)
 
     assert response.status_code == 200
@@ -265,7 +265,7 @@ def test_another_user_cannot_read_violations(client, fake_db, bob_client):
     dynamo.Table.return_value.query.return_value = {
         "Items": [{"detections": [{"category": "logo"}], "timestamp": "1"}]
     }
-    with patch.object(app_module.boto3, "resource", return_value=dynamo):
+    with patch("aws_clients.get_resource", return_value=dynamo):
         response = client.get("/violations/vid_abcd1234", headers=bob_client)
 
     assert response.status_code == 404

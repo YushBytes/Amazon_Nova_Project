@@ -41,6 +41,17 @@ Environment variables (names only; never commit values):
     TRUSTED_PROXY_COUNT     Optional. Number of trusted reverse proxies in
                             front of the app. 0 (default) means
                             X-Forwarded-For is IGNORED entirely.
+    JOB_EXECUTION_MODE      Optional. "worker" | "inline". Default "worker" in
+                            production, "inline" in development.
+    WORKER_POLL_INTERVAL_SECONDS       Optional. Default 5.
+    WORKER_RECOVERY_INTERVAL_SECONDS   Optional. Default 60. 0 disables.
+    WORKER_SHUTDOWN_GRACE_SECONDS      Optional. Default 30.
+    RETRY_BACKOFF_SECONDS   Optional. Base retry delay. Default 30.
+    RETRY_BACKOFF_CAP_SECONDS          Optional. Default 600.
+    READINESS_TIMEOUT_SECONDS          Optional. Per-dependency. Default 3.
+    AWS_CONNECT_TIMEOUT_SECONDS        Optional. Default 10.
+    AWS_READ_TIMEOUT_SECONDS           Optional. Default 60.
+    AWS_MAX_ATTEMPTS        Optional. botocore attempt budget. Default 3.
 
 See .env.example for a placeholder template.
 """
@@ -263,6 +274,133 @@ def load_ffmpeg_timeout_seconds() -> int:
 def load_bedrock_max_attempts() -> int:
     """Bounded retries per frame for retryable Bedrock failures."""
     return _int_env("BEDROCK_MAX_ATTEMPTS", 3, minimum=1)
+
+
+# ---------------------------------------------------------------------------
+# AWS client timeouts (Phase 6)
+# ---------------------------------------------------------------------------
+#
+# Before this phase only source_store built its boto3 client with a timeout.
+# Every other client - Bedrock, DynamoDB, S3 in the analyzer and extractor -
+# used botocore's defaults, which for a connection that stops responding means
+# the call can hang far longer than any job should take, pinning the thread
+# running it. Finite timeouts here are what make a worker's lease meaningful:
+# a hung call must eventually raise so the lease can lapse and the job be
+# recovered, rather than the worker appearing alive forever.
+
+
+def load_aws_connect_timeout() -> int:
+    """Seconds to wait for a TCP/TLS connection to an AWS endpoint."""
+    return _int_env("AWS_CONNECT_TIMEOUT_SECONDS", 10, minimum=1)
+
+
+def load_aws_read_timeout() -> int:
+    """Seconds to wait for a single read from an AWS endpoint.
+
+    Per read, not per call, so a slow-but-progressing transfer still succeeds.
+    The default is generous because one Bedrock frame analysis is a model
+    invocation, not a key-value lookup.
+    """
+    return _int_env("AWS_READ_TIMEOUT_SECONDS", 60, minimum=1)
+
+
+def load_aws_max_attempts() -> int:
+    """Total attempts botocore makes for one API call, including the first.
+
+    This is the SDK-level budget. The application adds its own bounded retries
+    on top for whole stages (see BEDROCK_MAX_ATTEMPTS and MAX_ATTEMPTS), so
+    keep this small: the two multiply, and 3 x 3 is already nine model
+    invocations for one frame.
+    """
+    return _int_env("AWS_MAX_ATTEMPTS", 3, minimum=1)
+
+
+# ---------------------------------------------------------------------------
+# Job execution and the durable worker (Phase 6)
+# ---------------------------------------------------------------------------
+
+WORKER_MODE = "worker"
+INLINE_MODE = "inline"
+JOB_EXECUTION_MODES = frozenset({WORKER_MODE, INLINE_MODE})
+
+
+def load_job_execution_mode() -> str:
+    """How an accepted analysis job gets executed.
+
+    `worker` - the API only records the job as queued and returns. A separate
+        `python backend/worker.py` process claims and runs it. The API and the
+        worker restart independently, and an accepted job survives an API
+        restart because the queue IS the durable job record.
+
+    `inline` - the API additionally hands the job to an in-process
+        `BackgroundTasks` thread, which is how Phases 4 and 4.1 worked. Useful
+        for local development and the test suite, where running a second
+        process is friction. It is NOT durable: killing the API mid-job strands
+        that job until a recovery sweep requeues it.
+
+    Default: `inline` in development so a fresh clone works end to end with one
+    process, `worker` in production so nothing depends on in-process execution
+    there. Set it explicitly to remove the ambiguity.
+    """
+    raw = (os.getenv("JOB_EXECUTION_MODE") or "").strip().lower()
+    if not raw:
+        return WORKER_MODE if is_production() else INLINE_MODE
+    if raw not in JOB_EXECUTION_MODES:
+        raise ConfigurationError(
+            f"JOB_EXECUTION_MODE must be one of {sorted(JOB_EXECUTION_MODES)}."
+        )
+    return raw
+
+
+def load_worker_poll_seconds() -> int:
+    """Pause between polls when the worker finds no claimable job.
+
+    A poll is one indexed query, so this is cheap; the floor exists only to
+    stop a misconfiguration turning into a hot loop against the database.
+    """
+    return _int_env("WORKER_POLL_INTERVAL_SECONDS", 5, minimum=1)
+
+
+def load_worker_recovery_seconds() -> int:
+    """How often a worker sweeps for jobs abandoned by a dead process.
+
+    This is what makes recovery continuous rather than startup-only. Set it to
+    0 to disable the in-worker sweep and rely on an external schedule instead.
+    """
+    return _int_env("WORKER_RECOVERY_INTERVAL_SECONDS", 60, minimum=0)
+
+
+def load_worker_shutdown_grace_seconds() -> int:
+    """Seconds a worker waits for the running job to finish after a stop signal.
+
+    On expiry the worker exits anyway and the job's lease is left to lapse, so
+    a recovery sweep requeues it. Nothing is reported as completed.
+    """
+    return _int_env("WORKER_SHUTDOWN_GRACE_SECONDS", 30, minimum=0)
+
+
+def load_retry_backoff_seconds() -> int:
+    """Base delay before a job requeued after a retryable failure runs again.
+
+    Doubled per attempt, so a dependency that is down briefly does not consume
+    the whole attempt budget in a few seconds. Without this the worker would
+    reclaim a just-failed job immediately and burn all MAX_ATTEMPTS at once.
+    """
+    return _int_env("RETRY_BACKOFF_SECONDS", 30, minimum=0)
+
+
+def load_retry_backoff_cap_seconds() -> int:
+    """Upper bound on the doubled backoff, so a delay cannot grow absurd."""
+    return _int_env("RETRY_BACKOFF_CAP_SECONDS", 600, minimum=1)
+
+
+def load_readiness_timeout_seconds() -> int:
+    """Per-dependency budget for the readiness probe.
+
+    Short and finite on purpose: a readiness check that can hang is worse than
+    one that reports a dependency as unreachable.
+    """
+    return _int_env("READINESS_TIMEOUT_SECONDS", 3, minimum=1)
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +640,16 @@ class Settings:
         self.max_frames_per_video = load_max_frames_per_video()
         self.ffmpeg_timeout_seconds = load_ffmpeg_timeout_seconds()
         self.bedrock_max_attempts = load_bedrock_max_attempts()
+        self.aws_connect_timeout = load_aws_connect_timeout()
+        self.aws_read_timeout = load_aws_read_timeout()
+        self.aws_max_attempts = load_aws_max_attempts()
+        self.job_execution_mode = load_job_execution_mode()
+        self.worker_poll_seconds = load_worker_poll_seconds()
+        self.worker_recovery_seconds = load_worker_recovery_seconds()
+        self.worker_shutdown_grace_seconds = load_worker_shutdown_grace_seconds()
+        self.retry_backoff_seconds = load_retry_backoff_seconds()
+        self.retry_backoff_cap_seconds = load_retry_backoff_cap_seconds()
+        self.readiness_timeout_seconds = load_readiness_timeout_seconds()
         self.cors_origins = load_cors_origins()
         self.rate_limit_enabled = load_rate_limit_enabled()
         self.rate_limit_login = load_rate_limit_login()
@@ -529,6 +677,7 @@ class Settings:
             f"max_frames_per_video={self.max_frames_per_video}, "
             f"ffmpeg_timeout_seconds={self.ffmpeg_timeout_seconds}, "
             f"bedrock_max_attempts={self.bedrock_max_attempts}, "
+            f"job_execution_mode={self.job_execution_mode!r}, "
             f"cors_origins={self.cors_origins}, "
             f"rate_limit_enabled={self.rate_limit_enabled}, "
             f"rate_limit_login={self.rate_limit_login!r}, "

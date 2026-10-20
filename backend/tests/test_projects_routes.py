@@ -197,7 +197,7 @@ def test_upload_init_as_assigned_agent_returns_presigned_url(
     s3 = MagicMock()
     s3.generate_presigned_url.return_value = "https://s3.example.invalid/signed"
 
-    with patch.object(projects.boto3, "client", return_value=s3):
+    with patch("aws_clients.get_client", return_value=s3):
         r = client.post(f"/projects/{PROJECT_ID}/upload-init", headers=agent_headers)
 
     assert r.status_code == 200, r.text
@@ -324,7 +324,7 @@ def test_no_project_route_returns_500_from_coroutine_misuse(
 
     s3 = MagicMock()
     s3.generate_presigned_url.return_value = "https://s3.example.invalid/signed"
-    with patch.object(projects.boto3, "client", return_value=s3):
+    with patch("aws_clients.get_client", return_value=s3):
         r = getattr(client, method)(path, json=body, headers=headers) if body \
             else getattr(client, method)(path, headers=headers)
 

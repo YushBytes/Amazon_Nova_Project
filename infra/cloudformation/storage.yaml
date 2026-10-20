@@ -14,6 +14,17 @@ Description: >-
   actually makes and from backend/aws_resources.py, which is the single place
   resource names and object prefixes are defined.
 
+  NO NEW RESOURCES FOR THE PHASE 6 WORKER
+  ---------------------------------------
+  The durable worker added in Phase 6 needs nothing here. Its queue is the
+  existing MongoDB `videos` collection, not SQS, so there is no queue, no
+  dead-letter queue and no new IAM resource to declare - the worker is a second
+  process over the same storage this template already creates. See
+  docs/PIPELINE_ARCHITECTURE.md section 8.6 for why SQS was rejected, and
+  infra/iam_policy_least_privilege.json for the API-versus-worker role split
+  (both roles are SUBSETS of the single-process policy; neither gains a
+  permission).
+
   THIS IS THE ONLY SUPPORTED PROVISIONING PATH. Phase 5 removed the legacy
   script (infra/init_s3.py) and the superseded IAM role template
   (infra/iam_policy.yaml); both provisioned or granted brand-guardian-* buckets
