@@ -1,29 +1,248 @@
-# NovaFlow Command Center
+# NovaFlow / Brand Guardian
 
-NovaFlow is a next-generation video compliance and automation platform designed for high-fidelity digital asset management. It combines multi-modal AI analysis (LLaVA) with robust browser automation (Nova Act) to provide a unified interface for content verification and orchestration.
+A video brand-compliance application. You upload a video; the backend extracts
+frames with FFmpeg, sends each frame to Amazon Bedrock (Nova Pro) for brand-safety
+analysis, and stores per-frame detections that the dashboard renders as bounding
+box overlays.
 
-## Features
+**Status: under active development, not production-ready.** See
+[Limitations](#limitations) before relying on anything here. Statements in this
+file are kept to what is verifiable in the code; `docs/PROJECT_AUDIT.md` is the
+evidence base, and `CLAUDE.md` records the current phase.
 
-- **Unified Command Center**: A Futuristic HUD for real-time video ingestion and goal definition.
-- **Role-Based Access Control**: 
-  - **Agents**: Full access to diagnostics, neural telemetry, and compliance logs.
-  - **Clients**: Streamlined "Digital Assets" view for reviewing and sharing verified output.
-- **Neural Telemetry**: Real-time bounding box visualization for detected compliance violations.
-- **Security Intelligence**: Comprehensive logging of AI-detected anomalies.
-
-## Getting Started
-
-### Local Access
-Once the services are running, access the dashboard at:
-[http://localhost:3000](http://localhost:3000)
-
-### Testing Credentials
-| Role | Username | Password |
-| :--- | :--- | :--- |
-| **Agent** | `agent_test` | `password123` |
-| **Client** | `client_test` | `password123` |
+---
 
 ## Architecture
 
-- **Frontend**: Next.js 14, TailwindCSS, Framer Motion, Lucide.
-- **Backend**: FastAPI, MongoDB (GridFS), Python, Ollama (LLaVA), AWS Bedrock.
+```
+Browser (Next.js, :3000)
+        │  JWT in Authorization header
+        ▼
+FastAPI backend (:8000)
+        ├── MongoDB ......... user accounts, video ownership, job state
+        ├── S3 .............. source videos AND extracted frames (one bucket)
+        ├── DynamoDB ........ per-frame metadata and detections
+        └── Bedrock ......... amazon.nova-pro-v1:0, one call per frame
+```
+
+**Frontend** — Next.js 16.1.6, React 19.2.3, TypeScript 5.9.3 (`strict`),
+Tailwind CSS v4, Framer Motion, lucide-react. Tests run on Vitest.
+
+**Backend** — FastAPI + Uvicorn, `python-jose` JWT (HS256), Argon2id password
+hashing, `motor` (async MongoDB), `boto3`, `ffmpeg-python`. Tests run on pytest.
+
+### Where data actually lives
+
+| Data | Store | Notes |
+| :-- | :-- | :-- |
+| User accounts | MongoDB `novaflow.users` | Argon2id hashes. Roles: `client`, `agent`. |
+| Video ownership, job state, worker leases | MongoDB `novaflow.videos` | The job state machine lives here. |
+| Source videos | S3 `sources/{video_id}/source.{ext}` | Server-generated keys; no client filename is used. |
+| Extracted frames | S3 `frames/{video_id}/frame_NNNN.jpg` | 1 frame per second by default. |
+| Agent reel uploads | S3 `raw/{project_id}/{agent}/reel.mp4` | Presigned PUT. |
+| Frame metadata and detections | DynamoDB `NovaFlowFrames` | PK `video_id`, SK `frame_number`. |
+| Projects and submissions | DynamoDB `NovaFlowProjects` | PK `project_id`, SK `sk`. |
+
+MongoDB holds **no** video or frame bytes. An earlier parallel MongoDB/GridFS
+pipeline existed; it was never reachable from the API and was removed.
+
+### Pipeline
+
+`POST /upload-reel` stores the video and records ownership — it does **not**
+start analysis. `POST /analyze/{video_id}` queues a job, which then moves
+`queued → extracting → analyzing → completed | failed`. A worker takes a lease
+on the job and every subsequent write is conditional on that lease, so a
+restarted or superseded worker cannot corrupt a newer attempt. A job is
+`completed` only once results are persisted; an empty detections list means
+nothing unless the state is `completed`.
+
+Details: `docs/PIPELINE_ARCHITECTURE.md`. Operations: `docs/PIPELINE_OPERATIONS.md`.
+
+### API surface
+
+```
+POST /auth/signup                  POST /upload-reel
+POST /auth/login                   POST /analyze/{video_id}
+GET  /auth/me                      POST /analyze/{video_id}/retry
+                                   GET  /jobs/{video_id}
+GET  /status                       GET  /violations/{video_id}
+GET  /submissions                  GET  /uploads/{file}?access_token=...
+POST /execute                      (6 routes under /projects/)
+```
+
+Every route that touches user data requires a JWT and checks ownership; a
+missing ownership record is a denial, and unauthorized access returns 404 rather
+than 403 so ids cannot be enumerated. Video playback uses a separate
+short-lived media token bound to one video id, because a browser `<video>`
+element cannot send an `Authorization` header.
+
+`POST /execute` returns placeholder text — the browser-automation feature behind
+it is not implemented and is awaiting a scope decision (`CLAUDE.md` §9).
+
+---
+
+## Setup
+
+### Prerequisites
+
+- **Python 3.11–3.14** (the Dockerfile targets 3.11)
+- **Node.js 20+** and npm
+- **FFmpeg** on `PATH` — a separate native binary. `pip install ffmpeg-python`
+  provides only the Python wrapper; frame extraction shells out to the real
+  `ffmpeg` executable. Verify with `ffmpeg -version`.
+- **MongoDB** reachable at `MONGODB_URL`
+- **AWS credentials** via the standard boto3 chain (IAM role, `aws configure`,
+  or the conventional `AWS_*` variables) with access to S3, DynamoDB and
+  Bedrock. Credentials are never read from the application's own variables.
+
+### Configuration
+
+```bash
+cp .env.example .env     # then edit; .env is git-ignored, never commit it
+```
+
+`.env.example` is the authoritative list, documenting every variable, its
+default, and whether it is required. The ones you cannot skip in production:
+
+| Variable | Requirement |
+| :-- | :-- |
+| `JWT_SECRET_KEY` | **Required in production** (≥ 32 chars). Development generates an ephemeral per-process key, so sessions do not survive a restart. |
+| `S3_BUCKET_NAME` | **Required in production.** Validated against the S3 naming rules at startup. |
+| `NOVAFLOW_ENV` | Set to `production` to enforce the above. Defaults to `development`. |
+| `CORS_ALLOWED_ORIGINS` | Set in production; `*` is rejected. |
+| `MONGODB_URL` | The only MongoDB connection-string variable. |
+
+With `NOVAFLOW_ENV=production`, a missing `JWT_SECRET_KEY` or `S3_BUCKET_NAME`
+raises `ConfigurationError` and the application refuses to start. That is
+deliberate: the development bucket default (`novaflow-media`) is a placeholder
+nobody owns, so accepting it in production would mean every upload failing later
+with an opaque S3 error instead of a clear one at startup. **There is no
+local-disk fallback for new uploads in any environment.**
+
+### Provisioning AWS resources
+
+`infra/cloudformation/storage.yaml` is the **only supported provisioning path**.
+It creates the S3 bucket (public-access block, SSE-S3 encryption, versioning,
+TLS-only bucket policy, lifecycle rules, optional access logging) and both
+DynamoDB tables.
+
+```bash
+aws cloudformation deploy \
+  --template-file infra/cloudformation/storage.yaml \
+  --stack-name novaflow-storage \
+  --parameter-overrides MediaBucketName=<globally-unique-name> Environment=staging
+```
+
+Each stack output names the environment variable to set it to
+(`MediaBucketNameOut` → `S3_BUCKET_NAME`, and so on). Apply the identity policy
+in `infra/iam_policy_least_privilege.json` alongside it — it is a **template**
+whose `${PLACEHOLDER}` values must be substituted first.
+
+> This template has never been deployed. It is validated structurally only (see
+> below), so it is unverified against CloudFormation itself.
+
+### Running
+
+```bash
+# Backend
+cd backend
+pip install -r requirements.txt -r requirements-dev.txt
+uvicorn app:app --host 0.0.0.0 --port 8000
+
+# Frontend
+cd frontend
+npm install
+npm run dev            # http://localhost:3000
+```
+
+There is **no seed script**, so no users exist on a fresh database. Create one
+through `POST /auth/signup`. Public signup always assigns the `client` role; the
+`agent` role is granted only by an operator updating MongoDB directly, by design.
+
+---
+
+## Tests
+
+```bash
+# Backend
+cd backend && pytest                      # 624 passed, 42 skipped by default
+pytest -m requires_mongodb                # needs MONGODB_TEST_URL
+pytest -m requires_ffmpeg                 # needs ffmpeg on PATH
+
+# Frontend
+cd frontend && npm test                    # 74 tests (Vitest)
+npm run lint && npm run typecheck && npm run build
+```
+
+42 backend tests are **skipped by default** because they need real dependencies:
+26 require a MongoDB instance (`MONGODB_TEST_URL`, which must name a disposable
+database — setup drops collections) and 16 require the FFmpeg binary. Skipped
+means unverified, not passing.
+
+No test calls real AWS or incurs cost. Every external service is stubbed.
+
+---
+
+## Limitations
+
+These are current and deliberate to state plainly.
+
+- **Nothing has ever been run against real AWS or Bedrock.** Every external
+  service is mocked in tests. **Detection accuracy is unmeasured** and no claim
+  is made about it. S3, DynamoDB, Bedrock and the CloudFormation template are
+  unverified against the live services.
+- **Analysis runs in an in-process `BackgroundTasks` worker.** There is no
+  durable queue. A crash mid-job is detected by the lease mechanism and the job
+  is requeued at the next startup sweep or by
+  `python backend/recover_jobs.py --apply`, but recovery is **not continuous**:
+  a job abandoned while the process stays up waits for the next sweep.
+- **Rate limiting is per-process**, so the effective limit multiplies by worker
+  count. There is no distributed limiter and no per-account throttle.
+- **No token revocation.** Tokens are valid until expiry; rotating
+  `JWT_SECRET_KEY` is the only break-glass.
+- **Media tokens travel in URLs**, so they can reach browser history, `Referer`
+  headers and proxy/CDN logs that this application cannot redact.
+- **Frame sampling is 1 fps**, so a violation visible for under ~1 second can be
+  missed.
+- **There is no brand-rule configuration** — one static prompt in
+  `backend/prompts.py`. No per-client policies, and no legal or regulatory
+  evaluation.
+- **Upload validation does not prove a file is a safe video.** There is no
+  content scanning.
+- Parts of the dashboard still render hardcoded placeholder data (the agents and
+  compliance-log views). Frame remediation and corrected-video reconstruction are
+  **not implemented**.
+- The AWS IAM hardening is a reviewed template, not an applied configuration.
+
+Removing dead code and reconciling configuration — the most recent work — makes
+the architecture coherent. It does **not** make the application production-ready.
+
+---
+
+## Repository layout
+
+```
+backend/            FastAPI service and the pipeline
+backend/tests/      pytest suite
+frontend/           Next.js dashboard (the live one)
+infra/              CloudFormation storage template + IAM policy template
+docs/               audit, roadmap, architecture and operations documents
+analyzer_nova.py    standalone single-frame Nova Pro CLI
+prompts.py          prompt used by analyzer_nova.py (backend/prompts.py is the
+                    pipeline's own, and the two differ — see CLAUDE.md)
+```
+
+## Documentation
+
+| Document | What it is |
+| :-- | :-- |
+| `CLAUDE.md` | Operational guide and current phase status. Start here. |
+| `docs/PROJECT_AUDIT.md` | Evidence-based audit with file:line references. |
+| `docs/IMPLEMENTATION_ROADMAP.md` | Phased plan to a releasable state. |
+| `docs/PIPELINE_ARCHITECTURE.md` | Job state machine and pipeline stages. |
+| `docs/PIPELINE_OPERATIONS.md` | Running, recovering and monitoring jobs. |
+| `docs/SECURITY_AUDIT.md` | Security findings and what was fixed. |
+| `docs/SECURITY_OPERATIONS.md` | Operator security procedures. |
+
+`docs/planning.md` is an original design **target**, not a description of the
+system; much of it is unimplemented.

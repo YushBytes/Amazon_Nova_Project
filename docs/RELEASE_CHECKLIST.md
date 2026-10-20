@@ -269,7 +269,7 @@ operator action, credentials, or a live environment this phase could not reach.
 | 2B.56 | ☐ Resolve the bucket naming conflict (`novaflow-media` vs `brand-guardian-*`) | §7.1 — must be settled before writing a policy |
 | 2B.57 | ☐ Fill in the placeholders and attach the role | §7 |
 | 2B.58 | ☐ Separate development and production roles/resources | §7.3 |
-| 2B.59 | ☐ Apply S3 public-access block | §7.4 — `infra/init_s3.py` sets none of it |
+| 2B.59 | ☐ Apply S3 public-access block | §7.4 — expressed in `infra/cloudformation/storage.yaml`, never deployed |
 | 2B.60 | ☐ Enable bucket encryption and versioning | §7.4 |
 | 2B.61 | ☐ Add a bucket-level TLS deny policy | §7.4 |
 | 2B.62 | ☐ Enable access logging or CloudTrail data events | §7.4 — today there is **no record of who read a reel** |

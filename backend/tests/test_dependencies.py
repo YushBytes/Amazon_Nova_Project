@@ -9,6 +9,11 @@ ModuleNotFoundError. These tests fail if that regresses.
 
 They deliberately assert on *importability and declaration*, not on pinned
 version numbers, so routine dependency bumps do not break the suite.
+
+Phase 5 removed the orphaned MongoDB/GridFS pipeline, which was the only
+importer of Pillow, gridfs and bson, so those are no longer expected. The
+dead-module guards at the end of this file keep them from coming back
+unnoticed.
 """
 
 import importlib
@@ -30,12 +35,8 @@ DIRECT_DEPENDENCIES = {
     "motor": "motor",
     "pymongo": "pymongo",
     "ffmpeg-python": "ffmpeg",
-    "Pillow": "PIL",
     "python-dotenv": "dotenv",
 }
-
-# Provided transitively by pymongo rather than declared separately.
-PYMONGO_PROVIDED = ["gridfs", "bson"]
 
 
 def _declared_packages():
@@ -91,9 +92,7 @@ def test_every_requirement_is_version_pinned():
 # importability
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize(
-    "module", sorted(set(DIRECT_DEPENDENCIES.values()) | set(PYMONGO_PROVIDED))
-)
+@pytest.mark.parametrize("module", sorted(set(DIRECT_DEPENDENCIES.values())))
 def test_dependency_module_imports(module):
     """The declared packages actually provide the modules the backend imports."""
     importlib.import_module(module)
@@ -105,17 +104,22 @@ def test_dependency_module_imports(module):
         "analyzer",
         "app",
         "auth",
-        "aws_config",
+        "aws_resources",
+        "config",
         "db",
+        "detections",
         "extractor",
+        "job_state",
         "orchestrator",
+        "pipeline",
         "projects",
         "prompts",
+        "recover_jobs",
         "s3_trigger",
         "safety",
+        "source_store",
+        "video_repo",
         "video_stitcher",
-        "audit_manager",
-        "verifier",
     ],
 )
 def test_backend_module_imports(module):
@@ -185,3 +189,94 @@ def test_ffmpeg_executable_is_available():
     out = subprocess.run([exe, "-version"], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0
     assert "ffmpeg version" in out.stdout.lower()
+
+
+# --------------------------------------------------------------------------
+# Phase 5: the removed legacy paths must stay removed
+# --------------------------------------------------------------------------
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+# Each entry is (module file, why it was removed). Reintroducing any of these
+# would restore a second, incompatible storage pipeline or a mock that reports
+# success without doing the work - both explicitly forbidden by CLAUDE.md.
+REMOVED_MODULES = {
+    "audit_manager.py": (
+        "orphaned MongoDB/GridFS pipeline; read meta['gridfs_id'] that nothing "
+        "ever wrote, and remediate_frame returned its input while the caller "
+        "recorded remediated=True"
+    ),
+    "verifier.py": "GridFS frame-dump dev utility with a hardcoded connection string",
+    "check_count.py": "throwaway debug script hardcoded to video_id='test_8k_v2'",
+    "debug_probe.py": "throwaway FFmpeg probe debug script",
+    "aws_config.py": "never imported; built an unused Step Functions client at import time",
+}
+
+
+@pytest.mark.parametrize("filename", sorted(REMOVED_MODULES))
+def test_removed_module_is_absent(filename):
+    """A deleted legacy module must not reappear."""
+    path = BACKEND_DIR / filename
+    assert not path.exists(), (
+        f"{filename} was removed in Phase 5 ({REMOVED_MODULES[filename]}); "
+        f"it is back at {path}. If it is genuinely needed again, that is a "
+        f"decision to record, not a file to restore quietly."
+    )
+
+
+@pytest.mark.parametrize("filename", sorted(REMOVED_MODULES))
+def test_removed_module_is_not_importable(filename):
+    """Guards against the module reappearing anywhere else on sys.path."""
+    module = filename[: -len(".py")]
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(module)
+
+
+def test_no_backend_module_imports_gridfs():
+    """GridFS is not a storage path this application has.
+
+    Source videos and frames live in S3; MongoDB holds accounts, ownership and
+    job state only. An import of gridfs would mean a second, incompatible
+    store had been reintroduced.
+    """
+    offenders = []
+    for path in sorted(BACKEND_DIR.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if re.search(r"^\s*(import gridfs|from gridfs\b)", text, re.MULTILINE):
+            offenders.append(path.name)
+    assert not offenders, f"modules importing gridfs: {offenders}"
+
+
+def test_no_backend_module_reads_the_duplicate_mongo_uri():
+    """MONGODB_URL is the only connection-string variable.
+
+    MONGO_URI was a second name for the same thing, read only by the removed
+    GridFS pipeline. A new reader would reintroduce the collision where two
+    variables configure one connection.
+    """
+    offenders = []
+    for path in sorted(BACKEND_DIR.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if re.search(r"""getenv\(\s*["']MONGO_URI["']""", text):
+            offenders.append(path.name)
+    assert not offenders, f"modules reading MONGO_URI: {offenders}"
+
+
+def test_no_module_hardcodes_a_mongo_connection_string():
+    """A connection string belongs in the environment, not in source.
+
+    verifier.py hardcoded one. The URL in db.py's os.getenv default is the
+    local-development fallback and is allowed; an assignment of a literal
+    mongodb:// URL to a module constant is not.
+    """
+    offenders = []
+    for path in sorted(BACKEND_DIR.glob("*.py")):
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if re.match(r"""^[A-Z_]+\s*=\s*["']mongodb(\+srv)?://""", stripped):
+                offenders.append(f"{path.name}:{number}")
+    assert not offenders, f"hardcoded MongoDB connection strings: {offenders}"

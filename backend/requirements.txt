@@ -1,7 +1,7 @@
 # NovaFlow backend runtime dependencies.
 #
 # Supported Python: 3.11 - 3.14.
-#   * 3.11 is the floor imposed by pymongo, dnspython and Pillow, and matches
+#   * 3.11 is the floor imposed by pymongo and dnspython, and matches
 #     the python:3.11-slim base image in Dockerfile.
 #   * Verified installing and importing on 3.14.6 (local development).
 #
@@ -12,8 +12,8 @@
 # NOTE ON FFMPEG: ffmpeg-python below is only a Python wrapper. It requires the
 # separate `ffmpeg` EXECUTABLE on PATH, which pip cannot install. The Dockerfile
 # installs it via apt-get. For local development install it yourself and verify
-# with `ffmpeg -version`. extractor.py and debug_probe.py will not work without
-# the executable, regardless of this package.
+# with `ffmpeg -version`. extractor.py will not work without the executable,
+# regardless of this package.
 
 # --- web framework ---
 fastapi==0.146.0
@@ -40,22 +40,28 @@ python-jose[cryptography]==3.5.0
 argon2-cffi==25.1.0
 
 # --- AWS (S3, DynamoDB, Bedrock) ---
-# Imported by analyzer.py, app.py, extractor.py, projects.py, video_stitcher.py,
-# aws_config.py, audit_manager.py, safety.py and automation.py. Its absence from
-# this manifest previously made the backend unimportable from a clean install,
-# because app.py imports projects.py which imports boto3.
+# Imported by analyzer.py, app.py, extractor.py, projects.py, source_store.py,
+# video_stitcher.py, safety.py and automation.py. Its absence from this manifest
+# previously made the backend unimportable from a clean install, because app.py
+# imports projects.py which imports boto3.
 boto3==1.43.114
 
-# --- MongoDB (user accounts) ---
-# pymongo also supplies the `gridfs` and `bson` modules used by
-# audit_manager.py and verifier.py.
+# --- MongoDB (user accounts, video ownership, job state) ---
+# motor is the async driver the application uses; pymongo is imported directly
+# by auth.py (for its error types) and by the database-integrity tests.
+# The `gridfs` and `bson` modules pymongo also provides are no longer imported
+# by anything: their only users were the orphaned MongoDB/GridFS pipeline
+# removed in Phase 5.
 motor==3.7.1
 pymongo==4.19.0
 dnspython==2.9.0
 
-# --- video and image processing ---
+# --- video processing ---
+# Pillow was removed in Phase 5. Its only importer was audit_manager.py, the
+# orphaned GridFS pipeline, which built inpainting masks for a Bedrock call
+# that was commented out. Frame remediation (roadmap Phase 8) must re-add it
+# if that feature is built.
 ffmpeg-python==0.2.0
-Pillow==13.0.0
 
 # --- configuration ---
 python-dotenv==1.2.4

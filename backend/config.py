@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,93 @@ def load_bedrock_max_attempts() -> int:
     return _int_env("BEDROCK_MAX_ATTEMPTS", 3, minimum=1)
 
 
+# ---------------------------------------------------------------------------
+# Object storage
+# ---------------------------------------------------------------------------
+
+# The name the application has always defaulted to. It is a placeholder, not a
+# real bucket: S3 bucket names are globally unique, so this one is already
+# taken by somebody and will not be yours. It exists so local development and
+# the test suite work with no configuration, and it is REFUSED in production
+# (see load_s3_bucket) rather than being silently used there.
+DEFAULT_S3_BUCKET = "novaflow-media"
+
+# Length and character rules from the S3 bucket naming requirements. Checked
+# so a typo fails at startup with a clear message instead of surfacing much
+# later as a confusing NoSuchBucket on the first upload.
+_BUCKET_MIN_LENGTH = 3
+_BUCKET_MAX_LENGTH = 63
+_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+
+
+def _validate_bucket(name: str) -> str:
+    """Validate an operator-supplied bucket name.
+
+    Raises:
+        ConfigurationError: the value cannot be a valid S3 bucket name.
+    """
+    stripped = name.strip()
+    if not stripped:
+        raise ConfigurationError("S3_BUCKET_NAME is set but empty.")
+    if not (_BUCKET_MIN_LENGTH <= len(stripped) <= _BUCKET_MAX_LENGTH):
+        raise ConfigurationError(
+            f"S3_BUCKET_NAME must be between {_BUCKET_MIN_LENGTH} and "
+            f"{_BUCKET_MAX_LENGTH} characters."
+        )
+    if not _BUCKET_RE.fullmatch(stripped):
+        raise ConfigurationError(
+            "S3_BUCKET_NAME must be a valid S3 bucket name: lowercase "
+            "letters, digits, dots and hyphens only, starting and ending "
+            "with a letter or digit."
+        )
+    if ".." in stripped or stripped.endswith("-s3alias"):
+        raise ConfigurationError("S3_BUCKET_NAME is not a valid S3 bucket name.")
+    return stripped
+
+
+def load_s3_bucket() -> str:
+    """Return the bucket holding source videos, frames and reel uploads.
+
+    Production: `S3_BUCKET_NAME` is mandatory. The development default is a
+    placeholder that no account owns, so accepting it in production would mean
+    every upload failing at the first S3 call with an opaque error. Failing at
+    startup instead names the actual problem.
+
+    Development: the placeholder is used so a clone runs with no setup. There
+    is deliberately NO local-disk fallback for new uploads in any environment:
+    if the bucket is wrong, uploads fail loudly rather than writing to a
+    filesystem that a redeployed container discards.
+
+    One bucket is used with separate key prefixes rather than several buckets;
+    `aws_resources` owns the prefix layout and is the only caller of this.
+    """
+    raw = os.getenv("S3_BUCKET_NAME")
+
+    # Validated whenever the variable is present at all, matching
+    # load_jwt_secret. An explicitly empty value is an operator mistake, so it
+    # is reported rather than quietly treated as "unset" and replaced with the
+    # placeholder - which would hide the mistake until the first upload.
+    if raw is not None:
+        return _validate_bucket(raw)
+
+    if is_production():
+        raise ConfigurationError(
+            "S3_BUCKET_NAME is required when NOVAFLOW_ENV=production. "
+            "Refusing to start with the development placeholder "
+            f"{DEFAULT_S3_BUCKET!r}, which is not a bucket you own. "
+            "Provision storage with infra/cloudformation/storage.yaml and set "
+            "S3_BUCKET_NAME to its MediaBucketNameOut output."
+        )
+
+    logger.warning(
+        "S3_BUCKET_NAME is not set; using the development placeholder %r. "
+        "Uploads will fail unless a bucket of that name exists and you can "
+        "write to it. Set S3_BUCKET_NAME for real storage.",
+        DEFAULT_S3_BUCKET,
+    )
+    return DEFAULT_S3_BUCKET
+
+
 def load_allowed_video_extensions() -> frozenset[str]:
     raw = os.getenv("ALLOWED_VIDEO_EXTENSIONS")
     if raw is None or not raw.strip():
@@ -407,6 +495,7 @@ class Settings:
         self.access_token_expire_minutes = load_token_lifetime_minutes()
         self.media_token_ttl_minutes = load_media_token_ttl_minutes()
         self.max_upload_bytes = load_max_upload_bytes()
+        self.s3_bucket = load_s3_bucket()
         self.allowed_video_extensions = load_allowed_video_extensions()
         self.max_video_duration_seconds = load_max_video_duration_seconds()
         self.frame_sample_fps = load_frame_sample_fps()
@@ -433,6 +522,7 @@ class Settings:
             f"access_token_expire_minutes={self.access_token_expire_minutes}, "
             f"media_token_ttl_minutes={self.media_token_ttl_minutes}, "
             f"max_upload_bytes={self.max_upload_bytes}, "
+            f"s3_bucket={self.s3_bucket!r}, "
             f"allowed_video_extensions={sorted(self.allowed_video_extensions)}, "
             f"max_video_duration_seconds={self.max_video_duration_seconds}, "
             f"frame_sample_fps={self.frame_sample_fps}, "

@@ -358,18 +358,20 @@ name, or table ARN was invented.
 
 ### 7.1 Resolve the bucket naming conflict first
 
-The repository contains two schemes, and this must be settled before writing a
-policy:
+**Settled in Phase 5.** The repository previously contained two naming schemes:
+application code used `S3_BUCKET_NAME` (development default `novaflow-media`),
+while `infra/init_s3.py` and `infra/iam_policy.yaml` created and granted
+`brand-guardian-raw` and `brand-guardian-final`, which **no code path has ever
+read**. Both files were deleted; `infra/cloudformation/storage.yaml` is now the
+only provisioning path.
 
-| Source | Bucket(s) |
-| :-- | :-- |
-| Application code (`S3_BUCKET_NAME` default) | `novaflow-media` |
-| `infra/init_s3.py` | `brand-guardian-raw`, `brand-guardian-final` |
+There is one bucket, named by `S3_BUCKET_NAME`, with three prefixes:
+`sources/`, `frames/` and `raw/`. Scope the policy to that one bucket.
+`S3_BUCKET_NAME` is **required** when `NOVAFLOW_ENV=production` — the
+development default is a placeholder nobody owns and is refused there.
 
-The application only ever reads and writes the single `S3_BUCKET_NAME` bucket,
-under the prefixes `frames/` and `raw/`. The `brand-guardian-*` buckets are
-**never read by any code path**. Decide which you are actually using, set
-`S3_BUCKET_NAME` accordingly, and scope the policy to that one bucket.
+⚠️ If `brand-guardian-*` buckets were ever created in a real account, removing
+them is a separate operator action. Phase 5 changed no AWS resource.
 
 ### 7.2 What the application actually needs
 
@@ -384,7 +386,8 @@ Derived from the boto3 calls in the code, not from the old policy:
 | DynamoDB | `PutItem`, `GetItem`, `UpdateItem`, `Scan` | projects table |
 | CloudWatch Logs | `CreateLogStream`, `PutLogEvents` | this app's log group |
 
-Corrections to the previous `infra/iam_policy.yaml`:
+Corrections to `infra/iam_policy.yaml`, the role template Phase 5 deleted
+(listed because they are the reasons the replacement exists):
 
 - `bedrock:InvokeModel` was on `Resource: '*'` — every model in the account.
   Now scoped to the one model actually invoked.
@@ -410,8 +413,9 @@ one role across environments "for convenience".
 
 ### 7.4 Bucket hardening (not expressible in an identity policy)
 
-`infra/init_s3.py` creates buckets with **none** of these. Apply them to the
-bucket itself:
+`infra/cloudformation/storage.yaml` applies all of these, so provisioning
+through that template satisfies this section. Verify them on any bucket created
+by other means:
 
 - **Public access block**: all four settings true.
 - **Default encryption**: SSE-S3 minimum, or SSE-KMS with a CMK.

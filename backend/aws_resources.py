@@ -16,6 +16,13 @@ Everything AWS-named now resolves here, from environment variables with
 documented defaults. No value is invented: the defaults are the names the code
 already used, and an operator overrides them per environment.
 
+Phase 5 narrowed this further for the bucket: `media_bucket()` delegates to
+`config.load_s3_bucket`, which validates the name and makes `S3_BUCKET_NAME`
+mandatory in production rather than silently accepting a placeholder nobody
+owns. The table names keep plain defaults because those defaults are the names
+infra/cloudformation/storage.yaml actually creates, so they are correct rather
+than merely a guess.
+
 OBJECT PREFIX LAYOUT
 
     sources/{video_id}/source.{ext}            uploaded source video (4.1)
@@ -30,6 +37,8 @@ means updating both.
 from __future__ import annotations
 
 import os
+
+import config
 
 # --- Region ----------------------------------------------------------------
 
@@ -51,9 +60,9 @@ def aws_region() -> str:
 
 # --- S3 --------------------------------------------------------------------
 
-# The name the application has always defaulted to. Kept as the default so an
-# existing deployment is unaffected; it is a placeholder, not a real bucket.
-DEFAULT_BUCKET = "novaflow-media"
+# Re-exported from config, which owns the value and its validation. Kept as a
+# name here because existing callers and tests import it from this module.
+DEFAULT_BUCKET = config.DEFAULT_S3_BUCKET
 
 SOURCE_PREFIX = "sources"
 FRAME_PREFIX = "frames"
@@ -74,8 +83,17 @@ def media_bucket() -> str:
     pattern and lifetime differ by prefix, which lifecycle rules express
     perfectly well, and a single bucket keeps the IAM policy to two
     statements.
+
+    Resolution and validation live in `config.load_s3_bucket`, so there is one
+    storage contract rather than a second `os.getenv` with its own fallback:
+    `S3_BUCKET_NAME` is required in production and the development placeholder
+    is refused there.
+
+    Raises:
+        config.ConfigurationError: the name is malformed, or absent in
+            production.
     """
-    return (os.getenv("S3_BUCKET_NAME") or DEFAULT_BUCKET).strip()
+    return config.load_s3_bucket()
 
 
 def source_key(video_id: str, extension: str) -> str:

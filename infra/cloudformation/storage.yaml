@@ -8,11 +8,17 @@ Description: >-
   ------------
   Before this template there was no infrastructure-as-code for the resources
   the application requires: the DynamoDB tables had to be created by hand from
-  a prose description, and infra/init_s3.py created two differently-named
-  buckets with no public-access block, no encryption, and no TLS enforcement.
-  Everything here is derived from the boto3 calls the code actually makes and
-  from backend/aws_resources.py, which is the single place resource names and
-  object prefixes are defined.
+  a prose description, and a legacy bootstrap script created two
+  differently-named buckets with no public-access block, no encryption, and no
+  TLS enforcement. Everything here is derived from the boto3 calls the code
+  actually makes and from backend/aws_resources.py, which is the single place
+  resource names and object prefixes are defined.
+
+  THIS IS THE ONLY SUPPORTED PROVISIONING PATH. Phase 5 removed the legacy
+  script (infra/init_s3.py) and the superseded IAM role template
+  (infra/iam_policy.yaml); both provisioned or granted brand-guardian-* buckets
+  that no application code has ever read. Apply the identity policy from
+  infra/iam_policy_least_privilege.json alongside this stack.
 
   CloudFormation rather than a new framework: the project has no IaC tooling at
   all, and introducing Terraform or CDK would mean a toolchain, a state store,

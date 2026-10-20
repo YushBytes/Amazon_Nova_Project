@@ -51,7 +51,7 @@ reintroduced.
 | :-- | :-- | :-- |
 | `json` used but never imported at module scope | `backend/analyzer.py` | Module-scope imports added; each frame now reaches exactly one terminal state (`audited` / `audit_failed`), so a failure can no longer read as a clean frame. |
 | async `decode_token` called without `await` | `backend/projects.py` | `get_current_user` is async and awaits it; Phase 3 then centralised it in `auth.py`. |
-| Remediation returned its input unchanged | `backend/audit_manager.py` | The disguised mock was removed. Real Nova Canvas remediation is a later phase and is **not** implemented — do not re-add a stub that reports success. |
+| Remediation returned its input unchanged | `backend/audit_manager.py` *(file deleted in Phase 5)* | The disguised mock was removed in Phase 2; the whole module went in Phase 5. Real Nova Canvas remediation is a later phase and is **not** implemented — do not re-add a stub that reports success. |
 
 **Phase 4** connected the pipeline end to end: a validated job state machine,
 real extraction/analysis stages, validated model output, and persisted results.
@@ -61,11 +61,11 @@ See `docs/PIPELINE_ARCHITECTURE.md`.
 Every external service is mocked in tests, so detection accuracy is
 **unmeasured** and no claim is made about it. See §3.
 
-### 1.4 The README is materially inaccurate **[VERIFIED]**
+### 1.4 The README was rewritten in Phase 5 **[VERIFIED]**
 
-`README.md` claims LLaVA/Ollama analysis (**no such code exists** — the only `llava` matches are a cosmetic display string), Nova Act automation (mocked), MongoDB GridFS as the primary store (orphaned), and Next.js 14 (it is 16.1.6). It also publishes test credentials for users no seed script creates.
+`README.md` previously claimed LLaVA/Ollama analysis (no such code exists), Nova Act automation (not implemented), MongoDB GridFS as the primary store (orphaned), and Next.js 14 (it is 16.1.6), and published test credentials for users no seed script creates. Phase 5 replaced it with an account of the system that matches the code: the real storage layout, the real route surface, the real setup steps, and an explicit limitations section. The fabricated credentials table is gone.
 
-**Do not treat `README.md` or `docs/planning.md` as a description of the system.** `docs/planning.md` is an unimplemented design target (no Critic, no Step Functions, no HITL). Use `docs/PROJECT_AUDIT.md`.
+**`docs/planning.md` is still NOT a description of the system** — it is an unimplemented design target (no Critic, no Step Functions, no HITL). Use `docs/PROJECT_AUDIT.md` for evidence, and note that the audit predates Phase 5, so files it cites as dead may no longer exist.
 
 ---
 
@@ -75,94 +75,127 @@ Every external service is mocked in tests, so detection accuracy is
 
 ```
 Amazon Nova/                         <- project root (flattened in Phase 0; holds .gitignore)
-├── backend/          FastAPI service, 17 Python modules
+├── backend/          FastAPI service, 23 Python modules + tests/
 ├── frontend/         Next.js 16 App Router dashboard (the live one)
-├── frontend_backup/  375 KB ORPHANED Vite dashboard — zero references
-├── infra/            CloudFormation IAM + S3 bootstrap (not deployed)
+├── infra/            CloudFormation storage template + IAM policy template (not deployed)
 ├── docs/             planning.md (aspirational) + the audit deliverables
 ├── analyzer_nova.py  Standalone Nova Pro single-frame CLI (the one working AI path)
-└── prompts.py        DIVERGES from backend/prompts.py — only the backend one is imported
+├── prompts.py        USED BY analyzer_nova.py — diverges from backend/prompts.py
+└── test_frame.jpg    Default input for analyzer_nova.py
 ```
+
+`frontend_backup/` (72 files) was deleted in Phase 5 after confirming zero references.
+
+⚠️ **Root `prompts.py` and root `test_frame.jpg` are live, not duplicates.** `analyzer_nova.py` sits at the repository root, so `from prompts import SYSTEM_PROMPT` resolves to the **root** copy, and its `__main__` block reads the **root** `test_frame.jpg`. `docs/IMPLEMENTATION_ROADMAP.md` Phase 5 task 1 calls both "duplicates that diverge from the backend copies" and lists them for deletion; **that instruction is wrong and deleting them would break `analyzer_nova.py`.** They were verified and retained. The prompt divergence itself (the root copy asks for prose, `backend/prompts.py` asks for the structured JSON the frontend consumes) is real and still needs a decision.
 
 ### 2.2 Stack **[VERIFIED from source]**
 
 - **Frontend:** Next.js 16.1.6, React 19.2.3, TypeScript 5.9.3 (`strict: true`), Tailwind CSS v4, Framer Motion, lucide-react.
 - **Backend:** FastAPI + Uvicorn, `python-jose` JWT (HS256), `motor` (async MongoDB), `boto3`.
 - **AI:** Amazon Bedrock, model `amazon.nova-pro-v1:0`. *(Docs say "Nova 2 Pro"; code says `nova-pro-v1:0`. Unresolved.)*
-- **Storage:** S3 (`novaflow-media`) for frame JPEGs; DynamoDB (`NovaFlowFrames`, `NovaFlowProjects`) for metadata; MongoDB (`novaflow.users`) for accounts; local `backend/uploads/` for raw videos.
+- **Storage:** S3 for **both** source videos (`sources/`) and frame JPEGs (`frames/`), one bucket named by `S3_BUCKET_NAME`; DynamoDB (`NovaFlowFrames`, `NovaFlowProjects`) for metadata; MongoDB for accounts (`novaflow.users`) and ownership plus job state (`novaflow.videos`). Local `backend/uploads/` is **read-only legacy** — pre-Phase-4.1 records only; new uploads never land there.
 - **Video:** `ffmpeg-python` + the FFmpeg binary, 1 fps extraction.
 - **Deploy:** AWS Amplify (frontend only); `backend/Dockerfile` exists with no deployment definition.
 
 ### 2.3 Storage reality vs. documentation **[VERIFIED]**
 
-The live pipeline uses **S3 + DynamoDB**, not MongoDB/GridFS. GridFS appears only in `audit_manager.py` and `verifier.py`, which are **unreachable from the API** — and structurally unrunnable, because they read `meta["gridfs_id"]` and **nothing in the repository ever writes a GridFS frame or a `frame_metadata` document**. MongoDB is used *only* for user accounts.
+The pipeline uses **S3 + DynamoDB** for media and frame metadata. **MongoDB holds user accounts (`novaflow.users`) plus video ownership and job state (`novaflow.videos`) — never video or frame bytes.**
 
-**Two parallel incompatible pipelines exist.** Pipeline A (live): `extractor.py` → `analyzer.py` → S3 + DynamoDB. Pipeline B (dead): `audit_manager.py` → MongoDB + GridFS. Audit §4.4 recommends deleting B. Do not revive it without a decision.
+**The second, dead pipeline is gone.** Phase 5 deleted `audit_manager.py`, `verifier.py` and `check_count.py` (the MongoDB/GridFS path): they were unreachable from the API and structurally unrunnable, because they read `meta["gridfs_id"]` and nothing in the repository ever wrote a GridFS frame or a `frame_metadata` document. `backend/tests/test_dependencies.py` now asserts those modules stay deleted and that **no backend module imports `gridfs`**, so the second store cannot reappear unnoticed. Do not reintroduce it without a decision.
 
-### 2.4 Request flow **[VERIFIED]**
+### 2.4 Request flow **[VERIFIED — rewritten after Phases 3/4/4.1]**
+
+The original audit's flow diagram described a pre-Phase-3 system (unauthenticated
+uploads to local disk, mocked `/submissions`). That is no longer accurate. Current
+surface — 18 paths:
 
 ```
 Browser (:3000)
-  ├─ POST /auth/login ──► auth.py sub-app ──► MongoDB novaflow.users
-  ├─ POST /upload-reel ─► app.py:69 ──► local disk ./uploads/   (NO AUTH)
-  ├─ GET  /submissions ─► app.py:157 ──► MOCKED (status from hash()!)
-  └─ GET  /violations/{id} ─► app.py:123 ──► DynamoDB (always empty, §1.3)
+  ├─ POST /auth/signup|login ──► MongoDB novaflow.users (Argon2id, rate-limited)
+  ├─ GET  /auth/me
+  ├─ POST /upload-reel ───────► S3 sources/{id}/source.{ext} + ownership record
+  ├─ POST /analyze/{id}[/retry] ► job queued, run by a leased worker
+  ├─ GET  /jobs/{id} ─────────► job state, stage, counts
+  ├─ GET  /violations/{id} ───► DynamoDB NovaFlowFrames (paginated)
+  ├─ GET  /submissions ───────► the caller's own videos
+  ├─ GET  /uploads/{file}?access_token=… ► S3 stream, scoped media token
+  └─ /projects/* (6 routes)
 
-  ✗ POST /analyze/{id}  — NEVER CALLED BY THE FRONTEND
-  ✗ /projects/* (6)     — never called; all 500
-  ✗ POST /execute       — never called; returns mock text
+  ⚠ POST /execute — returns placeholder text; the feature behind it is not
+                    implemented (§9 question 7). Not a secret leak, but it must
+                    not be presented as working.
 ```
 
-**Only 4 of 16 routes are used by the UI. 10 of 16 have no authentication.**
+**Every route that touches user data requires a JWT and an ownership check.**
+Unauthorized access returns **404, not 403**, so ids cannot be enumerated.
 
 ### 2.5 Known architectural inconsistencies **[VERIFIED]**
 
-- **Three conflicting bounding-box schemas:** `backend/prompts.py:16` uses `bounding_box: [ymin,xmin,ymax,xmax]`; `audit_manager.py:39` uses `box_2d`; `.agent/skills/video-audit/SKILL.md` uses `{x,y,width,height}` + `timestamp_ms`. **The frontend consumes the array form** (`HUDView.tsx:125`), so `prompts.py` is the de facto contract and `SKILL.md` is wrong.
-- **Bucket mismatch:** `infra/` provisions `brand-guardian-raw`/`-final`; all code uses `novaflow-media`. The IAM role grants access to unused buckets and **none to the bucket in use**, and has **no DynamoDB permissions at all**.
-- **Env var collision:** `MONGODB_URL` (`db.py:5`) vs `MONGO_URI` (`audit_manager.py:13`).
-- **`requirements.txt` omits `boto3`**, `ffmpeg-python`, `Pillow`, and `python-multipart` — all imported by the code. **The backend cannot start from a clean install of the manifest.** Nothing is version-pinned.
+- **Bounding-box schemas (partly resolved):** `backend/prompts.py` uses `bounding_box: [ymin,xmin,ymax,xmax]` and the frontend consumes that array form (`HUDView.tsx`), so it is the contract. The `box_2d` variant died with `audit_manager.py`; `detections.parse_frame_analysis` still tolerates it on input. ⚠️ `.agent/skills/video-audit/SKILL.md` still documents `{x,y,width,height}` + `timestamp_ms` and **is wrong** — correcting it is Phase 10.3.
+- ~~**Bucket mismatch**~~ **RESOLVED in Phase 5.** `infra/init_s3.py` and `infra/iam_policy.yaml` — which created and granted the unused `brand-guardian-*` buckets — were deleted. `infra/cloudformation/storage.yaml` is now the only provisioning path and provisions the bucket the code actually uses, and `infra/iam_policy_least_privilege.json` is the only policy. It covers DynamoDB.
+- ~~**Env var collision**~~ **RESOLVED in Phase 5.** `MONGO_URI` died with `audit_manager.py`; `MONGODB_URL` is the only connection-string variable, and a test asserts no module reads the old name or hardcodes a connection string.
+- ~~**`requirements.txt` omissions**~~ **RESOLVED in Phase 2**; every direct import is declared and pinned, and `test_dependencies.py` asserts it. Phase 5 removed `Pillow`, whose only importer was the deleted `audit_manager.py` — **frame remediation (Phase 8) must re-add it.**
 
 ---
 
 ## 3. Commands
 
-### Verified working **[VERIFIED]**
+### Verified working **[VERIFIED 2026-10-20, Phase 5]**
+
+A `.venv` exists at the repository root with the backend dependencies installed,
+and `frontend/node_modules` is installed. Use the venv interpreter.
 
 ```bash
-python -m py_compile backend/*.py analyzer_nova.py prompts.py   # passes — all 19 files
-git rev-parse --show-toplevel                                   # ALWAYS run before committing
-gh repo view YushBytes/Amazon_Nova_Project
+git rev-parse --show-toplevel                      # ALWAYS run before committing
+python -m py_compile backend/*.py analyzer_nova.py prompts.py
+
+# Backend tests — 624 passed, 42 skipped
+./.venv/Scripts/python.exe -m pytest backend/tests -q
+
+# Frontend — all four pass; lint reports 0 errors / 18 warnings
+cd frontend && npm test          # 74 tests (Vitest)
+cd frontend && npm run typecheck # tsc --noEmit, exit 0
+cd frontend && npm run lint      # "eslint app" — now has a target
+cd frontend && npm run build     # routes: / , /_not-found , /login
 ```
 
-### Declared but unverified — prerequisites are missing **[UNVERIFIED]**
+⚠️ **Rebuild after deleting a route.** `npm run typecheck` reads generated
+validators under `frontend/.next/types/`, which still reference a deleted
+`app/<route>/page.tsx` until `npm run build` regenerates them. A stale failure
+there is not a real type error.
+
+### Requires prerequisites this host lacks **[UNVERIFIED]**
 
 ```bash
-# Backend — WILL FAIL: boto3/motor/jose not installed, and boto3 is absent from requirements.txt
-cd backend && uvicorn app:app --host 0.0.0.0 --port 8000
+cd backend && uvicorn app:app --host 0.0.0.0 --port 8000   # needs MongoDB + AWS
+pytest -m requires_mongodb                                 # needs MONGODB_TEST_URL
+pytest -m requires_ffmpeg                                  # needs the FFmpeg binary
 
-# Frontend — node_modules has never been installed
-cd frontend && npm install && npm run dev      # :3000
-cd frontend && npm run build
-cd frontend && npm run lint                    # NOTE: "eslint" with no target — lints nothing useful
-
-# CLI utilities — require ffmpeg-python + the FFmpeg binary (NOT installed on this host)
+# CLI utilities — require the FFmpeg binary (NOT installed on this host)
 cd backend && python extractor.py <video.mp4> [video_id]
 cd backend && python analyzer.py <image.jpg | video_id>
 cd backend && python video_stitcher.py <video_id> [out.mp4]
+cd backend && python recover_jobs.py            # dry run; --apply to requeue
 ```
 
-### Does not exist **[VERIFIED]**
+### Does not exist **[VERIFIED 2026-10-20]**
 
-- **No tests anywhere.** No `tests/`, no `test_*.py`, no `*.spec.ts`, no `pytest.ini`, no `pyproject.toml`, no Jest/Vitest/Playwright, no `test` script in `package.json`.
-- **No CI.** No `.github/` directory.
-- **No `typecheck` script**, despite `strict: true`. Use `npx tsc --noEmit`.
-- **No `.env.example`.**
+- **No CI.** No `.github/` directory. Phase 10.2.
+- No Playwright/end-to-end test covering login → upload → analyze → review.
+- No backend linter or type checker is configured — no `pyproject.toml`,
+  `setup.cfg`, `.flake8`, ruff or mypy config. `requirements-dev.txt` holds only
+  pytest, pytest-asyncio and httpx. **Do not claim a Python lint or type pass:
+  there is no tool to run.**
+- `cfn-lint` is not installed, so `infra/cloudformation/storage.yaml` has only
+  ever been validated structurally offline (YAML parse, resource types, and
+  Ref/GetAtt/Condition resolution). `aws cloudformation validate-template` is an
+  AWS API call and has not been run.
 
 When a phase adds tests, run them and **quote the real output**. Never write "tests pass" without it.
 
-### Environment on this machine **[VERIFIED 2026-10-18]**
+### Environment on this machine **[VERIFIED 2026-10-20]**
 
-Python 3.14.6 (Dockerfile targets 3.11 — mismatch) · Node v24.18.1 · npm 11.16.0 · Docker 29.8.0 · git 2.51.0 (`core.autocrlf=false` set locally for this repo) · gh 2.97.0 authenticated as `YushBytes` (scopes `gist`, `read:org`, `repo`, `workflow`) · **FFmpeg NOT INSTALLED** · `boto3`, `motor`, `pymongo`, `jose`, `ffmpeg-python`, `strands`, `nova_act` **all missing** · `frontend/node_modules` absent.
+Python 3.14.6 in `.venv` (Dockerfile targets 3.11 — mismatch) · Node v24.18.1 · npm 11.16.0 · Docker 29.8.0 · git 2.51.0 (`core.autocrlf=false` set locally) · gh 2.97.0 as `YushBytes` · **FFmpeg NOT INSTALLED** · **no MongoDB reachable** · `frontend/node_modules` installed.
 
 ---
 
@@ -182,23 +215,27 @@ Security configuration (Phase 3, all via `backend/config.py`):
 | `EXPOSE_API_DOCS` | No | `false` in production |
 | `MAX_UPLOAD_BYTES` | No | `104857600` (100 MiB) |
 | `ALLOWED_VIDEO_EXTENSIONS` | No | `mp4,mov,avi,webm,mkv` |
+| `S3_BUCKET_NAME` | **Yes in production** (Phase 5; validated against the S3 naming rules) | `novaflow-media` in development — a placeholder nobody owns, and **refused in production** |
 
 Pre-existing application configuration:
 
 | Name | Read at | Default in code |
 | :-- | :-- | :-- |
-| `AWS_REGION` | 8 modules | `us-east-1` |
-| `S3_BUCKET_NAME` | `extractor`, `analyzer`, `projects`, `video_stitcher` | `novaflow-media` |
-| `DYNAMODB_TABLE_NAME` | `extractor`, `analyzer`, `app`, `video_stitcher` | `NovaFlowFrames` |
-| `MONGODB_URL` | `db.py:5` | `mongodb://localhost:27017` |
-| `MONGODB_DB_NAME` | `db.py:6` | `novaflow` |
-| `MONGO_URI` | `audit_manager.py:13` | duplicate of `MONGODB_URL` — consolidate |
+| `AWS_REGION` | `aws_resources.aws_region()` only | `us-east-1` (falls back to `AWS_DEFAULT_REGION`) |
+| `DYNAMODB_TABLE_NAME` | `aws_resources.frames_table_name()` only | `NovaFlowFrames` |
+| `DYNAMODB_PROJECTS_TABLE` | `aws_resources.projects_table_name()` only | `NovaFlowProjects` |
+| `MONGODB_URL` | `db.py` | `mongodb://localhost:27017` |
+| `MONGODB_DB_NAME` | `db.py` | `novaflow` |
+| `JOB_LEASE_SECONDS` | `video_repo` | `300` |
+| `RECOVER_JOBS_ON_STARTUP` | `app.py` | `true` |
 | `API_URL` | `app.py:82` | `http://localhost:8000` |
 | `BEDROCK_GUARDRAIL_ID` | `safety.py:13` | **none** |
 | `BEDROCK_GUARDRAIL_VERSION` | `safety.py:14` | `1` |
 | `NEXT_PUBLIC_API_URL` | 4 frontend files | `http://localhost:8000` |
 
 AWS credentials come from the boto3 default chain, not from these variables. The JWT signing key is read from `JWT_SECRET_KEY`; it is no longer in the source.
+
+**Storage contract (Phase 5).** Every AWS resource name resolves in exactly one place, `backend/aws_resources.py`, and the bucket resolves further into `config.load_s3_bucket()`. A second `os.getenv("S3_BUCKET_NAME", ...)` anywhere, or a second hardcoded `novaflow-media`, is a regression — `test_no_module_reimplements_the_bucket_fallback` fails on it. The table defaults are legitimate because they are the names `infra/cloudformation/storage.yaml` actually creates; the bucket default is not, because bucket names are globally unique, which is why production requires it explicitly. **There is no local-disk fallback for new uploads in any environment.**
 
 `.gitignore` correctly covers `.env*`. **Never commit a `.env`.** When reporting, name variables and redact values.
 
@@ -246,7 +283,7 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **Frame sampling is 1 fps**, so a violation visible for under ~1 second can be missed.
 - **There is no brand-rule configuration** - one static prompt in `prompts.py`. No per-client policies, and no legal/regulatory evaluation.
 - **Pre-Phase-3 uploads have no ownership record** and are therefore inaccessible. The uploader was never recorded, so it cannot be recovered from the data. Options in `docs/SECURITY_OPERATIONS.md` §6.
-- **AWS hardening is a template, not applied.** `infra/iam_policy_least_privilege.json` has placeholders; the bucket naming conflict (`novaflow-media` vs `brand-guardian-*`) is unresolved, and no bucket hardening is configured.
+- **AWS hardening is a template, not applied.** `infra/iam_policy_least_privilege.json` still has `${PLACEHOLDER}` values an operator must substitute, and `infra/cloudformation/storage.yaml` — which does express the bucket hardening (public-access block, SSE-S3, versioning, TLS-only policy, lifecycle) — **has never been deployed**. The bucket naming conflict was resolved in Phase 5 (§2.5), but nothing in AWS has been verified.
 - **Real-MongoDB integration tests are unverified.** Written and safety-guarded in `tests/test_integration_mongodb.py`, but never executed — no database or Docker daemon was available. Run `pytest -m requires_mongodb`.
 - Upload validation does **not** prove a file is a safe video; there is no content scanning.
 - 22 frontend lint **warnings** remain (unused vars, `<img>` usage); zero errors. None security-relevant.
@@ -262,7 +299,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 1. **Work only on the current assigned phase.** Do not pull work forward, even when it looks trivial.
 2. **Inspect the relevant existing code before modifying it** — the file and its callers.
 3. **Preserve working behavior.** Avoid rewrites. Do not replace a working component because another technology is available.
-4. **Implement real functionality.** Never present a mock, hardcoded value, or silent fallback as genuine AI output. `audit_manager.py:119` (returns the input, reports success) and `orchestrator.py:17` (returns `"Mock Response"` as a plan) are the exact patterns to eliminate — **do not reintroduce them anywhere.** If something cannot be implemented, leave it visibly unimplemented and say so.
+4. **Implement real functionality.** Never present a mock, hardcoded value, or silent fallback as genuine AI output. Two patterns are the ones to never reintroduce: a function that returns its input unchanged while the caller records success (was `audit_manager.remediate_frame`, deleted in Phase 5), and a stub that returns `"Mock Response"` as if it were a plan (still live at `orchestrator.py:17`, reachable through `POST /execute`, pending §9 question 7). If something cannot be implemented, leave it visibly unimplemented and say so.
 5. **Write or update tests for every meaningful change.**
 6. **Run relevant tests, lint, type checks, and builds** when applicable.
 7. **Review the final diff** for regressions, secrets, generated files, and accidental changes.
@@ -274,7 +311,23 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0, 1, 2, 3, 3.5 and 4 are **complete, committed, and pushed**: the repository is correctly rooted, flattened, private and tracking `origin/main`; the four critical Phase 1 defects are fixed with regression tests; authentication, authorization, resource ownership and upload handling are hardened, and Phase 3.5 added credential-endpoint rate limiting, safe database initialization, media-token log redaction, and a least-privilege IAM template (`docs/SECURITY_AUDIT.md`, `docs/SECURITY_OPERATIONS.md`). Phase 4 connected the end-to-end pipeline (`docs/PIPELINE_ARCHITECTURE.md`, `docs/PIPELINE_OPERATIONS.md`). **Phase 5 has not been started**, and the roadmap's remaining phases (cleanup, reliability, frontend completion, remediation, reconstruction, tests/CI/release) are still open. It still needs the maintainer decisions recorded in §9 — do not start it until it is explicitly assigned.
+Phases 0 through 5 are **complete, committed, and pushed**.
+
+| Phase | What landed |
+| :-- | :-- |
+| 0 | Repository correctly rooted, flattened, private, tracking `origin/main`. |
+| 1 | Evidence-based audit and roadmap. |
+| 2 | The four critical defects fixed, each with a regression test. |
+| 3 / 3.5 | Authentication, authorization, ownership, upload handling; rate limiting, safe DB init, media-token log redaction, least-privilege IAM template. |
+| 4 | End-to-end pipeline and job state machine. |
+| 4.1 | Durable S3 source storage, worker leases, crash recovery, CloudFormation storage template. |
+| 5 | Dead code removed, storage configuration reconciled to one contract, README rewritten. |
+
+**Phase 5 detail.** Deleted: the orphaned MongoDB/GridFS pipeline (`audit_manager.py`, `verifier.py`, `check_count.py`), `debug_probe.py`, `aws_config.py`, `frontend_backup/` (72 files), the stray `frontend/Video Compliance Dashboard/`, the orphan `/agents` and `/logs` duplicate routes, `infra/init_s3.py`, and `infra/iam_policy.yaml` — 82 files. `S3_BUCKET_NAME` is now required in production and validated; `MONGO_URI` and `Pillow` are gone with their only consumer. Regression tests assert the deleted modules stay deleted, that nothing imports `gridfs`, and that nothing reimplements the bucket fallback.
+
+**Phase 5 did NOT make the application production-ready.** It made the architecture coherent. Everything in §5 "Known remaining gaps" still stands, and nothing has still ever run against real AWS or Bedrock.
+
+**Phase 6 has not been started.** Remaining: 6 (backend reliability / durable worker), 7 (frontend completion), 8 (remediation — needs §9 q4), 9 (reconstruction — needs §9 q3), 10 (tests, CI, docs, release). Do not start one until it is explicitly assigned.
 
 ---
 
@@ -299,7 +352,7 @@ Observed in the existing code, for consistency. Several are **bad practices the 
 - 4-space indent; module-level constants in `SCREAMING_SNAKE_CASE`; `load_dotenv()` at module top.
 - boto3 clients are built at module scope — convenient for CLI use, but it makes testing harder and means no shared timeout config. New code should accept an injected client.
 - Each pipeline module has an `if __name__ == "__main__":` CLI block with `sys.argv` parsing. Keep this; it is genuinely useful.
-- `logging` is used in `app.py`, `auth.py`, `config.py`, `projects.py`, `video_repo.py` and `analyzer.py`. ⚠️ Several older modules (`extractor.py`, `video_stitcher.py`, `audit_manager.py`, `safety.py`) still use `print()`. **Use `logging` in new code.**
+- `logging` is used in `app.py`, `auth.py`, `config.py`, `projects.py`, `video_repo.py`, `analyzer.py`, `extractor.py`, `pipeline.py` and `source_store.py`. ⚠️ `video_stitcher.py` and `safety.py` still use `print()`. **Use `logging` in new code.**
 - ⚠️ **Bare `except Exception` that logs and continues** is still common in the older modules, and was the direct cause of the §1.3 defects being silent. **Catch specific exceptions and record a terminal failure state.**
 - Raw exception strings are **no longer** returned to clients: `app.py` has a catch-all handler returning a generic 500, and AWS errors become a generic 502. Keep it that way.
 - Pydantic `BaseModel` for request/response schemas — follow this, and extend it to **validating AI model output**, which is currently unvalidated everywhere.
@@ -318,14 +371,14 @@ Observed in the existing code, for consistency. Several are **bad practices the 
 
 These block specific phases. Do not decide them unilaterally.
 
-1. Delete the dead MongoDB/GridFS pipeline (`audit_manager.py`, `verifier.py`, `check_count.py`)? *(Recommended: yes — unreachable and unrunnable.)*
-2. Keep MongoDB for users, or consolidate onto DynamoDB?
+1. ~~Delete the dead MongoDB/GridFS pipeline?~~ **RESOLVED in Phase 5 — deleted**, per the recommendation recorded here. A regression test keeps it deleted.
+2. Keep MongoDB for users, or consolidate onto DynamoDB? *(Still open. MongoDB now also holds ownership and job state, so this is a larger decision than it was.)*
 3. Is video **reconstruction** in release scope, or is detection + reporting enough for v1?
 4. Is **remediation** (Nova Canvas) in release scope? It is currently a disguised mock and must be built properly or removed.
 5. Which bounding-box schema is canonical? *(De facto: the array form in `prompts.py`.)*
 6. Correct model ID — `amazon.nova-pro-v1:0`, or a "Nova 2 Pro" id? Docs and code disagree.
-7. Is Nova Act / browser automation in scope at all? If not, `automation.py`, `orchestrator.py`, `/execute`, and the "Neural Command" UI panel can all go.
-8. Are the `brand-guardian-*` buckets in `infra/` intentional, or leftovers?
+7. Is Nova Act / browser automation in scope at all? If not, `automation.py`, `orchestrator.py`, `/execute`, and the "Neural Command" UI panel can all go. *(Still open, so Phase 5 retained all of them. `backend/safety.py` is retained for the same reason: it is never imported, but its `intercept_action` is the human-in-the-loop gate for exactly this feature, so deleting it would pre-empt this decision. `backend/s3_trigger.py`, an unreferenced Lambda stub with no deployment definition, was retained as uncertain rather than deleted.)*
+8. ~~Are the `brand-guardian-*` buckets in `infra/` intentional, or leftovers?~~ **RESOLVED in Phase 5 — leftovers.** No application code has ever read them. The two files that created and granted them (`infra/init_s3.py`, `infra/iam_policy.yaml`) were deleted. ⚠️ **No AWS bucket was touched.** If such buckets were ever created in a real account, deleting them there is a separate operator action.
 9. Backend deployment target — ECS, Lambda, App Runner? Only the frontend has a deployment config.
 
 ---
@@ -336,6 +389,7 @@ These block specific phases. Do not decide them unilaterally.
 - Never force-push, rewrite history, or create another GitHub repository.
 - Never commit a `.env`, a credential, `node_modules/`, `backend/uploads/`, `temp_frames_*/`, or build artifacts.
 - Never present a mock, hardcoded value, or silent fallback as real AI output.
+- Never reintroduce the MongoDB/GridFS pipeline, a second `os.getenv("S3_BUCKET_NAME")`, or a hardcoded `novaflow-media` — three tests fail on these by design (§2.3, §4).
 - Never claim a test passed, a build succeeded, or a push completed without the actual output.
 - Never mark an audit or roadmap item verified because the code exists.
 - Never introduce a new database, framework, AI provider, or cloud service without an explicit decision.

@@ -102,12 +102,18 @@ One bucket, `${S3_BUCKET_NAME}`, with two prefixes in use:
 
 | Prefix | Contents |
 | :-- | :-- |
+| `sources/{video_id}/` | Uploaded source videos (Phase 4.1) |
 | `frames/{video_id}/` | Extracted frame JPEGs |
 | `raw/{project_id}/{user}/` | Presigned project uploads (dead path, nothing reads it) |
 
-Apply the hardening in `docs/SECURITY_OPERATIONS.md` §7.4 — public-access
-block, encryption, versioning, TLS-only bucket policy, access logging. None of
-it is configured by `infra/init_s3.py`.
+Provision with `infra/cloudformation/storage.yaml`, which is the only supported
+provisioning path and already expresses the hardening listed in
+`docs/SECURITY_OPERATIONS.md` §7.4 — public-access block, encryption,
+versioning, TLS-only bucket policy, optional access logging. Phase 5 deleted
+the legacy `infra/init_s3.py`, which applied none of it and created
+differently-named buckets. Set `S3_BUCKET_NAME` to the stack's
+`MediaBucketNameOut` output; it is **required** when `NOVAFLOW_ENV=production`
+and the application refuses to start without it.
 
 ### Bedrock
 
