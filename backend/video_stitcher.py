@@ -7,9 +7,11 @@ from datetime import datetime
 # Load configurations
 load_dotenv()
 
-S3_BUCKET = os.getenv("S3_BUCKET_NAME", "novaflow-media")
-DYNAMO_TABLE = os.getenv("DYNAMODB_TABLE_NAME", "NovaFlowFrames")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+import aws_resources
+
+S3_BUCKET = aws_resources.media_bucket()
+DYNAMO_TABLE = aws_resources.frames_table_name()
+AWS_REGION = aws_resources.aws_region()
 
 # Initialize AWS clients
 s3_client = boto3.client('s3', region_name=AWS_REGION)

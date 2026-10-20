@@ -1,3 +1,22 @@
+"""SUPERSEDED - do not run. Kept for reference only.
+
+This script creates buckets named "brand-guardian-raw" and
+"brand-guardian-final", which no application code reads: the backend resolves
+its single bucket through backend/aws_resources.py (S3_BUCKET_NAME, default
+"novaflow-media"). Running this would create two unused buckets and leave the
+real one unprovisioned.
+
+It also creates them with no public-access block, no default encryption, no
+versioning, no TLS-only bucket policy, and no lifecycle rules.
+
+Use infra/cloudformation/storage.yaml instead. It provisions the bucket the
+code actually uses, with those controls applied, plus the two DynamoDB tables
+this script never created. See docs/PIPELINE_OPERATIONS.md.
+
+Retained rather than deleted because it documents the original naming scheme,
+which an operator with existing buckets may need to reconcile.
+"""
+
 import boto3
 from botocore.exceptions import ClientError
 

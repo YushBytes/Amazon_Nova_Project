@@ -1,20 +1,24 @@
 {
   "_README": [
-    "NovaFlow / Brand Guardian - least-privilege IAM policy TEMPLATE (Phase 3.5).",
+    "NovaFlow / Brand Guardian - least-privilege IAM policy TEMPLATE.",
+    "Phase 3.5, updated in Phase 4.1.",
     "",
     "THIS IS A TEMPLATE, NOT A DEPLOYABLE POLICY. Every ${PLACEHOLDER} below must",
     "be replaced with a real value before use. No account id, bucket name, or",
-    "table name has been invented here: the repository contains two conflicting",
-    "bucket naming schemes (application code defaults to 'novaflow-media' while",
-    "infra/init_s3.py creates 'brand-guardian-raw' and 'brand-guardian-final'),",
-    "so an operator must resolve that first. See docs/SECURITY_OPERATIONS.md.",
+    "table name has been invented here.",
+    "",
+    "The bucket-naming conflict this file previously had to flag is resolved:",
+    "backend/aws_resources.py is now the single place every bucket, table, and",
+    "object prefix is defined, and infra/cloudformation/storage.yaml provisions",
+    "exactly those. infra/init_s3.py remains an unused legacy bootstrap script",
+    "that creates differently-named buckets; do not run it.",
     "",
     "Placeholders:",
     "  ${AWS_REGION}              e.g. the region in AWS_REGION",
     "  ${AWS_ACCOUNT_ID}          your 12-digit account id",
     "  ${S3_BUCKET_NAME}          value of the S3_BUCKET_NAME env var",
     "  ${DYNAMODB_FRAMES_TABLE}   value of DYNAMODB_TABLE_NAME (default NovaFlowFrames)",
-    "  ${DYNAMODB_PROJECTS_TABLE} the projects table (code hardcodes NovaFlowProjects)",
+    "  ${DYNAMODB_PROJECTS_TABLE} value of DYNAMODB_PROJECTS_TABLE (default NovaFlowProjects)",
     "",
     "Actions were derived from the boto3 calls the code actually makes, not from",
     "the previous policy. Differences from infra/iam_policy.yaml:",
@@ -23,6 +27,16 @@
     "  * Bucket ARNs now come from a placeholder rather than a hardcoded name.",
     "  * s3:ListBucket is constrained to the prefixes the app actually lists.",
     "  * aws:SecureTransport is required, so plaintext calls are denied.",
+    "",
+    "Phase 4.1 additions, each tied to a specific new call:",
+    "  * sources/* added to GetObject/PutObject - uploads are now stored in S3",
+    "    instead of on the application host local disk.",
+    "  * s3:DeleteObject granted for sources/* ONLY - the upload route deletes a",
+    "    just-written object when the ownership write fails, so an unreachable",
+    "    orphan is not left behind. Not granted for frames/ or raw/.",
+    "  * dynamodb:DeleteItem granted on the frames table - a re-run prunes frame",
+    "    rows left by a longer previous attempt, which would otherwise be",
+    "    returned as part of the current result.",
     "",
     "Remove this _README key before applying; it is documentation, not policy."
   ],
@@ -69,8 +83,11 @@
         "get_object  - analyzer.py reads those frames back",
         "download_file - video_stitcher.py (GetObject under the hood)",
         "generate_presigned_url for put_object - projects.py raw/ uploads",
-        "Scoped to the two prefixes in use so the role cannot touch anything",
-        "else in the bucket."
+        "put_object/get_object on sources/ - source_store.py (Phase 4.1)",
+        "Scoped to the three prefixes in use so the role cannot touch anything",
+        "else in the bucket. The prefixes are defined in",
+        "backend/aws_resources.py MANAGED_PREFIXES; adding one there means",
+        "adding it here too."
       ],
       "Effect": "Allow",
       "Action": [
@@ -78,9 +95,26 @@
         "s3:PutObject"
       ],
       "Resource": [
+        "arn:aws:s3:::${S3_BUCKET_NAME}/sources/*",
         "arn:aws:s3:::${S3_BUCKET_NAME}/frames/*",
         "arn:aws:s3:::${S3_BUCKET_NAME}/raw/*"
       ]
+    },
+
+    {
+      "Sid": "S3DeleteOrphanedSourcesOnly",
+      "_comment": [
+        "delete_object - source_store.delete_source, called only when the",
+        "ownership write fails after the upload succeeded. Without it that",
+        "object would be an orphan no route can reach and no user can be",
+        "billed for.",
+        "Deliberately a separate statement scoped to sources/* so the role can",
+        "never delete an extracted frame or an agent reel. Expiring those is a",
+        "bucket lifecycle rule, not an application action."
+      ],
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/sources/*"
     },
 
     {
@@ -95,6 +129,7 @@
       "Condition": {
         "StringLike": {
           "s3:prefix": [
+            "sources/*",
             "frames/*",
             "raw/*"
           ]
@@ -110,7 +145,10 @@
         "scan                - analyzer.check_pending_frames (acknowledged as a",
         "                      POC shortcut; remove this action once a GSI on",
         "                      status replaces the scan).",
-        "No DeleteItem: no code path deletes a frame record."
+        "delete_item         - analyzer.delete_frames_from (Phase 4.1), which",
+        "                      removes frame rows left by a longer previous",
+        "                      attempt so they are not reported as part of the",
+        "                      current result. Scoped to this table only."
       ],
       "Effect": "Allow",
       "Action": [
@@ -118,7 +156,8 @@
         "dynamodb:GetItem",
         "dynamodb:UpdateItem",
         "dynamodb:Query",
-        "dynamodb:Scan"
+        "dynamodb:Scan",
+        "dynamodb:DeleteItem"
       ],
       "Resource": [
         "arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${DYNAMODB_FRAMES_TABLE}"
@@ -168,8 +207,8 @@
     "bedrock:ApplyGuardrail": "backend/safety.py is never imported by the running app. Grant with the guardrail ARN if it is wired up.",
     "states:*": "backend/aws_config.py builds a Step Functions client that no code uses.",
     "s3:CreateBucket": "infra/init_s3.py is an operator bootstrap script and should run under separate administrative credentials, not the application role.",
-    "s3:DeleteObject": "No code path deletes an S3 object. A retention/cleanup job would need this explicitly.",
-    "dynamodb:DeleteItem": "No code path deletes a record.",
+    "s3:DeleteObject on frames/* and raw/*": "Granted for sources/* only, for orphan cleanup. No code path deletes a frame or a reel; expiring those is a bucket lifecycle rule.",
+    "dynamodb:DeleteItem on the projects table": "No code path deletes a project. Granted on the frames table only, for stale-frame pruning.",
     "dynamodb:CreateTable": "Table provisioning is an operator action; see docs/SECURITY_OPERATIONS.md.",
     "logs:CreateLogGroup": "Create the log group once, out of band, so the running role cannot create arbitrary groups."
   },
@@ -178,13 +217,15 @@
     "_comment": [
       "These are bucket and account settings, not identity-policy statements.",
       "They are listed so they are not forgotten; apply them to the bucket",
-      "itself. infra/init_s3.py currently creates buckets with none of them."
+      "itself. As of Phase 4.1, infra/cloudformation/storage.yaml applies all",
+      "of them, so provisioning through that template satisfies this list.",
+      "infra/init_s3.py, the legacy script, applies none of them."
     ],
     "PublicAccessBlockConfiguration": "BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets - all true.",
     "BucketEncryption": "SSE-S3 (AES256) at minimum, or SSE-KMS with a CMK.",
     "Versioning": "Enabled, so an overwritten frame or reel is recoverable.",
     "BucketPolicy": "Add an explicit Deny for aws:SecureTransport=false at the bucket level too, so the constraint does not depend on the caller's identity policy.",
-    "LifecycleConfiguration": "Expire or transition frames/ and raw/ objects per the retention decision in docs/SECURITY_OPERATIONS.md.",
+    "LifecycleConfiguration": "Expire or transition sources/, frames/ and raw/ objects per the retention decision in docs/SECURITY_OPERATIONS.md. infra/cloudformation/storage.yaml expresses these as parameters.",
     "ServerAccessLogging_or_CloudTrailDataEvents": "Needed to audit who read a reel; neither is configured today.",
     "OwnershipControls": "BucketOwnerEnforced, which disables ACLs entirely."
   }

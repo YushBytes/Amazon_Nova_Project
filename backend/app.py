@@ -1,6 +1,8 @@
 import logging
 import os
 import re
+import shutil
+import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,8 +23,9 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -31,8 +34,10 @@ from orchestrator import NovaFlowOrchestrator
 from automation import NovaFlowAutomation
 
 # Import routers
+import aws_resources
 import db_init
 import pipeline
+import source_store
 import video_repo
 from auth import (
     create_media_token,
@@ -47,6 +52,7 @@ from job_state import JobState, coerce
 from pipeline import AlreadyRunning, PipelineError, RetryLimitReached
 from projects import router as projects_router
 from rate_limit import RateLimitMiddleware, build_credential_rules
+from source_store import SourceMissing, SourceStoreError
 from video_repo import OwnershipUnknown
 
 load_dotenv()
@@ -61,6 +67,36 @@ settings = get_settings()
 # those values from this process's log records before anything is emitted.
 # External proxy and CDN logs are a separate, deployment-level concern.
 install_log_redaction()
+
+def _recovery_on_startup() -> bool:
+    """Whether to sweep for abandoned jobs when the process starts.
+
+    On by default. An operator running several instances behind a load
+    balancer may want exactly one of them doing this, and a test process does
+    not want it at all, so it is a switch rather than unconditional.
+    """
+    raw = (os.getenv("RECOVER_JOBS_ON_STARTUP") or "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _dispatch_recovered_job(video_id: str) -> None:
+    """Run a recovered job on a worker thread.
+
+    `BackgroundTasks` is request-scoped and there is no request here, so the
+    thread is started directly. The job is already durably queued, so losing
+    this thread costs a wait for the next sweep, not the job.
+    """
+    import threading
+
+    threading.Thread(
+        target=pipeline.run_job,
+        args=(video_id,),
+        name=f"novaflow-recovery-{video_id}",
+        daemon=True,
+    ).start()
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -79,6 +115,29 @@ async def lifespan(_: FastAPI):
         logger.warning(
             "Database initialization skipped; is MongoDB reachable?"
         )
+
+    # Phase 4.1: reclaim jobs abandoned by a previous process.
+    #
+    # This runs ONCE, here, at startup. It is not a continuous sweep, and the
+    # application does not pretend to have one: a job abandoned while this
+    # process stays up waits for the next restart or for an operator to run
+    # `python backend/recover_jobs.py`. See docs/PIPELINE_OPERATIONS.md for the
+    # scheduler configuration that makes recovery continuous.
+    #
+    # Recovered jobs are requeued AND dispatched, because this process is also
+    # the worker. Dispatch is best effort: the requeue is the durable part.
+    if _recovery_on_startup():
+        try:
+            counts = await pipeline.recover_abandoned_jobs(
+                dispatch=_dispatch_recovered_job
+            )
+            if counts.get("scanned"):
+                logger.info("Startup job recovery: %s", counts)
+        except Exception:
+            # Never prevent the application from serving because a sweep
+            # failed; the jobs stay abandoned and visibly non-terminal.
+            logger.exception("Startup job recovery failed")
+
     yield
 
 
@@ -224,19 +283,6 @@ def _check_content_type(content_type: Optional[str]) -> None:
     )
 
 
-def _resolve_within_uploads(stored_filename: str) -> Path:
-    """Join a server-generated filename to UPLOAD_DIR and assert containment.
-
-    Defence in depth: the filename is already server-generated, and this
-    re-checks that the resolved path has not escaped the upload directory.
-    """
-    candidate = (UPLOAD_DIR / stored_filename).resolve()
-    if candidate != UPLOAD_DIR and UPLOAD_DIR not in candidate.parents:
-        logger.error("Rejected a path that resolved outside the upload directory")
-        raise HTTPException(status_code=400, detail="Invalid file reference")
-    return candidate
-
-
 async def _stream_to_disk(upload: UploadFile, destination: Path) -> int:
     """Copy the upload to disk in chunks, enforcing the size limit.
 
@@ -316,18 +362,56 @@ async def require_video_owner(video_id: str, user: dict) -> dict:
 async def upload_reel(
     file: UploadFile = File(...), user: dict = Depends(get_current_user)
 ):
-    """Store a video and record the caller as its owner.
+    """Store a video durably in S3 and record the caller as its owner.
 
     Does NOT start analysis; call POST /analyze/{video_id} afterwards.
+
+    Phase 4.1 ordering, which is what makes the result consistent:
+
+    1. stream the body to a unique temporary file, enforcing the size limit;
+    2. put that file in S3 under a server-generated key;
+    3. write the ownership record naming that object;
+    4. remove the temporary file, always.
+
+    If (2) fails there is no record and no object, so nothing is orphaned. If
+    (3) fails the object is deleted as compensating cleanup, because without a
+    record it is unattributable and unreachable - no route can ever name it.
     """
     extension = _safe_extension(file.filename)
     _check_content_type(file.content_type)
 
     video_id = f"vid_{uuid.uuid4().hex[:8]}"
+    # Retained on the record for legacy playback and for the operator
+    # backfill. It is no longer where the bytes live.
     stored_filename = f"{video_id}.{extension}"
-    destination = _resolve_within_uploads(stored_filename)
 
-    size_bytes = await _stream_to_disk(file, destination)
+    # mkdtemp guarantees a unique directory, so two concurrent uploads cannot
+    # collide on a staging path even if they somehow shared a video id.
+    staging_dir = tempfile.mkdtemp(prefix=f"novaflow-upload-{video_id}-")
+    staged = Path(staging_dir) / f"source.{extension}"
+
+    try:
+        size_bytes = await _stream_to_disk(file, staged)
+
+        try:
+            # boto3 is synchronous; a 100 MiB PUT on the event loop would
+            # stall every other request on this worker.
+            ref = await run_in_threadpool(
+                source_store.upload_source,
+                local_path=staged,
+                video_id=video_id,
+                extension=extension,
+                size_bytes=size_bytes,
+            )
+        except SourceStoreError as exc:
+            # Safe message from source_store; no bucket name or botocore text.
+            logger.error("Durable upload failed for a new video")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            )
+    finally:
+        # The staged copy is never the durable one. Remove it on every path.
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     try:
         await video_repo.record_video(
@@ -337,11 +421,13 @@ async def upload_reel(
             original_filename=file.filename,
             extension=extension,
             size_bytes=size_bytes,
+            s3_bucket=ref.bucket,
+            s3_key=ref.key,
         )
     except Exception:
-        # Without an ownership record the file would be unreachable and
-        # unattributable, so do not keep it.
-        destination.unlink(missing_ok=True)
+        # Compensating cleanup: an object with no record is an orphan that no
+        # route can reach and no user can be billed for.
+        await run_in_threadpool(source_store.delete_source, ref)
         logger.exception("Could not record video ownership; upload rolled back")
         raise HTTPException(status_code=500, detail="Could not store the upload")
 
@@ -367,6 +453,7 @@ async def upload_reel(
 
 @app.get("/uploads/{stored_filename}")
 async def serve_upload(
+    request: Request,
     stored_filename: str,
     access_token: Optional[str] = Query(default=None),
 ):
@@ -405,12 +492,34 @@ async def serve_upload(
     if record.get("owner") != claims.get("sub"):
         raise HTTPException(status_code=404, detail="Not found")
 
-    path = _resolve_within_uploads(record["stored_filename"])
-    if not path.is_file():
+    # Phase 4.1: the bytes normally live in S3. A pre-4.1 record still points
+    # at local disk, so that path is kept rather than breaking old uploads.
+    if source_store.has_durable_source(record):
+        range_header = request.headers.get("range")
+        try:
+            stream = await run_in_threadpool(
+                source_store.open_stream, record, range_header
+            )
+        except SourceMissing:
+            raise HTTPException(status_code=404, detail="Not found")
+        except SourceStoreError:
+            # No bucket name, key, or botocore detail reaches the client.
+            raise HTTPException(status_code=502, detail="Video unavailable")
+
+        # Explicit content type plus nosniff: never let a stored object be
+        # interpreted as HTML on this origin. Range headers come from S3 so
+        # the browser can still seek, which FileResponse used to handle.
+        return StreamingResponse(
+            stream.chunks,
+            status_code=stream.status,
+            media_type="video/mp4",
+            headers=stream.headers,
+        )
+
+    path = source_store.local_fallback_path(record, UPLOAD_DIR)
+    if path is None:
         raise HTTPException(status_code=404, detail="Not found")
 
-    # Explicit content type and an attachment-safe disposition: never let a
-    # stored file be interpreted as HTML on this origin.
     return FileResponse(
         path,
         media_type="video/mp4",
@@ -421,6 +530,27 @@ async def serve_upload(
 # ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
+
+def _require_source(record: dict) -> None:
+    """Refuse to queue a job whose source bytes cannot be reached.
+
+    Phase 4 checked that the local file existed, which is why a restarted
+    container returned "Video payload not found" for every job. A record with
+    a durable S3 reference is accepted without a HEAD request: the pipeline
+    handles a missing object by failing the job with a truthful reason, and
+    paying a round trip on every submit to pre-empt a rare case is not worth
+    it. A legacy record is still checked on disk, because for those the file
+    really is the only copy.
+    """
+    if source_store.has_durable_source(record):
+        return
+    if source_store.local_fallback_path(record, UPLOAD_DIR) is not None:
+        return
+    raise HTTPException(
+        status_code=404,
+        detail="The uploaded video is no longer available. Please upload it again.",
+    )
+
 
 @app.post("/analyze/{video_id}")
 async def start_analysis(
@@ -438,12 +568,7 @@ async def start_analysis(
     a duplicate. A finished job can be retried while attempts remain.
     """
     record = await require_video_owner(video_id, user)
-
-    path = _resolve_within_uploads(record["stored_filename"])
-    if not path.is_file():
-        # The ownership record exists but the file does not. Record a terminal
-        # failure so the job does not sit in UPLOADED forever.
-        raise HTTPException(status_code=404, detail="Video payload not found.")
+    _require_source(record)
 
     try:
         updated = await pipeline.submit(video_id)
@@ -455,8 +580,10 @@ async def start_analysis(
         raise HTTPException(status_code=409, detail=str(exc))
 
     # Queued durably first, then handed to the worker, so a job can never be
-    # executing without a record saying so.
-    background_tasks.add_task(pipeline.run_job, video_id, str(path))
+    # executing without a record saying so. No path is passed: the worker
+    # fetches the source from S3 using the stored reference, which is what
+    # lets a different instance - or this one after a restart - run the job.
+    background_tasks.add_task(pipeline.run_job, video_id)
 
     job = video_repo.job_view(updated)
     return {
@@ -504,9 +631,7 @@ async def retry_analysis(
             detail="This video has not been analysed yet; start an analysis instead.",
         )
 
-    path = _resolve_within_uploads(record["stored_filename"])
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Video payload not found.")
+    _require_source(record)
 
     try:
         updated = await pipeline.submit(video_id, allow_retry=True)
@@ -517,7 +642,7 @@ async def retry_analysis(
     except PipelineError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    background_tasks.add_task(pipeline.run_job, video_id, str(path))
+    background_tasks.add_task(pipeline.run_job, video_id)
 
     job = video_repo.job_view(updated)
     return {"video_id": video_id, "status": job["state"], "job": job}
@@ -550,10 +675,8 @@ async def get_violations(
     """
     record = await require_video_owner(video_id, user)
 
-    table_name = os.getenv("DYNAMODB_TABLE_NAME", "NovaFlowFrames")
-    dynamodb = boto3.resource(
-        "dynamodb", region_name=os.getenv("AWS_REGION", "us-east-1")
-    )
+    table_name = aws_resources.frames_table_name()
+    dynamodb = boto3.resource("dynamodb", region_name=aws_resources.aws_region())
     table = dynamodb.Table(table_name)
 
     query_kwargs = {

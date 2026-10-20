@@ -9,15 +9,18 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
+import aws_resources
 from auth import get_current_user, require_roles
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
-# AWS Configuration
-REGION = os.getenv("AWS_REGION", "us-east-1")
-TABLE_NAME = "NovaFlowProjects"
+# AWS Configuration. Resolved through aws_resources (Phase 4.1) so the
+# projects table is overridable per environment like every other resource
+# name; it was previously the one hardcoded name in the codebase.
+REGION = aws_resources.aws_region()
+TABLE_NAME = aws_resources.projects_table_name()
 
 # Initialize DynamoDB
 dynamodb = boto3.resource('dynamodb', region_name=REGION)
@@ -159,8 +162,8 @@ async def initialize_upload(project_id: str, user: dict = Depends(require_agent)
 
     # 2. Generate S3 Pre-signed URL
     s3_client = boto3.client('s3', region_name=REGION)
-    BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "novaflow-media")
-    s3_key = f"raw/{project_id}/{user['sub']}/reel.mp4"
+    BUCKET_NAME = aws_resources.media_bucket()
+    s3_key = aws_resources.raw_reel_key(project_id, user['sub'])
     
     try:
         upload_url = s3_client.generate_presigned_url(

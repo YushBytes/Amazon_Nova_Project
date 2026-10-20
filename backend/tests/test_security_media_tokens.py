@@ -293,10 +293,15 @@ def test_unhandled_error_log_does_not_include_the_query_string(
     path = body["video_url"].split("/uploads/", 1)[1]
     token = path.split("access_token=", 1)[1]
 
-    def boom(_name):
+    def boom(*_args, **_kwargs):
         raise RuntimeError("induced failure")
 
-    monkeypatch.setattr(app_module, "_resolve_within_uploads", boom)
+    # Phase 4.1: playback reads from S3, so the failure is induced there.
+    # `_resolve_within_uploads` no longer exists; patching a missing
+    # attribute would make this test pass without inducing anything.
+    import source_store
+
+    monkeypatch.setattr(source_store, "open_stream", boom)
 
     with caplog.at_level("DEBUG"):
         client.get(f"/uploads/{path}")

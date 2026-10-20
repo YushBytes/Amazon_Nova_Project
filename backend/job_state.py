@@ -20,6 +20,9 @@ STATE MACHINE
                           │
                           └──► QUEUED        (explicit, bounded retry)
 
+    EXTRACTING ──┐
+    ANALYZING  ──┴──► QUEUED               (crash recovery, lease expired)
+
   UPLOADED    file stored, ownership recorded, analysis not requested
   QUEUED      analysis accepted; the worker has not begun
   EXTRACTING  frames are being extracted from the source video
@@ -38,6 +41,9 @@ Deliberate properties:
   explicit retry that increments `attempt`. COMPLETED → QUEUED is permitted so
   a finished job can be re-run deliberately; `pipeline` guards against
   concurrent duplicates separately.
+* EXTRACTING and ANALYZING may also return to QUEUED, but only for crash
+  recovery (Phase 4.1): a dead worker's job has to be requeueable. Every
+  other caller is blocked from that path - see the note on `_ALLOWED`.
 * An unknown or absent stored status is treated as UPLOADED, so records
   written before this phase keep working.
 """
@@ -82,8 +88,19 @@ _ALLOWED: dict[JobState, frozenset[JobState]] = {
     JobState.QUEUED: frozenset(
         {JobState.EXTRACTING, JobState.FAILED}
     ),
-    JobState.EXTRACTING: frozenset({JobState.ANALYZING, JobState.FAILED}),
-    JobState.ANALYZING: frozenset({JobState.COMPLETED, JobState.FAILED}),
+    # EXTRACTING/ANALYZING -> QUEUED exists for crash recovery only (Phase
+    # 4.1). A worker that dies leaves its job in one of these states, and the
+    # recovery sweep must be able to return it to the queue. It is NOT a path
+    # a request can take: `pipeline.submit` refuses any active job, and
+    # `video_repo.reclaim` - the only caller - makes the write conditional on
+    # the dead worker's claim id, so a live worker's job cannot be requeued
+    # out from under it.
+    JobState.EXTRACTING: frozenset(
+        {JobState.ANALYZING, JobState.FAILED, JobState.QUEUED}
+    ),
+    JobState.ANALYZING: frozenset(
+        {JobState.COMPLETED, JobState.FAILED, JobState.QUEUED}
+    ),
     # Terminal states re-enter the pipeline only through an explicit retry.
     JobState.COMPLETED: frozenset({JobState.QUEUED}),
     JobState.FAILED: frozenset({JobState.QUEUED}),

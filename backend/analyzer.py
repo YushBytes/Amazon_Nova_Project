@@ -12,6 +12,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from decimal import Decimal
 from dotenv import load_dotenv
 
+import aws_resources
 from config import get_settings
 from detections import (
     AnalysisParseError,
@@ -42,9 +43,12 @@ class FrameAuditError(RuntimeError):
     recorded against that frame and does not abort the run.
     """
 
-S3_BUCKET = os.getenv("S3_BUCKET_NAME", "novaflow-media")
-DYNAMO_TABLE = os.getenv("DYNAMODB_TABLE_NAME", "NovaFlowFrames")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+# Resource names come from aws_resources (Phase 4.1), which is the single
+# place they are defined. The module-level names are kept because tests and
+# the IAM documentation refer to them.
+S3_BUCKET = aws_resources.media_bucket()
+DYNAMO_TABLE = aws_resources.frames_table_name()
+AWS_REGION = aws_resources.aws_region()
 
 # Initialize AWS clients
 s3_client = boto3.client('s3', region_name=AWS_REGION)
@@ -253,7 +257,11 @@ def _detection_item(detection) -> dict:
 
 
 def _record_frame_result(
-    video_id: str, frame_number, status: str, analysis: FrameAnalysis
+    video_id: str,
+    frame_number,
+    status: str,
+    analysis: FrameAnalysis,
+    attempt: int | None = None,
 ) -> int:
     """Write one frame's terminal audit state to DynamoDB.
 
@@ -262,7 +270,9 @@ def _record_frame_result(
     stored.
 
     Keeps the established attribute contract (`status`, `analysis_report`,
-    `detections`, `updated_at`) and adds traceability fields.
+    `detections`, `updated_at`) and adds traceability fields. `attempt`
+    (Phase 4.1) records which job attempt produced the row, so an operator can
+    tell a recovered re-run's output from the run it replaced.
     """
     audited = status == STATUS_AUDITED
 
@@ -279,26 +289,80 @@ def _record_frame_result(
     if analysis.error:
         report["error"] = analysis.error
 
+    expression = (
+        "SET #s = :s, analysis_report = :r, detections = :d, "
+        "updated_at = :t, model_id = :m, pipeline_version = :p"
+    )
+    values = {
+        ":s": status,
+        ":r": json.dumps(report),
+        ":d": detections,
+        ":t": datetime.now(timezone.utc).isoformat(),
+        ":m": MODEL_ID,
+        ":p": PIPELINE_VERSION,
+    }
+    if attempt is not None:
+        expression += ", job_attempt = :a"
+        values[":a"] = int(attempt)
+
     table.update_item(
         Key={"video_id": video_id, "frame_number": frame_number},
-        UpdateExpression=(
-            "SET #s = :s, analysis_report = :r, detections = :d, "
-            "updated_at = :t, model_id = :m, pipeline_version = :p"
-        ),
+        UpdateExpression=expression,
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={
-            ":s": status,
-            ":r": json.dumps(report),
-            ":d": detections,
-            ":t": datetime.now(timezone.utc).isoformat(),
-            ":m": MODEL_ID,
-            ":p": PIPELINE_VERSION,
-        },
+        ExpressionAttributeValues=values,
     )
     return len(detections)
 
 
-def check_pending_frames(video_id=None):
+def delete_frames_from(video_id: str, keep_count: int) -> int:
+    """Delete this video's frame rows numbered `keep_count` and above.
+
+    Frame rows are keyed (video_id, frame_number), so a re-run overwrites rows
+    0..n-1 but leaves anything a longer previous attempt wrote. Those leftover
+    rows would be returned by /violations as part of the current result, which
+    would present a superseded attempt's detections as current findings.
+
+    Returns:
+        The number of rows deleted.
+
+    Raises:
+        Exception: propagated, because silently leaving stale rows in place
+            would mean reporting results that are not this attempt's.
+    """
+    from boto3.dynamodb.conditions import Key as _Key
+
+    deleted = 0
+    start_key = None
+    pages = 0
+    while True:
+        kwargs = {
+            "KeyConditionExpression": (
+                _Key("video_id").eq(video_id) & _Key("frame_number").gte(int(keep_count))
+            ),
+            "ProjectionExpression": "video_id, frame_number",
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        response = table.query(**kwargs)
+
+        for item in response.get("Items", []) or []:
+            table.delete_item(
+                Key={
+                    "video_id": item["video_id"],
+                    "frame_number": item["frame_number"],
+                }
+            )
+            deleted += 1
+
+        start_key = response.get("LastEvaluatedKey")
+        pages += 1
+        if not start_key or pages >= MAX_SCAN_PAGES:
+            break
+
+    return deleted
+
+
+def check_pending_frames(video_id=None, on_progress=None, attempt=None):
     """Audit every frame currently marked `pending_audit`.
 
     Each processed frame ends in exactly one terminal state: STATUS_AUDITED
@@ -306,8 +370,18 @@ def check_pending_frames(video_id=None):
     One frame failing does not abort the batch, but the failure is recorded
     rather than silently skipped.
 
+    Args:
+        video_id: restrict the batch to one video.
+        on_progress: optional callable `(audited, failed)` invoked after each
+            frame. The pipeline uses it to extend its lease and to confirm it
+            still holds the job. Exceptions from it are **not** caught: a
+            worker that has been fenced off must stop writing frame results
+            that belong to a superseded attempt, so raising here is the
+            intended way to abort the batch.
+        attempt: job attempt number, stored on each frame row for traceability.
+
     Returns:
-        dict: {"pending": int, "audited": int, "failed": int}
+        dict: {"pending": int, "audited": int, "failed": int, "detections": int}
 
     Raises:
         FrameAuditError: if the pending frames cannot be enumerated at all.
@@ -398,7 +472,7 @@ def check_pending_frames(video_id=None):
             summary["failed"] += 1
 
         try:
-            stored = _record_frame_result(vid, fnum, status, analysis)
+            stored = _record_frame_result(vid, fnum, status, analysis, attempt)
         except Exception as e:
             # The result could not be persisted, so do not report an audit
             # that was never stored.
@@ -409,17 +483,22 @@ def check_pending_frames(video_id=None):
                 "Could not persist audit result for frame %s/%s: %s",
                 vid, fnum, type(e).__name__,
             )
-            continue
-
-        # Log counts only. The analysis body contains scene descriptions of
-        # user video content and must not be written to logs.
-        if status == STATUS_AUDITED:
-            summary["detections"] += stored
-            logger.info(
-                "Frame %s/%s audited: %d detection(s) stored", vid, fnum, stored
-            )
         else:
-            logger.warning("Frame %s/%s marked %s", vid, fnum, STATUS_FAILED)
+            # Log counts only. The analysis body contains scene descriptions
+            # of user video content and must not be written to logs.
+            if status == STATUS_AUDITED:
+                summary["detections"] += stored
+                logger.info(
+                    "Frame %s/%s audited: %d detection(s) stored", vid, fnum, stored
+                )
+            else:
+                logger.warning("Frame %s/%s marked %s", vid, fnum, STATUS_FAILED)
+
+        # Heartbeat and fence check. Deliberately outside every try above:
+        # if the caller raises here, the batch stops, which is what a worker
+        # that has lost its lease must do.
+        if on_progress is not None:
+            on_progress(summary["audited"], summary["failed"])
 
     logger.info(
         "Audit batch complete: %d audited, %d failed, of %d pending",

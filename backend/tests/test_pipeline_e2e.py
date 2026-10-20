@@ -175,12 +175,53 @@ def test_analyze_denies_cross_user_submission(
     assert client.post(f"/analyze/{body['video_id']}", headers=mallory).status_code == 404
 
 
-def test_analyze_requires_the_file_to_exist(
+def test_analyze_requires_a_retrievable_source(
+    client, fake_db, upload_dir, alice, no_background, fake_s3
+):
+    """A job whose source bytes are gone must be refused, not queued.
+
+    Phase 4.1 moved the source to S3, so "gone" now means the object is
+    absent and no legacy local file remains. The property under test is
+    unchanged: a video the pipeline could never read must not be accepted.
+    """
+    body = _upload(client, alice).json()
+    fake_s3.objects.clear()
+
+    # The record still carries an s3_key, so the submit-time check passes and
+    # the worker is the one that discovers the object is gone. That is the
+    # deliberate design - see `_require_source` - so drive the worker and
+    # assert the job fails truthfully rather than hanging.
+    client.post(f"/analyze/{body['video_id']}", headers=alice)
+    result = pipeline.run_job(body["video_id"])
+
+    assert result["state"] == JobState.FAILED.value
+    job = client.get(f"/jobs/{body['video_id']}", headers=alice).json()
+    assert job["state"] == JobState.FAILED.value
+    assert "no longer available" in job["error_summary"].lower()
+    # The safe message must not name the bucket, key, or a botocore class.
+    assert "s3" not in job["error_summary"].lower()
+
+
+def test_analyze_refuses_a_legacy_record_with_no_source_at_all(
     client, fake_db, upload_dir, alice, no_background
 ):
+    """A pre-4.1 record whose local file is gone is refused at submit time.
+
+    For those records the local file genuinely is the only copy, so there is
+    nothing for a worker to discover and the request is rejected outright.
+    """
     body = _upload(client, alice).json()
-    (upload_dir / body["filename"]).unlink()
-    assert client.post(f"/analyze/{body['video_id']}", headers=alice).status_code == 404
+    vid = body["video_id"]
+    # Strip the durable reference to make this look like a legacy upload.
+    collection = fake_db["videos"]
+    for doc in collection.docs:
+        if doc["video_id"] == vid:
+            doc["s3_key"] = None
+            doc["s3_bucket"] = None
+
+    response = client.post(f"/analyze/{vid}", headers=alice)
+    assert response.status_code == 404
+    assert "no longer available" in response.json()["detail"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +439,9 @@ def test_worker_refuses_a_job_it_cannot_claim(client, fake_db, upload_dir, alice
         result = _run_worker(fake_db, vid, upload_dir, body["filename"])
 
     assert result["skipped"] is True
-    assert result["reason"] == "not_queued"
+    # Phase 4.1 renamed this: the claim now checks the lease as well as the
+    # state, so "not queued" is only one of the reasons it can fail.
+    assert result["reason"] == "not_claimable"
     assert not extract.called, "the worker ran without claiming the job"
 
     job = client.get(f"/jobs/{vid}", headers=alice).json()

@@ -43,15 +43,19 @@ import ffmpeg
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
+import aws_resources
 from config import get_settings
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-S3_BUCKET = os.getenv("S3_BUCKET_NAME", "novaflow-media")
-DYNAMO_TABLE = os.getenv("DYNAMODB_TABLE_NAME", "NovaFlowFrames")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+# Resource names come from aws_resources (Phase 4.1), the single place they
+# are defined. The module-level names are kept for the tests and tooling that
+# refer to them.
+S3_BUCKET = aws_resources.media_bucket()
+DYNAMO_TABLE = aws_resources.frames_table_name()
+AWS_REGION = aws_resources.aws_region()
 
 # Initialize AWS clients
 s3_client = boto3.client("s3", region_name=AWS_REGION)
@@ -292,7 +296,7 @@ def _store_frame(
     continued without incrementing the counter, which silently reused the same
     key and frame number for the next frame and corrupted the sequence.
     """
-    s3_key = f"frames/{video_id}/frame_{frame_number:04d}.jpg"
+    s3_key = aws_resources.frame_key(video_id, frame_number)
 
     s3_client.put_object(
         Bucket=S3_BUCKET,

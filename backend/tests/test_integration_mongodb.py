@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -466,3 +467,277 @@ async def test_initialize_database_against_a_real_server(patched_db):
         "video_indexes": True,
         "user_index": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.1: claims, leases, and recovery against a real server
+# ---------------------------------------------------------------------------
+#
+# These matter more than most integration tests in this file. The fencing
+# guarantee rests on `update_one` applying at most one update for a filter
+# that includes the expected state and the claim id, and on `$or` over a
+# missing field behaving the way the in-memory substitute assumes. Both are
+# server behaviours, not application logic, so the fake could agree with the
+# application and both could be wrong.
+
+async def _seed_queued(video_id, owner="alice"):
+    """Register a video and leave it queued, as upload + submit does."""
+    import video_repo
+    from job_state import JobState
+
+    await video_repo.record_video(
+        video_id=video_id,
+        owner=owner,
+        stored_filename=f"{video_id}.mp4",
+        original_filename="clip.mp4",
+        extension="mp4",
+        size_bytes=1024,
+        s3_bucket="test-bucket",
+        s3_key=f"sources/{video_id}/source.mp4",
+    )
+    await video_repo.transition(video_id, JobState.QUEUED, expected=JobState.UPLOADED)
+    return video_id
+
+
+async def _expire_lease(database, video_id, minutes=10):
+    await database["videos"].update_one(
+        {"video_id": video_id},
+        {"$set": {
+            "lease_expires_at": datetime.now(timezone.utc) - timedelta(minutes=minutes),
+            "updated_at": datetime.now(timezone.utc) - timedelta(minutes=minutes),
+        }},
+    )
+
+
+async def test_the_source_reference_round_trips_through_the_driver(patched_db):
+    import source_store
+    import video_repo
+
+    await _seed_queued("vid_real0001")
+    record = await video_repo.get_video("vid_real0001")
+
+    assert record["s3_bucket"] == "test-bucket"
+    assert record["s3_key"] == "sources/vid_real0001/source.mp4"
+    assert source_store.has_durable_source(record) is True
+
+
+async def test_only_one_claim_wins_against_a_real_server(patched_db):
+    """The real conditional update, not the fake's emulation of it."""
+    import video_repo
+    from job_state import InvalidTransition, JobState
+
+    await _seed_queued("vid_real0002")
+
+    _record, claim_id = await video_repo.claim(
+        "vid_real0002", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+    assert claim_id
+
+    with pytest.raises(InvalidTransition):
+        await video_repo.claim(
+            "vid_real0002", JobState.EXTRACTING, expected=JobState.QUEUED
+        )
+
+
+async def test_a_fenced_write_is_refused_by_the_real_server(patched_db):
+    import video_repo
+    from job_state import JobState
+    from video_repo import ClaimLost
+
+    await _seed_queued("vid_real0003")
+    await video_repo.claim(
+        "vid_real0003", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+
+    with pytest.raises(ClaimLost):
+        await video_repo.transition(
+            "vid_real0003",
+            JobState.ANALYZING,
+            expected=JobState.EXTRACTING,
+            claim_id="a-claim-that-never-held-this-job",
+        )
+
+    record = await video_repo.get_video("vid_real0003")
+    assert record["status"] == JobState.EXTRACTING.value
+
+
+async def test_heartbeat_extends_a_real_lease(patched_db):
+    import video_repo
+    from job_state import JobState
+
+    await _seed_queued("vid_real0004")
+    _record, claim_id = await video_repo.claim(
+        "vid_real0004", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+
+    # Pull the lease back so the extension is unambiguously observable.
+    await _expire_lease(patched_db, "vid_real0004", minutes=5)
+    await video_repo.heartbeat("vid_real0004", claim_id)
+
+    after = (await video_repo.get_video("vid_real0004"))["lease_expires_at"]
+    if after.tzinfo is None:
+        after = after.replace(tzinfo=timezone.utc)
+    assert after > datetime.now(timezone.utc)
+
+
+async def test_a_fenced_heartbeat_is_refused_by_the_real_server(patched_db):
+    import video_repo
+    from job_state import JobState
+    from video_repo import ClaimLost
+
+    await _seed_queued("vid_real0005")
+    await video_repo.claim(
+        "vid_real0005", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+
+    with pytest.raises(ClaimLost):
+        await video_repo.heartbeat("vid_real0005", "not-this-workers-claim")
+
+
+async def test_an_expired_lease_is_found_and_reclaimed(patched_db):
+    import video_repo
+    from job_state import JobState
+
+    await _seed_queued("vid_real0006")
+    await video_repo.claim(
+        "vid_real0006", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+    await _expire_lease(patched_db, "vid_real0006")
+
+    abandoned = await video_repo.find_expired_leases()
+    assert "vid_real0006" in [r["video_id"] for r in abandoned]
+
+    updated = await video_repo.reclaim(
+        next(r for r in abandoned if r["video_id"] == "vid_real0006")
+    )
+    assert updated["status"] == JobState.QUEUED.value
+    assert updated["claim_id"] is None
+    assert updated["recovered_count"] == 1
+
+
+async def test_a_live_lease_is_not_reported_abandoned_by_the_real_server(patched_db):
+    import video_repo
+    from job_state import JobState
+
+    await _seed_queued("vid_real0007")
+    await video_repo.claim(
+        "vid_real0007", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+
+    abandoned = await video_repo.find_expired_leases()
+
+    assert "vid_real0007" not in [r["video_id"] for r in abandoned]
+
+
+async def test_a_double_reclaim_is_refused_by_the_real_server(patched_db):
+    """Two schedulers reading the same record must not both consume an attempt."""
+    import video_repo
+    from job_state import JobState
+
+    await _seed_queued("vid_real0008")
+    await video_repo.claim(
+        "vid_real0008", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+    await _expire_lease(patched_db, "vid_real0008")
+
+    snapshot = await video_repo.get_video("vid_real0008")
+    first = await video_repo.reclaim(snapshot)
+    second = await video_repo.reclaim(snapshot)
+
+    assert first is not None
+    assert second is None
+    assert (await video_repo.get_video("vid_real0008"))["attempt"] == 2
+
+
+async def test_a_legacy_record_with_no_lease_fields_is_claimable(patched_db):
+    """`{"claim_id": None}` must match a document where the field is absent.
+
+    The lease filter depends on that server behaviour. A pre-4.1 record has no
+    claim_id at all, and if the filter failed to match it, the record could
+    never be claimed again - permanently stuck, by the very mechanism added to
+    rescue stuck jobs.
+    """
+    import video_repo
+    from job_state import JobState
+
+    await patched_db["videos"].insert_one({
+        "video_id": "vid_legacy99",
+        "owner": "alice",
+        "stored_filename": "vid_legacy99.mp4",
+        "status": "queued",
+        "attempt": 1,
+    })
+
+    record, claim_id = await video_repo.claim(
+        "vid_legacy99", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+
+    assert record["status"] == JobState.EXTRACTING.value
+    assert record["claim_id"] == claim_id
+
+
+async def test_recovery_sweep_is_idempotent_against_a_real_server(patched_db):
+    import pipeline
+    import video_repo
+    from job_state import JobState
+
+    await _seed_queued("vid_real0009")
+    await video_repo.claim(
+        "vid_real0009", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+    await _expire_lease(patched_db, "vid_real0009")
+
+    first = await pipeline.recover_abandoned_jobs(dispatch=None)
+    second = await pipeline.recover_abandoned_jobs(dispatch=None)
+
+    assert first["requeued"] >= 1
+    assert second["requeued"] == 0
+    assert (await video_repo.get_video("vid_real0009"))["attempt"] == 2
+
+
+async def test_reclaim_fails_a_job_past_its_attempt_budget(patched_db):
+    import video_repo
+    from job_state import MAX_ATTEMPTS, JobState
+
+    await _seed_queued("vid_real0010")
+    await video_repo.claim(
+        "vid_real0010", JobState.EXTRACTING, expected=JobState.QUEUED
+    )
+    await patched_db["videos"].update_one(
+        {"video_id": "vid_real0010"}, {"$set": {"attempt": MAX_ATTEMPTS}}
+    )
+    await _expire_lease(patched_db, "vid_real0010")
+
+    updated = await video_repo.reclaim(await video_repo.get_video("vid_real0010"))
+
+    assert updated["status"] == JobState.FAILED.value
+    assert "interrupted" in updated["error_summary"].lower()
+
+
+async def test_delete_video_removes_only_the_named_record(patched_db):
+    """The compensating cleanup must not take anything else with it."""
+    import video_repo
+
+    await _seed_queued("vid_real0011", owner="alice")
+    await _seed_queued("vid_real0012", owner="bob")
+
+    assert await video_repo.delete_video("vid_real0011") is True
+
+    with pytest.raises(video_repo.OwnershipUnknown):
+        await video_repo.get_video("vid_real0011")
+    assert (await video_repo.get_video("vid_real0012"))["owner"] == "bob"
+
+
+async def test_the_status_index_exists_for_the_recovery_sweep(patched_db):
+    """The sweep queries on status; without the index it is a collection scan."""
+    import video_repo
+
+    await video_repo.ensure_indexes()
+    information = await patched_db["videos"].index_information()
+
+    indexed = {
+        tuple(field for field, _direction in spec["key"])
+        for spec in information.values()
+    }
+    assert ("status",) in indexed
+    assert ("video_id",) in indexed
