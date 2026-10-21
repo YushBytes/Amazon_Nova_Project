@@ -322,6 +322,18 @@ class FakeFramesTable:
         self.items[(item["video_id"], int(item["frame_number"]))] = item
         return {}
 
+    def get_item(self, Key=None, **kwargs):
+        """Read one frame row by its full key.
+
+        Phase 8: the remediation routes address a single finding by
+        (video_id, frame_number), so a point read is the correct and cheapest
+        call. Mirrors the real service in the way that matters - a miss
+        returns a response with NO "Item" key rather than raising.
+        """
+        key = (Key["video_id"], int(Key["frame_number"]))
+        item = self.items.get(key)
+        return {"Item": dict(item)} if item is not None else {}
+
     def update_item(self, Key=None, UpdateExpression="", ExpressionAttributeNames=None,
                     ExpressionAttributeValues=None, **kwargs):
         key = (Key["video_id"], int(Key["frame_number"]))
@@ -671,7 +683,11 @@ def fake_db(monkeypatch):
 
     monkeypatch.setattr(db_module, "get_database", _get_database)
 
-    for module_name in ("auth", "video_repo", "db_init"):
+    # Every module that does `from db import get_database`, which binds its
+    # own reference. Phase 8 added remediation_repo; a module missing from
+    # this list silently reaches the real MongoDB and the test fails with a
+    # connection timeout rather than an assertion.
+    for module_name in ("auth", "video_repo", "db_init", "remediation_repo"):
         if module_name in sys.modules:
             monkeypatch.setattr(
                 sys.modules[module_name], "get_database", _get_database, raising=False

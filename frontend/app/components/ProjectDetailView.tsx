@@ -46,12 +46,17 @@ import {
   describeError,
   fetchAllViolations,
   fetchJob,
+  fetchRemediationCapabilities,
+  fetchRemediations,
+  findingKey,
   formatBytes,
   isAbortError,
   retryAnalysis,
   startAnalysis,
   type Detection,
   type Job,
+  type Remediation,
+  type RemediationCapabilities,
   type Submission,
 } from "../lib/api";
 import {
@@ -62,6 +67,7 @@ import {
   type Verdict,
 } from "../lib/jobs";
 import { EmptyState, ErrorBanner, LoadingPanel, StatusBadge } from "./ui/Feedback";
+import RemediationPanel from "./RemediationPanel";
 import ViolationList from "./ViolationList";
 
 export type { Submission };
@@ -87,6 +93,18 @@ export default function ProjectDetailView({
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [actionNotice, setActionNotice] = React.useState<string | null>(null);
+  // Phase 8. Null while loading; undefined when the capability read failed,
+  // in which case no remediation control is offered rather than one that
+  // guesses at what the server supports.
+  const [capabilities, setCapabilities] = React.useState<
+    RemediationCapabilities | null | undefined
+  >(null);
+  // Keyed by "frame:index" - the address the backend uses for a finding. One
+  // owner for the list, so a decision made in one panel is reflected
+  // everywhere without a refetch.
+  const [remediations, setRemediations] = React.useState<
+    Record<string, Remediation>
+  >({});
   const [actionBusy, setActionBusy] = React.useState(false);
   const [reloadToken, setReloadToken] = React.useState(0);
   const videoRef = React.useRef<HTMLVideoElement>(null);
@@ -113,8 +131,47 @@ export default function ProjectDetailView({
           });
           if (cancelled) return;
           setDetections(results.detections);
+
+          // Remediation is only meaningful for a completed analysis, so these
+          // two reads happen here rather than on mount. Each failure is
+          // handled on its own: an unreadable capability response must not
+          // discard the audit, and vice versa.
+          try {
+            const caps = await fetchRemediationCapabilities({
+              signal: controller.signal,
+            });
+            if (!cancelled) setCapabilities(caps);
+          } catch (capsError) {
+            // `undefined` means "unknown", which the panel renders as no
+            // control at all. A deployment with remediation disabled answers
+            // 404 here, and that is a legitimate answer, not an error worth
+            // showing over the audit.
+            if (!cancelled && !isAbortError(capsError)) setCapabilities(undefined);
+          }
+
+          try {
+            const existing = await fetchRemediations(videoId, {
+              signal: controller.signal,
+            });
+            if (!cancelled) {
+              setRemediations(
+                Object.fromEntries(
+                  existing.map((record) => [
+                    findingKey(record.frame_number, record.detection_index),
+                    record,
+                  ])
+                )
+              );
+            }
+          } catch (listError) {
+            // Leave the map empty: a panel with no record offers "propose",
+            // and the backend makes a duplicate proposal idempotent, so the
+            // worst case is one redundant request rather than a second record.
+            if (!cancelled && !isAbortError(listError)) setRemediations({});
+          }
         } else {
           setDetections([]);
+          setRemediations({});
         }
       } catch (err) {
         if (cancelled || isAbortError(err)) return;
@@ -140,6 +197,19 @@ export default function ProjectDetailView({
   const verdict = verdictFor(job, detections.length);
   const VerdictIcon = VERDICT_ICONS[verdict];
   const tone = toneForVerdict(verdict);
+
+  /**
+   * Adopt a record returned by a decision.
+   *
+   * Keyed by the finding's address rather than by the remediation id, so a
+   * fresh proposal for the same finding replaces the entry the panel renders.
+   */
+  const handleRemediationChanged = React.useCallback((record: Remediation) => {
+    setRemediations((previous) => ({
+      ...previous,
+      [findingKey(record.frame_number, record.detection_index)]: record,
+    }));
+  }, []);
 
   /** Jump playback to a finding. */
   const seekTo = React.useCallback((seconds: number) => {
@@ -381,7 +451,29 @@ export default function ProjectDetailView({
             </h3>
 
             {verdict === "flagged" && detections.length > 0 ? (
-              <ViolationList detections={detections} onSeek={seekTo} />
+              <ViolationList
+                detections={detections}
+                onSeek={seekTo}
+                renderActions={(detection) => (
+                  <RemediationPanel
+                    videoId={videoId}
+                    detection={detection}
+                    capabilities={capabilities}
+                    record={
+                      typeof detection.frame_number === "number" &&
+                      typeof detection.detection_index === "number"
+                        ? remediations[
+                            findingKey(
+                              detection.frame_number,
+                              detection.detection_index
+                            )
+                          ] ?? null
+                        : null
+                    }
+                    onChanged={handleRemediationChanged}
+                  />
+                )}
+              />
             ) : verdict === "clean" ? (
               <EmptyState
                 title="No violations recorded"

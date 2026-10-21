@@ -23,6 +23,7 @@ endpoint says so on screen rather than showing invented data — see
 | Dashboard (agent only) | `POST /upload-reel`, `POST /analyze/{id}`, `GET /jobs/{id}`, `GET /violations/{id}`, `POST /analyze/{id}/retry` | Upload → audit → findings, with job-state polling. |
 | Your Videos | `GET /submissions` | The caller's own uploads only, with each one's real job state. |
 | Audit detail | `GET /jobs/{id}`, `GET /violations/{id}` | The verdict and the findings. Can also start or re-run an analysis. |
+| Remediation (inside the audit detail) | `GET /remediations/capabilities`, `GET|POST /remediations`, `POST /remediations/{id}/approve|reject|cancel|execute` | Propose a change for a finding, review it, approve or reject it. **Generates nothing and modifies no video.** |
 | Compliance Log | `GET /submissions` | The caller's audit history, filterable by real job state. |
 | Infrastructure (agent only) | `GET /health/worker` | Job-queue counts and inferred worker health. |
 | Account | `GET /auth/me` (via the auth context) | The signed-in identity. Nothing else; see below. |
@@ -44,6 +45,12 @@ These panels state that a capability does not exist instead of simulating it:
   browser's token; it does **not** revoke it server-side, and the panel says so.
 - **Per-worker telemetry.** `/health/worker` infers queue health; it does not
   contact the worker process. The endpoint's own caveat is rendered.
+- **Automated remediation image generation.** The remediation panel offers
+  approval and rejection, which are real. It offers **no** generate control,
+  because `GET /remediations/capabilities` reports
+  `generation_available: false` on every deployment — no image provider is
+  implemented. The panel shows the backend's own reason rather than a button
+  that would 503. See `../docs/REMEDIATION.md`.
 
 ### Removed in Phase 7
 
@@ -122,13 +129,13 @@ the UI advertises a limit the server refuses.
 ## Checks
 
 ```bash
-npm test          # 263 tests (Vitest + @testing-library/react, jsdom)
+npm test          # 333 tests (Vitest + @testing-library/react, jsdom)
 npm run typecheck # tsc --noEmit
 npm run lint      # eslint app
 npm run build     # next build
 ```
 
-All four pass as of Phase 7: 263 tests, 0 type errors, **0 lint errors and 0
+All four pass as of Phase 8: 333 tests, 0 type errors, **0 lint errors and 0
 lint warnings**, and a successful build of `/`, `/_not-found` and `/login`.
 
 **Order matters after deleting a route.** `npm run typecheck` reads generated
@@ -177,6 +184,15 @@ against a live backend, and no browser-automation stack. That is Phase 10.
 > persisted. An empty detections list means "no violations found" only in that
 > state. In any other state an empty list means *unknown*.
 
+`app/lib/remediation.ts` owns the equivalent rule for a remediation record,
+and it is stricter: a remediation may be described as compliant only when the
+server's own `is_compliance_claim` field is true, which happens only in the
+`verified` state. This module never derives that from the state string, and a
+missing field reads as "no". So `approved` renders as "Approved, not
+generated", `asset_ready` as "Asset ready, video unchanged", and `applied` as
+"Applied, not verified" — each naming exactly the thing a reader would
+otherwise assume.
+
 So a failed or still-running analysis is never rendered as compliant, and a
 missing confidence stays missing rather than becoming a fabricated `0%`.
 
@@ -214,8 +230,14 @@ enumerated.
 - **Bounding-box overlays assume the `[ymin, xmin, ymax, xmax]` 0–1000 form**
   from `backend/prompts.py`, and are positioned as percentages of the player
   box — so they are only correct when the video fills it.
+- **Remediation is review only.** The panel can propose, approve, reject and
+  withdraw. It cannot generate an image, change a video, or verify
+  compliance, and it says so. Approval is per-finding with no bulk action,
+  deliberately: a bulk approve over unmeasured detections is a way to approve
+  things unread. The panel does not poll — a decision updates its record in
+  place, and other changes need a reload.
 - **Nothing here has been exercised against live AWS or Bedrock.** No claim is
-  made about detection accuracy.
+  made about detection accuracy, and no video has ever been corrected.
 
 See `../CLAUDE.md` §5 for the backend's remaining gaps and `../README.md` for
 the system as a whole.

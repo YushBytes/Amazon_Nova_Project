@@ -143,8 +143,18 @@ async def test_initialize_database_is_safe_with_duplicates(fake_db):
 
 
 async def test_initialize_database_on_a_clean_database(fake_db):
+    """Every initialization step reports success on a clean database.
+
+    Asserted as an exact set, deliberately: a new step must be added here
+    consciously, so an initialization step cannot be introduced without a test
+    acknowledging it exists. Phase 8 added `remediation_indexes`.
+    """
     results = await db_init.initialize_database(strict=False)
-    assert results == {"video_indexes": True, "user_index": True}
+    assert results == {
+        "video_indexes": True,
+        "remediation_indexes": True,
+        "user_index": True,
+    }
 
 
 # ---------------------------------------------------------------------------

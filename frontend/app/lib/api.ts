@@ -13,6 +13,10 @@
  *   GET  /violations/{id}     -> { detections[], counts, next_cursor, job }
  *   GET  /submissions         -> { submissions[] }  the caller's own uploads
  *   GET  /health/worker       -> queue counts, inferred worker health
+ *   GET  /remediations/capabilities      -> what this deployment can do
+ *   GET|POST /remediations                -> list for a video | propose
+ *   GET  /remediations/{id}               -> one record
+ *   POST /remediations/{id}/approve|reject|cancel|execute
  *
  * `GET /jobs/{id}` is authoritative for progress: treat an empty `detections`
  * list as "no violations found" ONLY when `state === "completed"`, because
@@ -516,6 +520,16 @@ export interface Detection {
   timestamp?: number;
   /** The frame this detection came from; added by /violations. */
   frame_number?: number;
+  /**
+   * This detection's position within its frame's stored list; added by
+   * /violations in Phase 8.
+   *
+   * Together with the video id and `frame_number` it is how the remediation
+   * API addresses a finding. It cannot be derived here: /violations flattens
+   * detections across frames, so list position in this array is not the index
+   * within a frame.
+   */
+  detection_index?: number;
 }
 
 /** A detection whose bounding box is present and well formed. */
@@ -716,4 +730,240 @@ export async function fetchWorkerHealth(
   } catch {
     throw new ApiError("The server returned a malformed response", res.status);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Remediation (Phase 8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Remediation lifecycle, mirroring `backend/remediation_state.py`.
+ *
+ * These are seven different statements about the world and none may be
+ * inferred from another. In particular `approved` does not mean an image was
+ * generated, `asset_ready` does not mean the video changed, `applied` does not
+ * mean the result is compliant, and ONLY `verified` may be described as
+ * compliant - and it is reachable only after a completed re-analysis.
+ *
+ * `processing` onwards are unreachable in this build: no image provider is
+ * implemented and nothing reconstructs a video. They are typed because the
+ * backend defines them, not because the UI can ever receive them.
+ */
+export type RemediationState =
+  | "proposed"
+  | "approved"
+  | "processing"
+  | "asset_ready"
+  | "applied"
+  | "verifying"
+  | "verified"
+  | "rejected"
+  | "cancelled"
+  | "superseded"
+  | "failed"
+  | "verification_failed";
+
+/** How the finding's confidence compared with the configured threshold. */
+export type ConfidenceGate = "pass" | "below_threshold" | "not_reported";
+
+/** The evidence snapshot the proposal was built from. */
+export interface RemediationFinding {
+  frame_number: number;
+  detection_index: number;
+  category: string;
+  description?: string;
+  risk_level?: string | null;
+  confidence?: number | null;
+  bounding_box?: number[] | null;
+  timestamp_seconds?: number | null;
+}
+
+/** What is proposed, and on what basis. All of it server-derived. */
+export interface RemediationProposal {
+  action: string;
+  summary: string;
+  rationale: string;
+  /** The model's own words, quoted and attributed. Never evidence. */
+  model_claim: string;
+  target_description: string;
+  limitations: string;
+  requires_approval: boolean;
+  confidence_gate: ConfidenceGate | string;
+  gate_explanation: string;
+}
+
+export interface Remediation {
+  remediation_id: string;
+  video_id: string;
+  frame_number: number;
+  detection_index: number;
+  state: RemediationState;
+  /** Human-readable label written by the backend. Not a percentage. */
+  stage: string;
+  is_terminal: boolean;
+  is_active: boolean;
+  /**
+   * The single authoritative answer to "may this be called compliant?".
+   * Computed server-side so no client has to re-derive the rule.
+   */
+  is_compliance_claim: boolean;
+  /** Whether an OUTPUT video exists. The upload is never overwritten. */
+  source_video_modified: boolean;
+  finding: RemediationFinding;
+  proposal: RemediationProposal;
+  approved_by: string | null;
+  approved_at: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_note: string | null;
+  provider: string | null;
+  provider_model_id: string | null;
+  /** Presence only. The storage key is never sent to a client. */
+  has_asset: boolean;
+  asset_bytes: number | null;
+  asset_content_type: string | null;
+  output_video_id: string | null;
+  verification_video_id: string | null;
+  verified_at: string | null;
+  error_code: string | null;
+  error_summary: string | null;
+  attempt: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * What GET /remediations/capabilities reports.
+ *
+ * Read before rendering any remediation control: it is how the UI knows
+ * whether generation exists on this deployment rather than guessing.
+ */
+export interface RemediationCapabilities {
+  remediation_enabled: boolean;
+  proposals_supported: boolean;
+  generation_available: boolean;
+  generation_provider: string;
+  generation_unavailable_reason: string | null;
+  min_confidence: number;
+  applies_assets_to_video: boolean;
+  verifies_compliance: boolean;
+  notes: string;
+}
+
+/** Read this deployment's remediation capabilities. */
+export async function fetchRemediationCapabilities(
+  options: RequestOptions = {}
+): Promise<RemediationCapabilities> {
+  return requestJson<RemediationCapabilities>(
+    "/remediations/capabilities",
+    { method: "GET" },
+    "Could not read remediation capabilities",
+    options
+  );
+}
+
+/** List the caller's remediation records for one video. */
+export async function fetchRemediations(
+  videoId: string,
+  options: RequestOptions = {}
+): Promise<Remediation[]> {
+  const data = await requestJson<{ remediations?: unknown }>(
+    `/remediations?video_id=${encodeURIComponent(videoId)}`,
+    { method: "GET" },
+    "Could not load remediations",
+    options
+  );
+  return Array.isArray(data?.remediations)
+    ? (data.remediations as Remediation[])
+    : [];
+}
+
+/**
+ * Propose a remediation for one finding.
+ *
+ * Addresses the finding positionally, which is how the backend stores it:
+ * (video_id, frame_number, detection_index). Creates nothing but a proposal -
+ * no provider is called and no video is touched.
+ *
+ * Not retried automatically. The backend makes a repeat for the same finding
+ * idempotent (it returns the open record with 200), but a retry is still the
+ * user's action.
+ */
+export async function createRemediation(
+  videoId: string,
+  frameNumber: number,
+  detectionIndex: number,
+  options: RequestOptions = {}
+): Promise<Remediation> {
+  return requestJson<Remediation>(
+    "/remediations",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        video_id: videoId,
+        frame_number: frameNumber,
+        detection_index: detectionIndex,
+      }),
+    },
+    "Could not create a remediation proposal",
+    options
+  );
+}
+
+/** The owner decisions the backend accepts on a record. */
+export type RemediationDecision = "approve" | "reject" | "cancel";
+
+/**
+ * Record an owner decision.
+ *
+ * The approving identity is taken from the session token server-side; nothing
+ * here sends a user, an owner or a role, because the backend would ignore it
+ * and sending one would imply the client could choose.
+ */
+export async function decideRemediation(
+  remediationId: string,
+  decision: RemediationDecision,
+  note?: string,
+  options: RequestOptions = {}
+): Promise<Remediation> {
+  return requestJson<Remediation>(
+    `/remediations/${encodeURIComponent(remediationId)}/${decision}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: note ?? null }),
+    },
+    `Could not ${decision} this remediation`,
+    options
+  );
+}
+
+/**
+ * Attempt an approved remediation.
+ *
+ * Expect this to fail with 503 on every current deployment: no image provider
+ * is implemented. The backend leaves the record `approved` when it refuses,
+ * so this is safe to call and safe to retry later.
+ */
+export async function executeRemediation(
+  remediationId: string,
+  options: RequestOptions = {}
+): Promise<Remediation> {
+  return requestJson<Remediation>(
+    `/remediations/${encodeURIComponent(remediationId)}/execute`,
+    { method: "POST" },
+    "Could not start this remediation",
+    options
+  );
+}
+
+/**
+ * Key a remediation by the finding it addresses.
+ *
+ * A detection carries `frame_number` from `/violations`; the index is its
+ * position within that frame's detections, which is how the backend names it.
+ */
+export function findingKey(frameNumber: number, detectionIndex: number): string {
+  return `${frameNumber}:${detectionIndex}`;
 }

@@ -51,7 +51,7 @@ reintroduced.
 | :-- | :-- | :-- |
 | `json` used but never imported at module scope | `backend/analyzer.py` | Module-scope imports added; each frame now reaches exactly one terminal state (`audited` / `audit_failed`), so a failure can no longer read as a clean frame. |
 | async `decode_token` called without `await` | `backend/projects.py` | `get_current_user` is async and awaits it; Phase 3 then centralised it in `auth.py`. |
-| Remediation returned its input unchanged | `backend/audit_manager.py` *(file deleted in Phase 5)* | The disguised mock was removed in Phase 2; the whole module went in Phase 5. Real Nova Canvas remediation is a later phase and is **not** implemented — do not re-add a stub that reports success. |
+| Remediation returned its input unchanged | `backend/audit_manager.py` *(file deleted in Phase 5)* | The disguised mock was removed in Phase 2; the whole module went in Phase 5. **Phase 8 resolved the scope question** (§9 q4) and built the reviewed proposal workflow; automated image generation is still **not** implemented, and `image_provider.NullImageProvider.generate` raises rather than returning anything. Do not re-add a stub that reports success. |
 
 **Phase 4** connected the pipeline end to end: a validated job state machine,
 real extraction/analysis stages, validated model output, and persisted results.
@@ -93,7 +93,7 @@ Amazon Nova/                         <- project root (flattened in Phase 0; hold
 - **Frontend:** Next.js 16.1.6, React 19.2.3, TypeScript 5.9.3 (`strict: true`), Tailwind CSS v4, Framer Motion, lucide-react.
 - **Backend:** FastAPI + Uvicorn, `python-jose` JWT (HS256), `motor` (async MongoDB), `boto3`.
 - **AI:** Amazon Bedrock, model `amazon.nova-pro-v1:0`. *(Docs say "Nova 2 Pro"; code says `nova-pro-v1:0`. Unresolved.)*
-- **Storage:** S3 for **both** source videos (`sources/`) and frame JPEGs (`frames/`), one bucket named by `S3_BUCKET_NAME`; DynamoDB (`NovaFlowFrames`, `NovaFlowProjects`) for metadata; MongoDB for accounts (`novaflow.users`) and ownership plus job state (`novaflow.videos`). Local `backend/uploads/` is **read-only legacy** — pre-Phase-4.1 records only; new uploads never land there.
+- **Storage:** S3 for **both** source videos (`sources/`) and frame JPEGs (`frames/`), one bucket named by `S3_BUCKET_NAME`; DynamoDB (`NovaFlowFrames`, `NovaFlowProjects`) for metadata; MongoDB for accounts (`novaflow.users`), ownership plus job state (`novaflow.videos`), and remediation records (`novaflow.remediations`, Phase 8). Local `backend/uploads/` is **read-only legacy** — pre-Phase-4.1 records only; new uploads never land there.
 - **Video:** `ffmpeg-python` + the FFmpeg binary, 1 fps extraction.
 - **Deploy:** AWS Amplify (frontend only); `backend/Dockerfile` exists with no deployment definition. **Two backend processes** now: the API (`uvicorn app:app`) and the worker (`python backend/worker.py`). Both run from the same image; neither has a deployment definition. §9 question 9 is still open.
 
@@ -121,6 +121,9 @@ Browser (:3000)
   ├─ GET  /violations/{id} ───► DynamoDB NovaFlowFrames (paginated)
   ├─ GET  /submissions ───────► the caller's own videos
   ├─ GET  /uploads/{file}?access_token=… ► S3 stream, scoped media token
+  ├─ /remediations/* (7 routes, Phase 8) ► propose, review, decide
+  │        POST /remediations/{id}/execute ALWAYS 503: no image provider
+  │        exists, and the record is left `approved`, not failed.
   └─ /projects/* (6 routes)
 
   ⚠ POST /execute — returns placeholder text; the feature behind it is not
@@ -170,7 +173,7 @@ see `frontend/README.md` "Known limitations".
 - **Bounding-box schemas (partly resolved):** `backend/prompts.py` uses `bounding_box: [ymin,xmin,ymax,xmax]` and the frontend consumes that array form (`HUDView.tsx`), so it is the contract. The `box_2d` variant died with `audit_manager.py`; `detections.parse_frame_analysis` still tolerates it on input. ⚠️ `.agent/skills/video-audit/SKILL.md` still documents `{x,y,width,height}` + `timestamp_ms` and **is wrong** — correcting it is Phase 10.3.
 - ~~**Bucket mismatch**~~ **RESOLVED in Phase 5.** `infra/init_s3.py` and `infra/iam_policy.yaml` — which created and granted the unused `brand-guardian-*` buckets — were deleted. `infra/cloudformation/storage.yaml` is now the only provisioning path and provisions the bucket the code actually uses, and `infra/iam_policy_least_privilege.json` is the only policy. It covers DynamoDB.
 - ~~**Env var collision**~~ **RESOLVED in Phase 5.** `MONGO_URI` died with `audit_manager.py`; `MONGODB_URL` is the only connection-string variable, and a test asserts no module reads the old name or hardcodes a connection string.
-- ~~**`requirements.txt` omissions**~~ **RESOLVED in Phase 2**; every direct import is declared and pinned, and `test_dependencies.py` asserts it. Phase 5 removed `Pillow`, whose only importer was the deleted `audit_manager.py` — **frame remediation (Phase 8) must re-add it.**
+- ~~**`requirements.txt` omissions**~~ **RESOLVED in Phase 2**; every direct import is declared and pinned, and `test_dependencies.py` asserts it. Phase 5 removed `Pillow`, whose only importer was the deleted `audit_manager.py`. ⚠️ Phase 8 did **not** re-add it: nothing builds an inpainting mask, because no provider consumes one. **A real image provider must re-add and pin it** — see `docs/REMEDIATION.md` §6 step 3.
 
 ---
 
@@ -185,11 +188,11 @@ and `frontend/node_modules` is installed. Use the venv interpreter.
 git rev-parse --show-toplevel                      # ALWAYS run before committing
 python -m py_compile backend/*.py analyzer_nova.py prompts.py
 
-# Backend tests — 679 passed, 42 skipped
+# Backend tests — 925 passed, 42 skipped (Phase 8)
 ./.venv/Scripts/python.exe -m pytest backend/tests -q
 
-# Frontend — all four pass; lint reports 0 errors / 0 warnings (Phase 7)
-cd frontend && npm test          # 263 tests (Vitest), 14 files
+# Frontend — all four pass; lint reports 0 errors / 0 warnings
+cd frontend && npm test          # 333 tests (Vitest), 17 files
 cd frontend && npm run typecheck # tsc --noEmit, exit 0
 cd frontend && npm run lint      # "eslint app"
 cd frontend && npm run build     # routes: / , /_not-found , /login
@@ -263,6 +266,10 @@ Pre-existing application configuration:
 | `DYNAMODB_TABLE_NAME` | `aws_resources.frames_table_name()` only | `NovaFlowFrames` |
 | `DYNAMODB_PROJECTS_TABLE` | `aws_resources.projects_table_name()` only | `NovaFlowProjects` |
 | `MONGODB_URL` | `db.py` | `mongodb://localhost:27017` |
+| `REMEDIATION_ENABLED` | `config.load_remediation_enabled()` | `true` (`false` makes every `/remediations` route 404) |
+| `REMEDIATION_IMAGE_PROVIDER` | `config.load_remediation_image_provider()` | `none` (`nova-canvas` is accepted but **unimplemented**; anything else fails at startup) |
+| `REMEDIATION_MIN_CONFIDENCE` | `config.load_remediation_min_confidence()` | `0.8` — the first code to read the figure `docs/planning.md` has specified since Phase 1 |
+| `MAX_REMEDIATIONS_PER_VIDEO` | `config.load_max_remediations_per_video()` | `200` |
 | `MONGODB_DB_NAME` | `db.py` | `novaflow` |
 | `JOB_LEASE_SECONDS` | `video_repo` | `300` |
 | `RECOVER_JOBS_ON_STARTUP` | `app.py` | `true` |
@@ -318,6 +325,10 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **Never log a password, hash, token, signing key, or model analysis body.** Log counts, ids, and exception *types*. Tests assert this.
 - **Never put a secret in a `NEXT_PUBLIC_*` variable** — those are compiled into the browser bundle and are public.
 - **A job is `completed` only when analysis finished AND its results were persisted.** Never set that state from anywhere but `pipeline.run_job`'s final transition, and never infer it on the client. An empty detections list means nothing unless `job.state === "completed"` - that distinction is the whole point of the state machine.
+- **Never collapse the remediation states into one flag** (Phase 8). `proposed` is not approved, `approved` is not generated, `asset_ready` is not a changed video, `applied` is not compliant. **Only `verified` may be called compliant**, and it is reachable only from `verifying` — i.e. only after a completed re-analysis whose persisted results support the claim. `remediation_repo.view` answers this once in `is_compliance_claim`; never re-derive it from the state string. A `verification_failed` record is NOT clean.
+- **Do not add a Nova Canvas adapter without verifying the payload schema** against authoritative Bedrock documentation (§9 q4, `docs/REMEDIATION.md` §6). `image_provider.NullImageProvider.generate` raises and never returns an image; a provider that returned its input, a placeholder, or a fabricated success would reintroduce the exact defect Phase 2 removed. A test is named for it.
+- **Treat provider output as untrusted.** `image_provider.validate_image_bytes` derives the content type from the bytes and ignores the provider's declaration; a 2xx response is not evidence of an image.
+- **Re-read and re-fingerprint a finding before acting on a remediation.** A proposal addresses a finding positionally and a re-analysis overwrites the frame row, so a stale proposal must become `superseded` rather than be approved or executed.
 - **Add new job states to `job_state.py`'s transition table**, not as free-text. `video_repo.transition` validates every move and is conditional on the current state, which is what prevents two workers advancing one job.
 - **Report named stages, never percentages.** The frame total is unknown until extraction finishes, so any earlier percentage is invented.
 - **Frontend: derive every status from `app/lib/jobs.ts`** (Phase 7). `verdictFor` is the single place that decides whether an audit may be described as clean, and it refuses to for any state but `completed`. Four views share it; a view that re-derives a verdict locally is how the unconditional "Audit Passed" card happened. `jobStateOf` reads an unrecognised status as `uploaded` — the state that claims the least — rather than rendering it raw.
@@ -376,7 +387,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0 through 7 are **complete, committed, and pushed**.
+Phases 0 through 8 are **complete, committed, and pushed**.
 
 | Phase | What landed |
 | :-- | :-- |
@@ -389,6 +400,7 @@ Phases 0 through 7 are **complete, committed, and pushed**.
 | 5 | Dead code removed, storage configuration reconciled to one contract, README rewritten. |
 | 6 | Durable worker process, AWS client timeouts, retry classification with backoff, health/readiness probes, Scan replaced by Query on the request path. |
 | 7 | Frontend connected to real compliance data; every fabricated panel removed; findings rendered for the first time; accessibility, TypeScript and API-layer cleanup. |
+| 8 | Reviewed remediation workflow: proposal, owner approval, staleness detection, confidence gating, provider contract with a truthful unavailable state. **No image generated, no video modified.** |
 
 **Phase 5 detail.** Deleted: the orphaned MongoDB/GridFS pipeline (`audit_manager.py`, `verifier.py`, `check_count.py`), `debug_probe.py`, `aws_config.py`, `frontend_backup/` (72 files), the stray `frontend/Video Compliance Dashboard/`, the orphan `/agents` and `/logs` duplicate routes, `infra/init_s3.py`, and `infra/iam_policy.yaml` — 82 files. `S3_BUCKET_NAME` is now required in production and validated; `MONGO_URI` and `Pillow` are gone with their only consumer. Regression tests assert the deleted modules stay deleted, that nothing imports `gridfs`, and that nothing reimplements the bucket fallback.
 
@@ -412,11 +424,34 @@ client is now the only module reading `NEXT_PUBLIC_API_URL`. **No backend file
 was modified** — `git diff` touches `frontend/`, the two READMEs, `.env.example`
 and this file only.
 
-**Phases 5, 6 and 7 did NOT make the application production-ready.** Phase 5 made the architecture coherent; Phase 6 made job execution durable and removed a real class of data loss. Everything still open in §5 "Known remaining gaps" stands, and **nothing has ever run against real AWS or Bedrock** — no worker has run against real infrastructure and no process has been SIGKILLed, so crash recovery is verified as logic, not as observed behaviour.
+**Phases 5 through 8 did NOT make the application production-ready.** Phase 5 made the architecture coherent; Phase 6 made job execution durable and removed a real class of data loss. Everything still open in §5 "Known remaining gaps" stands, and **nothing has ever run against real AWS or Bedrock** — no worker has run against real infrastructure and no process has been SIGKILLed, so crash recovery is verified as logic, not as observed behaviour.
 
 **Phase 6 detail.** Execution split into two processes: the API queues durably and returns; `backend/worker.py` polls, claims under a lease, and runs. The durable queue is the existing MongoDB `videos` collection — **no SQS, no new AWS resource, no new IAM permission** (`docs/PIPELINE_ARCHITECTURE.md` §8.6 records why SQS was rejected). Also added: `backend/aws_clients.py` so every boto3 client has a finite timeout and a bounded retry budget (only `source_store` had one before); retryable-vs-permanent failure classification with exponential backoff via `not_before`; `/health/live`, `/health/ready` and `/health/worker`; and the per-video frame read moved from a full-table `Scan` to a key-based `Query`. The API response contract is unchanged in both execution modes, and a test asserts it.
 
-**Phase 8 has not been started.** Remaining: 8 (remediation — needs §9 q4), 9 (reconstruction — needs §9 q3), 10 (tests, CI, docs, release). Do not start one until it is explicitly assigned.
+**Phase 8 detail.** Resolved §9 q4 (see above) and built the review workflow
+that question was blocking. New modules: `remediation_state.py` (12 states and
+a validated transition table), `remediation.py` (proposal construction from a
+persisted finding, fingerprinting, the confidence gate), `remediation_repo.py`
+(MongoDB `remediations`, conditional owner-scoped writes), `image_provider.py`
+(the provider contract plus `NullImageProvider`), `remediation_routes.py`
+(7 routes), and `ownership.py` — `app.require_video_owner` moved there so the
+new router reuses the ONE ownership check instead of a second copy (`app.py`
+now delegates; external behaviour unchanged).
+
+Also: `GET /violations/{id}` gained `detection_index` per detection (additive;
+a test asserts the existing keys are unchanged), because `/violations`
+flattens detections across frames so a client cannot otherwise address a
+finding. `db_init` creates the new indexes non-destructively. A real bug was
+found and fixed in the process: the analyzer stores bounding boxes as
+`Decimal`, which `detections.BoundingBox.parse` rejects (it accepts only
+int/float, because its input is model JSON) — so reading a stored box back
+silently dropped it. `remediation._normalised_box` converts first.
+
+**Phase 9 has not been started.** Remaining: 9 (reconstruction — needs §9 q3), 10 (tests, CI, docs, release). Do not start one until it is explicitly assigned.
+
+⚠️ **Nothing in Phase 8 generated an asset or modified a video, and no code
+path can.** `docs/REMEDIATION.md` §8 lists the four things Phase 9 must build,
+in order, before any record may move to `verified`.
 
 Deferred out of Phase 7 and still open: frontend views are not URL-addressable
 (the shell switches views in client state), the audit detail view loads once
@@ -472,7 +507,7 @@ These block specific phases. Do not decide them unilaterally.
 1. ~~Delete the dead MongoDB/GridFS pipeline?~~ **RESOLVED in Phase 5 — deleted**, per the recommendation recorded here. A regression test keeps it deleted.
 2. Keep MongoDB for users, or consolidate onto DynamoDB? *(Still open. MongoDB now also holds ownership and job state, so this is a larger decision than it was.)*
 3. Is video **reconstruction** in release scope, or is detection + reporting enough for v1?
-4. Is **remediation** (Nova Canvas) in release scope? It is currently a disguised mock and must be built properly or removed.
+4. ~~Is **remediation** (Nova Canvas) in release scope?~~ **RESOLVED in Phase 8 — in scope as a reviewed proposal workflow; automated image generation is NOT implemented.** Full decision record and rationale: `docs/REMEDIATION.md`. In short: the Canvas request schema could not be verified from anything in this repository (botocore types `InvokeModel.body` as an opaque blob — verified; the deleted `audit_manager.remediate_frame` admitted in its own comment that the schema was unconfirmed), and the roadmap forbids guessing a provider wire format. So Phase 8 built the proposal/approval lifecycle, the provider interface with its error contract, and a provider that truthfully reports itself unavailable. ⚠️ **Do not add a Canvas adapter without first verifying the payload schema against authoritative Bedrock documentation**, and do not re-add a mock: `test_remediation_provider.py` asserts the shipped provider raises rather than returning an image.
 5. Which bounding-box schema is canonical? *(De facto: the array form in `prompts.py`.)*
 6. Correct model ID — `amazon.nova-pro-v1:0`, or a "Nova 2 Pro" id? Docs and code disagree.
 7. Is Nova Act / browser automation in scope at all? If not, `automation.py`, `orchestrator.py`, `/execute`, and the "Neural Command" UI panel can all go. *(Still open, so Phase 5 retained all of them. `backend/safety.py` is retained for the same reason: it is never imported, but its `intercept_action` is the human-in-the-loop gate for exactly this feature, so deleting it would pre-empt this decision. `backend/s3_trigger.py`, an unreferenced Lambda stub with no deployment definition, was retained as uncertain rather than deleted.)*

@@ -133,6 +133,29 @@ async def ensure_video_indexes(database=None) -> None:
     logger.info("video ownership indexes are in place")
 
 
+async def ensure_remediation_indexes(database=None) -> None:
+    """Create the remediation indexes. Idempotent.
+
+    Phase 8. Delegated to `remediation_repo.ensure_indexes` so the collection
+    that owns those indexes declares them, rather than this module carrying a
+    second copy of the spec that could drift.
+
+    Non-destructive like every other step here: creating an index never
+    deletes, merges or rewrites a document.
+    """
+    import remediation_repo
+
+    if database is None:
+        await remediation_repo.ensure_indexes()
+    else:
+        collection = database[remediation_repo.COLLECTION]
+        await collection.create_index("remediation_id", unique=True)
+        await collection.create_index("owner")
+        await collection.create_index("video_id")
+        await collection.create_index("state")
+    logger.info("remediation indexes are in place")
+
+
 async def initialize_database(*, strict: bool = False) -> dict[str, bool]:
     """Run every initialization step. Safe to call on each startup.
 
@@ -149,6 +172,13 @@ async def initialize_database(*, strict: bool = False) -> dict[str, bool]:
     except Exception:
         results["video_indexes"] = False
         logger.warning("Could not create video ownership indexes", exc_info=False)
+
+    try:
+        results["remediation_indexes"] = True
+        await ensure_remediation_indexes(database)
+    except Exception:
+        results["remediation_indexes"] = False
+        logger.warning("Could not create remediation indexes", exc_info=False)
 
     try:
         results["user_index"] = await ensure_user_indexes(database, strict=strict)

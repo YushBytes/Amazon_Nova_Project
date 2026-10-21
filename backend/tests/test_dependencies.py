@@ -109,12 +109,18 @@ def test_dependency_module_imports(module):
         "db",
         "detections",
         "extractor",
+        "image_provider",
         "job_state",
         "orchestrator",
+        "ownership",
         "pipeline",
         "projects",
         "prompts",
         "recover_jobs",
+        "remediation",
+        "remediation_repo",
+        "remediation_routes",
+        "remediation_state",
         "s3_trigger",
         "safety",
         "source_store",
@@ -148,6 +154,14 @@ def test_app_registers_expected_routes():
         "/projects/{project_id}/upload-init",
         "/projects/{project_id}/review",
         "/projects/{project_id}/chat",
+        # Phase 8.
+        "/remediations",
+        "/remediations/capabilities",
+        "/remediations/{remediation_id}",
+        "/remediations/{remediation_id}/approve",
+        "/remediations/{remediation_id}/reject",
+        "/remediations/{remediation_id}/cancel",
+        "/remediations/{remediation_id}/execute",
     }
     missing = expected - paths
     assert not missing, f"routes missing from the app: {sorted(missing)}"

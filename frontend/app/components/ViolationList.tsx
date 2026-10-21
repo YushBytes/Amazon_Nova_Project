@@ -39,11 +39,21 @@ export default function ViolationList({
   detections,
   onSeek,
   className,
+  renderActions,
 }: {
   detections: Detection[];
   /** Jump playback to a finding's timestamp. Omitted where there is no player. */
   onSeek?: (seconds: number) => void;
   className?: string;
+  /**
+   * Extra controls for one finding, rendered inside its row.
+   *
+   * Phase 8 uses this for the remediation panel. A render prop rather than a
+   * direct import so this component stays a presentation of detections and
+   * does not acquire a dependency on the remediation API - the dashboard
+   * passes nothing and shows no remediation controls.
+   */
+  renderActions?: (detection: Detection) => React.ReactNode;
 }) {
   const ordered = React.useMemo(() => sortBySeverity(detections), [detections]);
 
@@ -107,6 +117,8 @@ export default function ViolationList({
                 </div>
               )}
             </dl>
+
+            {renderActions && renderActions(detection)}
 
             {canSeek && (
               <button

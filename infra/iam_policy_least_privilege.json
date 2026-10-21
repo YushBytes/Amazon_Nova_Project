@@ -64,12 +64,16 @@
     {
       "Sid": "BedrockInvokeNovaProOnly",
       "_comment": [
-        "backend/analyzer.py and backend/audit_manager.py call invoke_model with",
-        "modelId 'amazon.nova-pro-v1:0'. The streaming variant is NOT used by any",
-        "code path; add bedrock:InvokeModelWithResponseStream only if that",
-        "changes. The Nova Canvas entry is commented out below because the only",
-        "call site (audit_manager.remediate_frame) is disabled - grant it when",
-        "remediation is actually implemented."
+        "backend/analyzer.py calls invoke_model with modelId",
+        "'amazon.nova-pro-v1:0'. The streaming variant is NOT used by any code",
+        "path; add bedrock:InvokeModelWithResponseStream only if that changes.",
+        "audit_manager.py was deleted in Phase 5 and no longer exists.",
+        "NOVA CANVAS IS STILL NOT GRANTED (see _NOT_GRANTED). Phase 8 added a",
+        "remediation proposal and review workflow that calls NO provider at",
+        "all: backend/image_provider.py ships only a provider that reports",
+        "itself unavailable, because the Canvas request schema could not be",
+        "verified from the pinned SDK. Granting Canvas now would widen this",
+        "policy for a capability no code path can use."
       ],
       "Effect": "Allow",
       "Action": "bedrock:InvokeModel",
@@ -205,7 +209,7 @@
       "actually implemented, and never to make a failing call succeed."
     ],
     "bedrock:InvokeModelWithResponseStream": "No code path streams a response.",
-    "amazon.nova-canvas-v1:0": "audit_manager.remediate_frame's invoke_model call is commented out; remediation is a later phase.",
+    "amazon.nova-canvas-v1:0": "Still withheld after Phase 8. No code path invokes it: image_provider.NullImageProvider raises ProviderUnavailable instead, because the request/response schema is not verifiable from this project's pinned botocore (InvokeModel takes an opaque blob body). Grant it ONLY alongside a real provider implementation - see docs/REMEDIATION.md for the checklist, which includes this grant as its first operator step.",
     "bedrock:ApplyGuardrail": "backend/safety.py is never imported by the running app. Grant with the guardrail ARN if it is wired up.",
     "states:*": "backend/aws_config.py builds a Step Functions client that no code uses.",
     "s3:CreateBucket": "Bucket creation is a provisioning action performed by infra/cloudformation/storage.yaml under separate administrative credentials, never by the application role.",

@@ -277,6 +277,112 @@ def load_bedrock_max_attempts() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Remediation (Phase 8)
+# ---------------------------------------------------------------------------
+#
+# Two separate switches, because they gate two different things:
+#
+#   REMEDIATION_ENABLED          the proposal and review workflow. Pure
+#                                application logic over findings already
+#                                persisted by the analyzer. No provider, no
+#                                spend, no change to any stored video.
+#   REMEDIATION_IMAGE_PROVIDER   automated image generation. A separate,
+#                                consequential capability; see
+#                                backend/image_provider.py for why no provider
+#                                is implemented.
+#
+# Keeping them apart means an operator can run the human review workflow - the
+# part that actually exists - without implying any generation capability.
+
+REMEDIATION_PROVIDER_NONE = "none"
+REMEDIATION_PROVIDER_NOVA_CANVAS = "nova-canvas"
+# Mirrors image_provider.KNOWN_PROVIDERS. Duplicated as a literal rather than
+# imported because config must not import an application module: config is
+# resolved at import time by app.py, and a cycle here would break startup.
+# A test asserts the two sets stay identical.
+REMEDIATION_IMAGE_PROVIDERS = frozenset(
+    {REMEDIATION_PROVIDER_NONE, REMEDIATION_PROVIDER_NOVA_CANVAS}
+)
+
+
+def load_remediation_enabled() -> bool:
+    """Whether the proposal and review workflow is served.
+
+    Default on. It reads findings the analyzer already persisted and writes
+    only to its own collection, so there is nothing to protect an operator
+    from by defaulting it off.
+    """
+    return _bool_env("REMEDIATION_ENABLED", True)
+
+
+def load_remediation_image_provider() -> str:
+    """Which image-generation provider to use. Default "none".
+
+    An unrecognised value is a ConfigurationError, so a typo surfaces at
+    startup rather than as an opaque failure on the first approved
+    remediation. A recognised-but-unimplemented value ("nova-canvas") is
+    ACCEPTED here and reported as unavailable at the API, deliberately: the
+    operator asked for something real that does not exist yet, and the precise
+    reason belongs in the response they will actually read, not in a crash
+    that stops the rest of the application from serving.
+    """
+    raw = (os.getenv("REMEDIATION_IMAGE_PROVIDER") or "").strip().lower()
+    if not raw:
+        return REMEDIATION_PROVIDER_NONE
+    if raw not in REMEDIATION_IMAGE_PROVIDERS:
+        raise ConfigurationError(
+            f"REMEDIATION_IMAGE_PROVIDER must be one of "
+            f"{sorted(REMEDIATION_IMAGE_PROVIDERS)}; got {raw!r}."
+        )
+    return raw
+
+
+def load_remediation_min_confidence() -> float:
+    """Model confidence at or above which a finding may be auto-remediated.
+
+    `backend/prompts.py` asks the model for a confidence and
+    `docs/planning.md` specifies 0.8 as the threshold, but until Phase 8 **no
+    code read either** - the number was documentation only. This is that
+    threshold.
+
+    What it gates: a proposal records whether the finding met it, and
+    execution of a proposal that did not is refused. It does NOT gate whether
+    a proposal can be created or reviewed - a human should be able to look at
+    a low-confidence finding; that is the point of review. It gates spending
+    provider budget on a finding the model itself was unsure about.
+
+    A finding with NO reported confidence does not pass. Absent is not the
+    same as high, and `detections.py` deliberately keeps it absent rather than
+    defaulting it.
+    """
+    raw = os.getenv("REMEDIATION_MIN_CONFIDENCE")
+    if raw is None or not raw.strip():
+        return 0.8
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        raise ConfigurationError(
+            "REMEDIATION_MIN_CONFIDENCE must be a number between 0 and 1."
+        )
+    if value != value or not (0.0 <= value <= 1.0):
+        raise ConfigurationError(
+            "REMEDIATION_MIN_CONFIDENCE must be between 0 and 1 inclusive."
+        )
+    return value
+
+
+def load_max_remediations_per_video() -> int:
+    """Cap on proposals per video.
+
+    A proposal is cheap, but unbounded creation against one video is a way to
+    grow the collection without limit on an endpoint that is otherwise free to
+    call. The cap is generous relative to MAX_FRAMES_PER_VIDEO (120 frames,
+    each able to carry several findings) while still being a bound.
+    """
+    return _int_env("MAX_REMEDIATIONS_PER_VIDEO", 200, minimum=1)
+
+
+# ---------------------------------------------------------------------------
 # AWS client timeouts (Phase 6)
 # ---------------------------------------------------------------------------
 #
@@ -640,6 +746,10 @@ class Settings:
         self.max_frames_per_video = load_max_frames_per_video()
         self.ffmpeg_timeout_seconds = load_ffmpeg_timeout_seconds()
         self.bedrock_max_attempts = load_bedrock_max_attempts()
+        self.remediation_enabled = load_remediation_enabled()
+        self.remediation_image_provider = load_remediation_image_provider()
+        self.remediation_min_confidence = load_remediation_min_confidence()
+        self.max_remediations_per_video = load_max_remediations_per_video()
         self.aws_connect_timeout = load_aws_connect_timeout()
         self.aws_read_timeout = load_aws_read_timeout()
         self.aws_max_attempts = load_aws_max_attempts()
@@ -677,6 +787,9 @@ class Settings:
             f"max_frames_per_video={self.max_frames_per_video}, "
             f"ffmpeg_timeout_seconds={self.ffmpeg_timeout_seconds}, "
             f"bedrock_max_attempts={self.bedrock_max_attempts}, "
+            f"remediation_enabled={self.remediation_enabled}, "
+            f"remediation_image_provider={self.remediation_image_provider!r}, "
+            f"remediation_min_confidence={self.remediation_min_confidence}, "
             f"job_execution_mode={self.job_execution_mode!r}, "
             f"cors_origins={self.cors_origins}, "
             f"rate_limit_enabled={self.rate_limit_enabled}, "

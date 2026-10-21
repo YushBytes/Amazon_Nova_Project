@@ -1,6 +1,5 @@
 import logging
 import os
-import re
 import shutil
 import tempfile
 import uuid
@@ -39,6 +38,7 @@ import aws_clients
 import config
 import aws_resources
 import db_init
+import ownership
 import pipeline
 import source_store
 import video_repo
@@ -55,6 +55,7 @@ from job_state import JobState, coerce
 from pipeline import AlreadyRunning, PipelineError, RetryLimitReached
 from projects import router as projects_router
 from rate_limit import RateLimitMiddleware, build_credential_rules
+from remediation_routes import router as remediation_router
 from source_store import SourceMissing, SourceStoreError
 from video_repo import OwnershipUnknown
 
@@ -204,6 +205,10 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # second /auth/docs surface. External paths are unchanged.
 app.include_router(auth_router)
 app.include_router(projects_router)
+# Phase 8. Proposal and review only: it calls no provider and modifies no
+# video. Included (not mounted) like the others so it shares this app's CORS
+# policy and appears in one OpenAPI schema.
+app.include_router(remediation_router)
 
 orchestrator = NovaFlowOrchestrator()
 automation = NovaFlowAutomation()
@@ -412,7 +417,9 @@ async def execute_goal(request: GoalRequest, user: dict = Depends(get_current_us
 
 # A stored filename is always server-generated: "vid_" + 8 hex + "." + a
 # whitelisted alphanumeric extension. Nothing from the client reaches a path.
-_VIDEO_ID_RE = re.compile(r"^vid_[0-9a-f]{8}$")
+# One definition, in `ownership`, so the playback route and the ownership
+# check can never drift apart on what a valid id looks like.
+_VIDEO_ID_RE = ownership.VIDEO_ID_RE
 
 
 def _safe_extension(filename: Optional[str]) -> str:
@@ -512,21 +519,13 @@ async def require_video_owner(video_id: str, user: dict) -> dict:
 
     404 is returned for both "no such video" and "not your video" so the
     endpoint cannot be used to probe which ids exist.
+
+    Phase 8 moved the implementation to `ownership.py` so the remediation
+    router can use the SAME check: a router cannot import `app` (which imports
+    the routers), and a second copy of an ownership check is how an IDOR gets
+    reintroduced. This stays as the name every existing call site uses.
     """
-    if not _VIDEO_ID_RE.fullmatch(video_id):
-        raise HTTPException(status_code=400, detail="Invalid video id")
-
-    try:
-        record = await video_repo.get_video(video_id)
-    except OwnershipUnknown:
-        logger.info("Denied access to a video with no ownership record")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if record.get("owner") != user["sub"]:
-        logger.warning("Denied cross-user access attempt to a video")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    return record
+    return await ownership.require_video_owner(video_id, user)
 
 
 # ---------------------------------------------------------------------------
@@ -892,10 +891,18 @@ async def get_violations(
             failed_frames += 1
 
         timestamp = _as_float(item.get("timestamp"))
-        for detection in item.get("detections", []) or []:
+        for index, detection in enumerate(item.get("detections", []) or []):
             # Frame context the UI needs to seek and attribute the finding.
             detection["timestamp"] = timestamp
             detection["frame_number"] = _as_int(item.get("frame_number"))
+            # Phase 8, ADDITIVE: the position of this detection within its
+            # frame's stored list. Together with video_id and frame_number it
+            # is how the remediation API addresses a finding, and the client
+            # cannot derive it once the detections are flattened across
+            # frames. Deriving it from list position in the browser would work
+            # only by undocumented convention and would break the moment this
+            # response is paginated differently.
+            detection["detection_index"] = index
             all_detections.append(_normalise_detection(detection))
 
     last_key = response.get("LastEvaluatedKey") or None
@@ -942,6 +949,10 @@ def _normalise_detection(detection: dict) -> dict:
         "description": str(detection.get("description") or ""),
         "timestamp": _as_float(detection.get("timestamp")),
         "frame_number": _as_int(detection.get("frame_number")),
+        # Phase 8. Always present and always an int: a client addressing a
+        # finding for remediation needs it, and an absent-or-present field
+        # would make every caller defensive about it.
+        "detection_index": _as_int(detection.get("detection_index")),
     }
     if detection.get("risk_level") is not None:
         out["risk_level"] = str(detection["risk_level"])
