@@ -1,28 +1,33 @@
 /**
  * Typed client for the NovaFlow backend.
  *
- * Phase 2, defect C: the Launch Audit action uploaded a video but never called
- * the analysis endpoint, so the pipeline was never triggered and the dashboard
- * polled for violations that could not exist.
+ * Every shape below was read off `backend/app.py` and `backend/auth.py`
+ * rather than assumed. The route surface this file covers:
  *
- * The request/response shapes below were read off backend/app.py rather than
- * assumed:
+ *   POST /auth/signup|login   -> { access_token, token_type, role }
+ *   GET  /auth/me             -> { username, role }
+ *   POST /upload-reel         -> { video_id, video_url, filename, status, ... }
+ *   POST /analyze/{video_id}  -> { video_id, status, job }   404 if not found
+ *   POST /analyze/{id}/retry  -> { video_id, status, job }
+ *   GET  /jobs/{video_id}     -> the job view: state, stage, counts, attempt
+ *   GET  /violations/{id}     -> { detections[], counts, next_cursor, job }
+ *   GET  /submissions         -> { submissions[] }  the caller's own uploads
+ *   GET  /health/worker       -> queue counts, inferred worker health
  *
- *   POST /upload-reel        -> { video_id, video_url, filename, status, message }
- *   POST /analyze/{video_id} -> { video_id, status, job }      404 if not found
- *   GET  /jobs/{video_id}    -> the job view: state, stage, counts, attempt
- *   GET  /violations/{id}    -> { video_id, detections[], frame_count }
- *
- * The contract gap noted here previously - no way to know whether an audit had
- * finished - was closed by the backend job state machine. `GET /jobs/{id}` is
- * authoritative: treat an empty `detections` list as "compliant" ONLY when
- * `state === "completed"`, because that state means analysis finished AND its
- * results were persisted. Any other state means the picture is incomplete.
+ * `GET /jobs/{id}` is authoritative for progress: treat an empty `detections`
+ * list as "no violations found" ONLY when `state === "completed"`, because
+ * that state means analysis finished AND its results were persisted. Any
+ * other state means the picture is incomplete.
  *
  * How the backend executes the job is deliberately invisible here. It queues
  * the job durably before responding, and either a separate worker process or
  * an in-process task runs it depending on server configuration; the response
  * shape is identical either way, so nothing in this file depends on it.
+ *
+ * Logging policy: this module never logs a request URL. A playback URL
+ * carries a media token in its query string, so a logged URL would leak a
+ * credential into the browser console. Errors carry a status and the
+ * backend's own `detail`, never the target.
  */
 
 export function apiBaseUrl(): string {
@@ -31,6 +36,8 @@ export function apiBaseUrl(): string {
 
 /** Storage key for the session token; owned by AuthContext. */
 export const TOKEN_STORAGE_KEY = "novaflow_token";
+/** Storage key for the cached user record; owned by AuthContext. */
+export const USER_STORAGE_KEY = "novaflow_user";
 
 /**
  * Read the stored session token.
@@ -60,46 +67,341 @@ function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+/** An error carrying the backend's HTTP status and `detail` message. */
+export class ApiError extends Error {
+  readonly status: number;
+  /** Seconds to wait, parsed from a `Retry-After` header. Null when absent. */
+  readonly retryAfterSeconds: number | null;
+
+  constructor(message: string, status: number, retryAfterSeconds: number | null = null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+
+  /** True when the session is missing, expired, or rejected. */
+  get isUnauthorized(): boolean {
+    return this.status === 401;
+  }
+
+  /** True when the caller is being throttled rather than refused. */
+  get isThrottled(): boolean {
+    return this.status === 429;
+  }
+
+  /**
+   * True when the resource is absent or not the caller's.
+   *
+   * The backend deliberately returns 404 rather than 403 for another user's
+   * video, so ids cannot be enumerated; both land here.
+   */
+  get isNotFound(): boolean {
+    return this.status === 404 || this.status === 403;
+  }
+}
+
+/** Read `Retry-After` as whole seconds, or null when it is absent/invalid. */
+function readRetryAfter(res: Response): number | null {
+  const raw = Number(res.headers.get("Retry-After"));
+  return Number.isFinite(raw) && raw > 0 ? raw : null;
+}
+
+async function readError(res: Response, fallback: string): Promise<ApiError> {
+  let detail = fallback;
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === "string") {
+      detail = body.detail;
+    }
+  } catch {
+    // Non-JSON error body; keep the fallback message.
+  }
+  return new ApiError(detail, res.status, readRetryAfter(res));
+}
+
+/** Options every request helper accepts. */
+export interface RequestOptions {
+  /** Abort signal, so a view can cancel in-flight work on unmount. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Single place every JSON request goes through.
+ *
+ * Centralising this is what keeps error handling consistent: one status
+ * check, one defensive `detail` parse, one place that attaches the bearer
+ * token, and one place that must never log the URL.
+ */
+async function requestJson<T>(
+  path: string,
+  init: RequestInit,
+  fallbackMessage: string,
+  options: RequestOptions = {}
+): Promise<T> {
+  const res = await fetch(`${apiBaseUrl()}${path}`, {
+    ...init,
+    headers: { ...authHeaders(), ...(init.headers as Record<string, string>) },
+    signal: options.signal,
+  });
+
+  if (!res.ok) {
+    throw await readError(res, fallbackMessage);
+  }
+
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new ApiError("The server returned a malformed response", res.status);
+  }
+}
+
+/** True when a rejection is an abort, which is a normal cancellation. */
+export function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === "AbortError") ||
+    (err instanceof Error && err.name === "AbortError")
+  );
+}
+
+/**
+ * A human-readable message for any rejection, with no internals.
+ *
+ * Views call this instead of rendering `String(err)`, so a thrown object can
+ * never reach the DOM as "[object Object]" and a stack trace is never shown.
+ */
+export function describeError(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) {
+    if (err.isUnauthorized) return "Your session has expired. Please sign in again.";
+    return err.message || fallback;
+  }
+  if (err instanceof Error && err.message) {
+    // A fetch failure in a browser is reported as "Failed to fetch", which is
+    // accurate but unhelpful on its own.
+    if (err.name === "TypeError") {
+      return "Could not reach the server. Check your connection and try again.";
+    }
+    return err.message;
+  }
+  return fallback;
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+/** The two roles the backend recognises; see backend/config.py VALID_ROLES. */
+export type UserRole = "client" | "agent";
+
+export interface AuthenticatedUser {
+  username: string;
+  role: UserRole;
+}
+
+export interface TokenResponse {
+  access_token: string;
+  token_type?: string;
+  role: string;
+}
+
+/**
+ * Narrow an untrusted role value.
+ *
+ * The role arrives from the API and from localStorage, and drives which
+ * navigation entries are rendered. An unrecognised value is treated as the
+ * least-privileged role rather than passed through: presentation must never
+ * widen on the strength of an unknown string. This is presentation only -
+ * the backend remains the authority on what the role may actually do.
+ */
+export function coerceRole(value: unknown): UserRole {
+  return value === "agent" ? "agent" : "client";
+}
+
+/** Sign in. Never sends a role: the backend reads it from stored account data. */
+export async function login(
+  username: string,
+  password: string,
+  options: RequestOptions = {}
+): Promise<TokenResponse> {
+  return requestJson<TokenResponse>(
+    "/auth/login",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    },
+    "Authentication failed",
+    options
+  );
+}
+
+/**
+ * Register. Never sends a role.
+ *
+ * Public signup always creates a least-privileged account server-side; a
+ * `role` field in the body is ignored, so sending one would only imply the
+ * client could choose it.
+ */
+export async function signup(
+  username: string,
+  password: string,
+  options: RequestOptions = {}
+): Promise<TokenResponse> {
+  return requestJson<TokenResponse>(
+    "/auth/signup",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    },
+    "Registration failed",
+    options
+  );
+}
+
+/**
+ * Verify the stored session against the server.
+ *
+ * The stored token may be expired, or signed with a key this backend no
+ * longer accepts, and the cached role may be stale. This is the only
+ * trustworthy source for both.
+ */
+export async function fetchCurrentUser(
+  options: RequestOptions = {}
+): Promise<AuthenticatedUser> {
+  const data = await requestJson<{ username?: unknown; role?: unknown }>(
+    "/auth/me",
+    { method: "GET" },
+    "Could not verify your session",
+    options
+  );
+  return {
+    username: typeof data.username === "string" ? data.username : "",
+    role: coerceRole(data.role),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
+
 export interface UploadReelResponse {
   video_id: string;
   video_url: string;
   filename: string;
+  original_filename?: string | null;
+  size_bytes?: number;
   status: string;
   message?: string;
 }
 
-export interface StartAnalysisResponse {
-  video_id: string;
-  /** Mirrors `job.state`; retained for backwards compatibility. */
-  status: string;
-  job?: Job;
-  message?: string;
+/**
+ * Upload limits enforced client-side, before a byte leaves the browser.
+ *
+ * IMPORTANT: these mirror the backend defaults (`MAX_UPLOAD_BYTES`,
+ * `ALLOWED_VIDEO_EXTENSIONS` in backend/config.py). The browser cannot read
+ * the server's configuration, so this is a pre-flight courtesy, NOT the
+ * authority: the backend validates every upload independently and its
+ * rejection message is surfaced verbatim when the two disagree. A deployment
+ * that narrows the server limits should set the matching NEXT_PUBLIC_* values
+ * so the hint shown to the user stays true.
+ */
+export const DEFAULT_MAX_UPLOAD_BYTES = 104857600; // 100 MiB
+export const DEFAULT_ALLOWED_VIDEO_EXTENSIONS = ["mp4", "mov", "avi", "webm", "mkv"];
+
+export function maxUploadBytes(): number {
+  const configured = Number(process.env.NEXT_PUBLIC_MAX_UPLOAD_BYTES);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_MAX_UPLOAD_BYTES;
 }
 
-/** A single violation as stored by analyzer.py and flattened by /violations. */
-export interface Detection {
-  category?: string;
-  description?: string;
-  confidence?: number;
-  /** Normalized 0-1000 as [ymin, xmin, ymax, xmax]; see backend/prompts.py. */
-  bounding_box?: number[];
-  risk_level?: string;
-  /** Added per-detection by /violations from the frame's timestamp, seconds. */
-  timestamp?: number;
+export function allowedVideoExtensions(): string[] {
+  const configured = process.env.NEXT_PUBLIC_ALLOWED_VIDEO_EXTENSIONS;
+  if (!configured) return DEFAULT_ALLOWED_VIDEO_EXTENSIONS;
+  const parsed = configured
+    .split(",")
+    .map((part) => part.trim().toLowerCase().replace(/^\./, ""))
+    .filter((part) => /^[a-z0-9]+$/.test(part));
+  return parsed.length > 0 ? parsed : DEFAULT_ALLOWED_VIDEO_EXTENSIONS;
 }
 
-export interface ViolationsResponse {
-  video_id: string;
-  detections: Detection[];
-  /** Frames in THIS page. `job.frames_extracted` is the total. */
-  frame_count: number;
-  audited_frames: number;
-  failed_frames: number;
-  next_cursor: string | null;
-  has_more: boolean;
-  /** Authoritative job state. Never infer completion from an empty list. */
-  job: Job;
+/** Render a byte count for display. */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) return "--";
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
+
+/**
+ * Validate a chosen file against the limits above.
+ *
+ * Returns null when the file passes, or a message to show inline. Mirrors the
+ * backend's own checks (extension allowlist, size cap, non-empty body) so the
+ * common mistakes are caught without a 100 MiB round trip. Neither check
+ * proves the bytes are a safe video; the backend does not prove that either.
+ */
+export function validateVideoFile(file: File): string | null {
+  const extensions = allowedVideoExtensions();
+  const suffix = file.name.replace(/\\/g, "/").split("/").pop() ?? "";
+  const dot = suffix.lastIndexOf(".");
+  const extension = dot > 0 ? suffix.slice(dot + 1).toLowerCase() : "";
+
+  if (!extension) {
+    return `File must have an extension. Supported: ${extensions.join(", ")}.`;
+  }
+  if (!extensions.includes(extension)) {
+    return `Unsupported file type ".${extension}". Supported: ${extensions.join(", ")}.`;
+  }
+  if (file.size === 0) {
+    return "That file is empty.";
+  }
+  const limit = maxUploadBytes();
+  if (file.size > limit) {
+    return `That file is ${formatBytes(file.size)}; the limit is ${formatBytes(limit)}.`;
+  }
+  return null;
+}
+
+/**
+ * Upload a video file. This only stores the file; it does NOT start analysis.
+ * Call startAnalysis afterwards.
+ *
+ * Deliberately NOT retried automatically: a repeated POST would store a
+ * second copy of the same video and bill a second analysis. A retry is the
+ * user's explicit action.
+ */
+export async function uploadReel(
+  file: File,
+  options: RequestOptions = {}
+): Promise<UploadReelResponse> {
+  const form = new FormData();
+  form.append("file", file);
+
+  // Note: no Content-Type header. The browser must set the multipart
+  // boundary itself.
+  const res = await fetch(`${apiBaseUrl()}/upload-reel`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: form,
+    signal: options.signal,
+  });
+
+  if (!res.ok) {
+    throw await readError(res, `Upload failed (HTTP ${res.status})`);
+  }
+
+  const data = (await res.json()) as UploadReelResponse;
+  if (!data?.video_id) {
+    throw new ApiError("Upload response did not include a video_id", res.status);
+  }
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Jobs
+// ---------------------------------------------------------------------------
 
 /**
  * Analysis job state, as reported by GET /jobs/{video_id}.
@@ -125,6 +427,8 @@ export interface Job {
   is_active: boolean;
   attempt: number;
   max_attempts: number;
+  /** Times a crashed run was automatically requeued; see video_repo.job_view. */
+  recovered_count?: number;
   frames_extracted: number | null;
   frames_audited: number | null;
   frames_failed: number | null;
@@ -141,84 +445,24 @@ export interface Job {
 }
 
 /** Fetch the authoritative job state for a video. */
-export async function fetchJob(videoId: string): Promise<Job> {
-  const res = await fetch(
-    `${apiBaseUrl()}/jobs/${encodeURIComponent(videoId)}`,
-    { headers: authHeaders() }
+export async function fetchJob(
+  videoId: string,
+  options: RequestOptions = {}
+): Promise<Job> {
+  return requestJson<Job>(
+    `/jobs/${encodeURIComponent(videoId)}`,
+    { method: "GET" },
+    `Could not fetch job status (HTTP error)`,
+    options
   );
-
-  if (!res.ok) {
-    throw await readError(res, `Could not fetch job status (HTTP ${res.status})`);
-  }
-  return (await res.json()) as Job;
 }
 
-/** Re-run analysis for a job that has reached a terminal state. */
-export async function retryAnalysis(videoId: string): Promise<Job> {
-  const res = await fetch(
-    `${apiBaseUrl()}/analyze/${encodeURIComponent(videoId)}/retry`,
-    { method: "POST", headers: authHeaders() }
-  );
-
-  if (!res.ok) {
-    throw await readError(res, `Could not retry analysis (HTTP ${res.status})`);
-  }
-  const data = await res.json();
-  return data.job as Job;
-}
-
-/** An error carrying the backend's HTTP status and `detail` message. */
-export class ApiError extends Error {
-  readonly status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-  }
-
-  /** True when the session is missing, expired, or rejected. */
-  get isUnauthorized(): boolean {
-    return this.status === 401;
-  }
-}
-
-async function readError(res: Response, fallback: string): Promise<ApiError> {
-  let detail = fallback;
-  try {
-    const body = await res.json();
-    if (body && typeof body.detail === "string") {
-      detail = body.detail;
-    }
-  } catch {
-    // Non-JSON error body; keep the fallback message.
-  }
-  return new ApiError(detail, res.status);
-}
-
-/**
- * Upload a video file. This only stores the file; it does NOT start analysis.
- * Call startAnalysis afterwards.
- */
-export async function uploadReel(file: File): Promise<UploadReelResponse> {
-  const form = new FormData();
-  form.append("file", file);
-
-  const res = await fetch(`${apiBaseUrl()}/upload-reel`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: form,
-  });
-
-  if (!res.ok) {
-    throw await readError(res, `Upload failed (HTTP ${res.status})`);
-  }
-
-  const data = (await res.json()) as UploadReelResponse;
-  if (!data?.video_id) {
-    throw new ApiError("Upload response did not include a video_id", res.status);
-  }
-  return data;
+export interface StartAnalysisResponse {
+  video_id: string;
+  /** Mirrors `job.state`; retained for backwards compatibility. */
+  status: string;
+  job?: Job;
+  message?: string;
 }
 
 /**
@@ -226,39 +470,94 @@ export async function uploadReel(file: File): Promise<UploadReelResponse> {
  *
  * Returns once the backend has *accepted* the job. The work runs in the
  * background, so a successful return means "queued", not "complete".
+ *
+ * Never retried automatically: each run bills the model per frame.
  */
-export async function startAnalysis(videoId: string): Promise<StartAnalysisResponse> {
-  const res = await fetch(`${apiBaseUrl()}/analyze/${encodeURIComponent(videoId)}`, {
-    method: "POST",
-    headers: authHeaders(),
-  });
+export async function startAnalysis(
+  videoId: string,
+  options: RequestOptions = {}
+): Promise<StartAnalysisResponse> {
+  return requestJson<StartAnalysisResponse>(
+    `/analyze/${encodeURIComponent(videoId)}`,
+    { method: "POST" },
+    "Could not start analysis",
+    options
+  );
+}
 
-  if (!res.ok) {
-    throw await readError(res, `Could not start analysis (HTTP ${res.status})`);
-  }
-  return (await res.json()) as StartAnalysisResponse;
+/** Re-run analysis for a job that has reached a terminal state. */
+export async function retryAnalysis(
+  videoId: string,
+  options: RequestOptions = {}
+): Promise<Job> {
+  const data = await requestJson<StartAnalysisResponse>(
+    `/analyze/${encodeURIComponent(videoId)}/retry`,
+    { method: "POST" },
+    "Could not retry analysis",
+    options
+  );
+  return data.job as Job;
+}
+
+// ---------------------------------------------------------------------------
+// Violations
+// ---------------------------------------------------------------------------
+
+/** A single violation as stored by analyzer.py and flattened by /violations. */
+export interface Detection {
+  category?: string;
+  description?: string;
+  confidence?: number;
+  /** Normalized 0-1000 as [ymin, xmin, ymax, xmax]; see backend/prompts.py. */
+  bounding_box?: number[];
+  /** "High" | "Medium" | "Low" per backend/prompts.py, but model-supplied. */
+  risk_level?: string;
+  /** Added per-detection by /violations from the frame's timestamp, seconds. */
+  timestamp?: number;
+  /** The frame this detection came from; added by /violations. */
+  frame_number?: number;
+}
+
+/** A detection whose bounding box is present and well formed. */
+export type RenderableDetection = Detection & {
+  bounding_box: [number, number, number, number];
+};
+
+export interface ViolationsResponse {
+  video_id: string;
+  detections: Detection[];
+  /** Frames in THIS page. `job.frames_extracted` is the total. */
+  frame_count: number;
+  audited_frames: number;
+  failed_frames: number;
+  next_cursor: string | null;
+  has_more: boolean;
+  /**
+   * Authoritative job state. Never infer completion from an empty list.
+   *
+   * Optional because a malformed or legacy response may omit it; a caller
+   * must treat a missing job as "state unknown", never as completed.
+   */
+  job?: Job;
 }
 
 /** Fetch whatever detections have been persisted for a video so far. */
 export async function fetchViolations(
   videoId: string,
-  options: { cursor?: string | null; limit?: number } = {}
+  options: RequestOptions & { cursor?: string | null; limit?: number } = {}
 ): Promise<ViolationsResponse> {
   const params = new URLSearchParams();
   if (options.cursor) params.set("cursor", options.cursor);
   if (options.limit) params.set("limit", String(options.limit));
   const query = params.toString();
 
-  const res = await fetch(
-    `${apiBaseUrl()}/violations/${encodeURIComponent(videoId)}${query ? `?${query}` : ""}`,
-    { headers: authHeaders() }
+  const data = await requestJson<Partial<ViolationsResponse>>(
+    `/violations/${encodeURIComponent(videoId)}${query ? `?${query}` : ""}`,
+    { method: "GET" },
+    "Could not fetch violations",
+    options
   );
 
-  if (!res.ok) {
-    throw await readError(res, `Could not fetch violations (HTTP ${res.status})`);
-  }
-
-  const data = (await res.json()) as ViolationsResponse;
   return {
     video_id: data?.video_id ?? videoId,
     detections: Array.isArray(data?.detections) ? data.detections : [],
@@ -279,8 +578,9 @@ export async function fetchViolations(
  */
 export async function fetchAllViolations(
   videoId: string,
-  maxPages = 20
+  options: RequestOptions & { maxPages?: number } = {}
 ): Promise<ViolationsResponse> {
+  const maxPages = options.maxPages ?? 20;
   let cursor: string | null = null;
   let pages = 0;
   const detections: Detection[] = [];
@@ -290,7 +590,10 @@ export async function fetchAllViolations(
   let job: Job | undefined;
 
   do {
-    const page: ViolationsResponse = await fetchViolations(videoId, { cursor });
+    const page: ViolationsResponse = await fetchViolations(videoId, {
+      cursor,
+      signal: options.signal,
+    });
     detections.push(...page.detections);
     frameCount += page.frame_count;
     audited += page.audited_frames;
@@ -308,46 +611,109 @@ export async function fetchAllViolations(
     failed_frames: failed,
     next_cursor: cursor,
     has_more: Boolean(cursor),
-    job: job as Job,
+    job,
   };
-}
-
-export interface Submission {
-  id: string;
-  filename?: string;
-  original_filename?: string | null;
-  title?: string;
-  status?: string;
-  created_at?: string | null;
-  size_bytes?: number;
-  url?: string;
-}
-
-/** List the signed-in user's own uploads. Never another user's. */
-export async function fetchSubmissions(): Promise<Submission[]> {
-  const res = await fetch(`${apiBaseUrl()}/submissions`, {
-    headers: authHeaders(),
-  });
-
-  if (!res.ok) {
-    throw await readError(res, `Could not fetch submissions (HTTP ${res.status})`);
-  }
-
-  const data = await res.json();
-  return Array.isArray(data?.submissions) ? data.submissions : [];
 }
 
 /**
  * True when a detection carries the fields the overlay needs to render.
  *
- * Model output is not schema-validated server-side yet, so a malformed
- * detection must be skipped rather than rendered as NaN.
+ * A type predicate, so a caller that filters by it no longer needs a
+ * non-null assertion to read the box. Model output is not schema-validated
+ * server-side, so a malformed detection must be skipped rather than rendered
+ * as NaN.
  */
-export function isRenderableDetection(d: Detection | null | undefined): boolean {
+export function isRenderableDetection(
+  d: Detection | null | undefined
+): d is RenderableDetection {
   return Boolean(
     d &&
       Array.isArray(d.bounding_box) &&
       d.bounding_box.length === 4 &&
       d.bounding_box.every((n) => typeof n === "number" && Number.isFinite(n))
   );
+}
+
+// ---------------------------------------------------------------------------
+// Submissions
+// ---------------------------------------------------------------------------
+
+export interface Submission {
+  id: string;
+  filename?: string;
+  original_filename?: string | null;
+  title?: string;
+  /**
+   * The video's stored job state, lower-case: see backend/job_state.py.
+   * Legacy records can hold "UPLOADED" in upper case, so compare
+   * case-insensitively - use `jobStateOf` in ./jobs.
+   */
+  status?: string;
+  created_at?: string | null;
+  size_bytes?: number;
+  /** Playback URL carrying a short-lived media token. Never log it. */
+  url?: string;
+}
+
+/** List the signed-in user's own uploads. Never another user's. */
+export async function fetchSubmissions(
+  options: RequestOptions = {}
+): Promise<Submission[]> {
+  const data = await requestJson<{ submissions?: unknown }>(
+    "/submissions",
+    { method: "GET" },
+    "Could not fetch submissions",
+    options
+  );
+  return Array.isArray(data?.submissions) ? (data.submissions as Submission[]) : [];
+}
+
+// ---------------------------------------------------------------------------
+// Worker health
+// ---------------------------------------------------------------------------
+
+/**
+ * What GET /health/worker reports.
+ *
+ * Read the backend docstring before presenting any of this: the endpoint does
+ * NOT contact the worker process. It infers whether work is being consumed
+ * from the job queue, and says so in `note`. Counts only - never ids or
+ * owners.
+ */
+export interface WorkerHealth {
+  status: "ok" | "degraded" | "unknown" | string;
+  execution_mode?: string;
+  counts?: Record<string, number>;
+  active?: number;
+  abandoned?: number;
+  note?: string;
+  detail?: string;
+}
+
+/**
+ * Read inferred worker health.
+ *
+ * Returns the body on 503 as well as 200: the backend answers "degraded" with
+ * a 503 so it can drive an alert, and the body is the useful part. Only a
+ * transport failure or an unreadable body throws.
+ */
+export async function fetchWorkerHealth(
+  options: RequestOptions = {}
+): Promise<WorkerHealth> {
+  const res = await fetch(`${apiBaseUrl()}/health/worker`, {
+    method: "GET",
+    headers: authHeaders(),
+    signal: options.signal,
+  });
+
+  // 503 is an expected, informative answer here, not a failure to report.
+  if (!res.ok && res.status !== 503) {
+    throw await readError(res, "Could not read worker health");
+  }
+
+  try {
+    return (await res.json()) as WorkerHealth;
+  } catch {
+    throw new ApiError("The server returned a malformed response", res.status);
+  }
 }

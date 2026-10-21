@@ -38,7 +38,11 @@ is the `videos` collection itself, not a separate queue service; see
 `docs/PIPELINE_ARCHITECTURE.md` §8 for why, including why SQS was rejected.
 
 **Frontend** — Next.js 16.1.6, React 19.2.3, TypeScript 5.9.3 (`strict`),
-Tailwind CSS v4, Framer Motion, lucide-react. Tests run on Vitest.
+Tailwind CSS v4, Framer Motion, lucide-react. Tests run on Vitest. Three
+routes (`/`, `/login`, `/_not-found`); the shell at `/` switches views in
+client state, so individual views are not deep-linkable. Every view is backed
+by a real endpoint or says on screen that the capability does not exist —
+`frontend/README.md` maps each one to its route.
 
 **Backend** — FastAPI + Uvicorn, `python-jose` JWT (HS256), Argon2id password
 hashing, `motor` (async MongoDB), `boto3`, `ffmpeg-python`. Tests run on pytest.
@@ -215,9 +219,19 @@ pytest -m requires_mongodb                # needs MONGODB_TEST_URL
 pytest -m requires_ffmpeg                 # needs ffmpeg on PATH
 
 # Frontend
-cd frontend && npm test                    # 74 tests (Vitest)
+cd frontend && npm test                    # 263 tests (Vitest)
 npm run lint && npm run typecheck && npm run build
 ```
+
+Frontend: 263 tests pass, 0 type errors, **0 lint errors and 0 lint warnings**,
+and the build emits `/`, `/_not-found` and `/login`. `fetch` is stubbed at the
+network boundary in every frontend test, so they prove the UI renders the right
+thing for a given API response — and nothing about real backend or AWS
+behaviour. Run `npm run build` before `npm run typecheck` after deleting a
+route: the typecheck reads generated validators under `.next/types/`.
+
+There is no end-to-end test covering login → upload → analyze → review against
+a live backend, and no browser-automation stack (Phase 10).
 
 42 backend tests are **skipped by default** because they need real dependencies:
 26 require a MongoDB instance (`MONGODB_TEST_URL`, which must name a disposable
@@ -261,15 +275,23 @@ These are current and deliberate to state plainly.
   evaluation.
 - **Upload validation does not prove a file is a safe video.** There is no
   content scanning.
-- Parts of the dashboard still render hardcoded placeholder data (the agents and
-  compliance-log views). Frame remediation and corrected-video reconstruction are
-  **not implemented**.
+- **The dashboard no longer presents hardcoded data as live state.** Every
+  fabricated panel was removed in Phase 7 — invented agents and cluster
+  metrics, fabricated security "incidents", and an unconditional "Audit
+  Passed" card that appeared whether or not analysis had run. Capabilities the
+  backend lacks now say so on screen. Frame remediation and corrected-video
+  reconstruction remain **not implemented**, and `POST /execute` still returns
+  placeholder text, so no UI control is wired to it.
+- **Frontend views are not URL-addressable**, the audit detail view loads once
+  rather than polling, and search and filtering run client-side over the list
+  already fetched (`GET /submissions` caps at 100 records).
 - The AWS IAM hardening is a reviewed template, not an applied configuration.
 
-Making job execution durable — the most recent work — removes a real class of
-data loss. It does **not** make the application production-ready: nothing here
-has run against real AWS, and the infrastructure template has never been
-deployed.
+Connecting the frontend to real compliance data — the most recent work — means
+the interface no longer claims more than the backend did. It does **not** make
+the application production-ready: nothing here has run against real AWS, the
+infrastructure template has never been deployed, and detection accuracy remains
+unmeasured.
 
 ---
 

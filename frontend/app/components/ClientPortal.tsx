@@ -1,184 +1,216 @@
 "use client";
 
+/**
+ * The caller's own uploads, from GET /submissions.
+ *
+ * Phase 7 changes, all of them removals of claims the backend never made:
+ *
+ *  - The "VERIFIED" shield badge compared `sub.status` to the string
+ *    "VERIFIED". `/submissions` returns the lower-case job state
+ *    ("uploaded", "completed", ...), so that badge could never appear - and
+ *    had it appeared, it would have asserted a verdict from a field that only
+ *    describes whether analysis ran. Rows now show the real job state.
+ *  - The filter tabs read "LLAVA-CORE", "ACT-AGENT" and "VERIFIED". There is
+ *    no LLaVA in this system (the README claim was removed in Phase 5) and no
+ *    agent routing; the tabs also filtered nothing, since `activeTab` was
+ *    never read. Replaced with a search that actually filters.
+ *  - The "Post" button, which claimed social publishing. No such endpoint
+ *    exists.
+ *  - "Verified Neural Output Feed" as a subtitle for a list of unverified
+ *    uploads.
+ *
+ * The search box filters the already-fetched list in the browser. There is no
+ * search endpoint, and pretending otherwise would mean one request per
+ * keystroke against a route that ignores the query.
+ */
+
 import React from "react";
-import { 
-  Play, 
-  Share2, 
-  Info, 
-  CheckCircle2, 
-  LayoutGrid,
-  ShieldCheck,
-  Search,
-  Filter
-} from "lucide-react";
+import { LayoutGrid, Play, Search } from "lucide-react";
 import { motion } from "framer-motion";
-import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
-import { ApiError, fetchSubmissions, type Submission } from "../lib/api";
+import { cn } from "../lib/utils";
+import {
+  describeError,
+  fetchSubmissions,
+  formatBytes,
+  isAbortError,
+  type Submission,
+} from "../lib/api";
+import {
+  JOB_STATE_LABELS,
+  formatDateTime,
+  jobStateOf,
+  toneForState,
+} from "../lib/jobs";
+import { EmptyState, ErrorBanner, LoadingPanel, StatusBadge } from "./ui/Feedback";
 
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
-
-// The Submission shape comes from the API client so this view cannot drift
-// from the backend contract. The previous local interface required `agent`
-// and `time`, which the backend fabricated and no longer returns.
-
-/** Render an ISO timestamp as a short local time, or a dash when absent. */
-function formatUploadedAt(iso?: string | null): string {
-  if (!iso) return "--";
-  const parsed = new Date(iso);
-  if (Number.isNaN(parsed.getTime())) return "--";
-  return parsed.toLocaleString([], {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-/** Render a byte count as MB, or a dash when absent. */
-function formatSize(bytes?: number): string {
-  if (typeof bytes !== "number" || bytes <= 0) return "--";
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
-export default function ClientPortal({ onSelect }: { onSelect: (sub: Submission) => void }) {
+export default function ClientPortal({
+  onSelect,
+}: {
+  onSelect: (sub: Submission) => void;
+}) {
   const [submissions, setSubmissions] = React.useState<Submission[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState<string | null>(null);
-  const [activeTab, setActiveTab] = React.useState("ALL NODES");
+  const [query, setQuery] = React.useState("");
+  const [reloadToken, setReloadToken] = React.useState(0);
 
   React.useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+
     const load = async () => {
       try {
-        // /submissions now requires authentication and returns only the
+        // /submissions requires authentication and returns only the
         // signed-in user's own uploads.
-        setSubmissions(await fetchSubmissions());
+        const data = await fetchSubmissions({ signal: controller.signal });
+        if (cancelled) return;
+        setSubmissions(data);
         setLoadError(null);
       } catch (err) {
-        if (err instanceof ApiError && err.isUnauthorized) {
-          setLoadError("Your session has expired. Please sign in again.");
-        } else {
-          setLoadError(
-            err instanceof Error ? err.message : "Could not load assets."
-          );
-        }
+        if (cancelled || isAbortError(err)) return;
+        setLoadError(describeError(err, "Could not load your assets."));
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
-    load();
-  }, []);
+
+    void load();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [reloadToken]);
+
+  const visible = React.useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return submissions;
+    return submissions.filter((sub) => {
+      const haystack = [sub.title, sub.original_filename, sub.id]
+        .filter((part): part is string => typeof part === "string")
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(needle);
+    });
+  }, [submissions, query]);
+
+  const reload = () => {
+    setLoading(true);
+    setReloadToken((n) => n + 1);
+  };
 
   return (
-    <div className="space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-1000">
-      {/* Header Area */}
-      <header className="flex flex-col md:flex-row md:items-end justify-between gap-10 border-b border-white/5 pb-10">
+    <div className="space-y-12">
+      <header className="flex flex-col justify-between gap-10 border-b border-white/5 pb-10 md:flex-row md:items-end">
         <div className="space-y-2">
-          <h1 className="text-3xl font-bold tracking-tight text-white flex items-center space-x-4">
-            <LayoutGrid className="w-8 h-8 text-accent" />
-            <span>Digital Assets</span>
+          <h1 className="flex items-center space-x-4 text-3xl font-bold tracking-tight text-white">
+            <LayoutGrid className="h-8 w-8 text-accent" aria-hidden="true" />
+            <span>Your Videos</span>
           </h1>
-          <p className="text-[11px] font-semibold text-white/30 uppercase tracking-[0.3em]">
-            Verified Neural Output Feed
+          <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-white/30">
+            {submissions.length} upload(s) · owned by you
           </p>
         </div>
-        
+
         <div className="flex items-center space-x-6">
-          <div className="bg-white/[0.02] border border-white/5 rounded-2xl px-5 py-3 flex items-center space-x-4 focus-within:border-accent/40 transition-all">
-            <Search className="w-4 h-4 text-white/20" />
-            <input 
-              type="text" 
-              placeholder="Search assets..." 
-              className="bg-transparent border-none outline-none text-xs font-medium text-white placeholder:text-white/10 w-64"
+          <div className="flex items-center space-x-4 rounded-2xl border border-white/5 bg-white/[0.02] px-5 py-3 transition-all focus-within:border-accent/40">
+            <Search className="h-4 w-4 text-white/20" aria-hidden="true" />
+            <label htmlFor="asset-search" className="sr-only">
+              Filter your videos by name
+            </label>
+            <input
+              id="asset-search"
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Filter by name..."
+              className="w-64 border-none bg-transparent text-xs font-medium text-white outline-none placeholder:text-white/20"
             />
           </div>
-          <button className="bg-white/[0.02] hover:bg-white/5 p-3 rounded-2xl border border-white/5 transition-all text-white/20 hover:text-white">
-            <Filter className="w-5 h-5" />
-          </button>
         </div>
       </header>
 
-      {/* Filter Tabs */}
-      <div className="flex items-center gap-4 overflow-x-auto pb-6 no-scrollbar shrink-0">
-        {["ALL NODES", "LLAVA-CORE", "ACT-AGENT", "VERIFIED"].map((tab) => (
-          <button 
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            className={cn(
-              "px-8 py-4 rounded-2xl text-[10px] font-bold uppercase tracking-widest transition-all whitespace-nowrap flex-shrink-0",
-              activeTab === tab ? "bg-accent text-white shadow-xl shadow-accent/20" : "bg-white/[0.01] text-white/40 hover:bg-white/5 border border-white/5"
-            )}
-          >
-            {tab}
-          </button>
-        ))}
-      </div>
+      {loading && submissions.length === 0 && (
+        <LoadingPanel label="Loading your videos" />
+      )}
 
-      {/* Submission Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-10 pb-20">
-        {loading ? (
-          [1,2,3].map(i => (
-            <div key={i} className="bg-white/[0.01] h-80 animate-pulse rounded-[2rem] border border-white/5" />
-          ))
-        ) : loadError ? (
-          <div
-            role="alert"
-            className="md:col-span-2 lg:col-span-3 rounded-[2rem] border border-critical/30 bg-critical/5 p-8 text-xs font-bold uppercase tracking-widest text-critical"
-          >
-            {loadError}
-          </div>
-        ) : (
-          (submissions || []).map((sub) => (
-            <motion.div 
-              key={sub.id}
-              whileHover={{ y: -8 }}
-              className="bg-white/[0.02] border border-white/5 rounded-[2rem] overflow-hidden flex flex-col group transition-all hover:border-accent/20 hover:shadow-2xl"
-            >
-              <div className="aspect-video relative overflow-hidden bg-black/40">
-                <video 
-                  src={sub.url} 
-                  className="w-full h-full object-cover opacity-60 group-hover:opacity-100 transition-opacity"
-                  muted
-                />
-                
-                {sub.status === "VERIFIED" && (
-                  <div className="absolute top-6 left-6 flex items-center space-x-2 bg-black/80 backdrop-blur-xl border border-success/30 px-3 py-1.5 rounded-full">
-                    <ShieldCheck className="w-3.5 h-3.5 text-success" />
-                    <span className="text-[10px] font-bold text-success tracking-widest uppercase">Verified</span>
-                  </div>
-                )}
-              </div>
+      {loadError && <ErrorBanner message={loadError} onRetry={reload} />}
 
-              <div className="p-8 space-y-6">
-                <div>
-                  <h3 className="text-base font-bold text-white tracking-wide truncate">{sub.title}</h3>
-                  <div className="flex items-center space-x-2 mt-2">
-                    <span className="text-[10px] font-semibold text-white/20 uppercase tracking-tighter">{formatUploadedAt(sub.created_at)}</span>
-                    <span className="text-white/10 text-xs">•</span>
-                    <span className="text-[10px] font-semibold text-white/20 uppercase tracking-tighter">{formatSize(sub.size_bytes)}</span>
+      {!loading && !loadError && submissions.length === 0 && (
+        <EmptyState
+          title="No videos yet"
+          hint="Uploads you make from the dashboard appear here, with the state of each one's analysis."
+        />
+      )}
+
+      {!loadError && submissions.length > 0 && visible.length === 0 && (
+        <EmptyState
+          title="No matches"
+          hint={`None of your ${submissions.length} upload(s) match "${query.trim()}".`}
+        />
+      )}
+
+      {visible.length > 0 && (
+        <ul className="grid grid-cols-1 gap-10 pb-20 md:grid-cols-2 lg:grid-cols-3">
+          {visible.map((sub) => {
+            const state = jobStateOf(sub.status);
+            const title = sub.title || sub.original_filename || sub.id;
+
+            return (
+              <motion.li
+                key={sub.id}
+                whileHover={{ y: -8 }}
+                className="flex flex-col overflow-hidden rounded-[2rem] border border-white/5 bg-white/[0.02] transition-all hover:border-accent/20"
+              >
+                <div className="relative aspect-video overflow-hidden bg-black/40">
+                  {/* The playback URL carries a short-lived media token; it is
+                      never logged and never persisted. `preload="metadata"`
+                      keeps the grid from downloading every video in full. */}
+                  <video
+                    src={sub.url}
+                    preload="metadata"
+                    muted
+                    aria-label={`Preview of ${title}`}
+                    className="h-full w-full object-cover opacity-60 transition-opacity hover:opacity-100"
+                  />
+                  <div className="absolute left-5 top-5">
+                    <StatusBadge
+                      label={JOB_STATE_LABELS[state]}
+                      tone={toneForState(state)}
+                      className="backdrop-blur-xl"
+                    />
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4">
-                  <button 
+                <div className="flex flex-1 flex-col justify-between space-y-6 p-8">
+                  <div>
+                    <h3 className="truncate text-base font-bold tracking-wide text-white">
+                      {title}
+                    </h3>
+                    <p className="mt-2 text-[10px] uppercase tracking-tighter text-white/25">
+                      {formatDateTime(sub.created_at)} · {formatBytes(sub.size_bytes)}
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
                     onClick={() => onSelect(sub)}
-                    className="flex items-center justify-center space-x-3 py-4 rounded-2xl bg-white/5 hover:bg-accent text-white/60 hover:text-white border border-white/5 transition-all text-xs font-bold uppercase tracking-widest"
+                    className={cn(
+                      "flex items-center justify-center space-x-3 rounded-2xl border border-white/5",
+                      "bg-white/5 py-4 text-xs font-bold uppercase tracking-widest text-white/60",
+                      "transition-all hover:bg-accent hover:text-white",
+                      "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                    )}
                   >
-                    <Play className="w-4 h-4" />
-                    <span>Review</span>
-                  </button>
-                  <button className="flex items-center justify-center space-x-3 py-4 rounded-2xl bg-white/5 hover:bg-primary text-white/60 hover:text-white border border-white/5 transition-all text-xs font-bold uppercase tracking-widest">
-                    <Share2 className="w-4 h-4" />
-                    <span>Post</span>
+                    <Play className="h-4 w-4" aria-hidden="true" />
+                    <span>Review audit</span>
                   </button>
                 </div>
-              </div>
-            </motion.div>
-          ))
-        )}
-      </div>
+              </motion.li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }

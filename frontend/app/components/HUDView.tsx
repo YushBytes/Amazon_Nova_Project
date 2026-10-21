@@ -1,36 +1,29 @@
 "use client";
 
 import React from "react";
-import { 
-  Play, 
-  Activity, 
-  CheckCircle2,
-  Eye,
-  MoreVertical,
-  Zap,
-  Rocket,
-  FileVideo,
-  Bell,
-  Search
-} from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
-import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
+import { Activity, FileVideo, Rocket, ShieldCheck, VideoOff } from "lucide-react";
+import { motion } from "framer-motion";
+import { cn } from "../lib/utils";
 import {
   ApiError,
+  allowedVideoExtensions,
+  describeError,
   fetchAllViolations,
   fetchJob,
+  formatBytes,
+  isAbortError,
   isRenderableDetection,
+  maxUploadBytes,
   retryAnalysis,
   startAnalysis,
   uploadReel,
+  validateVideoFile,
   type Detection,
   type Job,
 } from "../lib/api";
-
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
+import { formatTimestamp, verdictFor } from "../lib/jobs";
+import { EmptyState, StatusBadge, UnavailablePanel } from "./ui/Feedback";
+import ViolationList from "./ViolationList";
 
 /**
  * Local phases for the parts of the flow the UI owns.
@@ -42,9 +35,7 @@ function cn(...inputs: ClassValue[]) {
  *   failed    the upload or the trigger failed client-side
  *
  * Phase 4: once a job exists, the backend's validated `job.state` decides
- * what is displayed. The UI no longer infers progress or completion - it was
- * previously unable to show completion at all, because no completion signal
- * existed.
+ * what is displayed. The UI never infers progress or completion.
  */
 type AuditPhase = "idle" | "uploading" | "starting" | "tracking" | "failed";
 
@@ -65,7 +56,6 @@ interface SubmissionSummary {
 }
 
 export default function HUDView() {
-  const [goal, setGoal] = React.useState("");
   const [submissions, setSubmissions] = React.useState<SubmissionSummary[]>([]);
   const [activeVideoId, setActiveVideoId] = React.useState<string | null>(null);
   const [detections, setDetections] = React.useState<Detection[]>([]);
@@ -89,7 +79,9 @@ export default function HUDView() {
 
   const [videoSrc, setVideoSrc] = React.useState<string | null>(null);
   const [selectedFile, setSelectedFile] = React.useState<File | null>(null);
-  const [activeTab, setActiveTab] = React.useState("Overview");
+  // Inline validation for the file field, replacing a silent accept of a
+  // file the backend was always going to reject.
+  const [fileError, setFileError] = React.useState<string | null>(null);
 
   // The recent-uploads list is session state only. It was previously
   // hydrated from a "novaflow_submissions" localStorage key that nothing ever
@@ -118,7 +110,6 @@ export default function HUDView() {
           : auditPhase === "uploading"
             ? "Transferring payload to backend..."
             : "Awaiting a selected video.",
-        time: "",
       },
       {
         title: "Analysis Trigger",
@@ -135,7 +126,6 @@ export default function HUDView() {
           : auditPhase === "starting"
             ? "Requesting frame extraction and audit..."
             : "Not yet requested.",
-        time: "",
       },
       {
         // Stages and counts come from the backend's job record. Nothing here
@@ -156,7 +146,6 @@ export default function HUDView() {
             : job?.state === "extracting"
               ? "Decoding and sampling frames..."
               : "Not started.",
-        time: "",
       },
       {
         title: "Frame Audit",
@@ -177,7 +166,6 @@ export default function HUDView() {
               : job?.state === "failed"
                 ? job.error_summary ?? "Analysis failed."
                 : "No frames audited yet.",
-        time: "",
       },
     ];
   }, [auditPhase, uploadedVideoId, job]);
@@ -189,6 +177,18 @@ export default function HUDView() {
   // and restart polling in a loop.
   const jobIsTerminal = job?.is_terminal ?? false;
 
+  // Aborts in-flight requests when the view goes away. Deliberately NOT tied
+  // to the polling effect's cleanup: that cleanup also runs when the job
+  // turns terminal, which is exactly the moment the results fetch starts, so
+  // aborting there would cancel the fetch that loads the findings.
+  const abortRef = React.useRef<AbortController | null>(null);
+  React.useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+    };
+  }, []);
+
   React.useEffect(() => {
     if (!activeVideoId || auditPhase !== "tracking") return;
     if (jobIsTerminal) return;
@@ -197,14 +197,22 @@ export default function HUDView() {
     let failures = 0;
     let polls = 0;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     const loadResults = async (videoId: string) => {
       try {
-        const data = await fetchAllViolations(videoId);
+        const data = await fetchAllViolations(videoId, { signal: controller.signal });
         if (cancelled) return;
         setDetections(data.detections);
       } catch (err) {
-        if (!cancelled) console.error("Could not load results", err);
+        // A cancellation is not a failure to report, and the URL is never
+        // logged: a media token can appear in a query string.
+        if (!cancelled && !isAbortError(err)) {
+          setPollNotice(
+            describeError(err, "The audit finished but its results could not be loaded.")
+          );
+        }
       }
     };
 
@@ -213,7 +221,7 @@ export default function HUDView() {
       polls += 1;
 
       try {
-        const next = await fetchJob(activeVideoId);
+        const next = await fetchJob(activeVideoId, { signal: controller.signal });
         if (cancelled) return;
 
         failures = 0;
@@ -227,7 +235,7 @@ export default function HUDView() {
           return; // terminal: stop polling
         }
       } catch (err) {
-        if (cancelled) return;
+        if (cancelled || isAbortError(err)) return;
 
         if (err instanceof ApiError && err.isUnauthorized) {
           // Session gone: stop rather than hammering a route that will keep
@@ -260,9 +268,7 @@ export default function HUDView() {
       }
 
       if (polls >= MAX_POLLS) {
-        setPollNotice(
-          "Still running after a long time. Reload to check again."
-        );
+        setPollNotice("Still running after a long time. Reload to check again.");
         return;
       }
 
@@ -275,84 +281,181 @@ export default function HUDView() {
     void poll();
 
     return () => {
+      // `cancelled` is what prevents a late response from overwriting newer
+      // UI state; the abort itself happens on unmount (see above).
       cancelled = true;
       if (timer !== null) clearTimeout(timer);
     };
   }, [activeVideoId, auditPhase, jobIsTerminal]);
 
+  /** Seek the player to a finding's timestamp. */
+  const seekTo = React.useCallback((seconds: number) => {
+    const player = videoRef.current;
+    if (!player) return;
+    try {
+      player.currentTime = seconds;
+      setCurrentTime(seconds);
+    } catch {
+      // Seeking can throw before metadata has loaded; nothing to report.
+    }
+  }, []);
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    // Mirrors the backend's own checks so the user is told immediately
+    // rather than after transferring the whole file. The backend validates
+    // independently and remains the authority.
+    const problem = validateVideoFile(file);
+    if (problem) {
+      setFileError(problem);
+      setSelectedFile(null);
+      return;
+    }
+    setFileError(null);
+    setSelectedFile(file);
+  };
+
+  const launchAudit = async () => {
+    if (!selectedFile) return;
+    // Hard guard against duplicate submissions.
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    setAuditError(null);
+
+    try {
+      // Step 1: upload, unless a previous attempt already uploaded this file
+      // and only the trigger failed.
+      let videoId = uploadedVideoId;
+      if (!videoId) {
+        setAuditPhase("uploading");
+        const uploaded = await uploadReel(selectedFile);
+        videoId = uploaded.video_id;
+        // Bound to a non-nullable local so the list entry cannot be built
+        // with a null id.
+        const newVideoId: string = videoId;
+        setUploadedVideoId(newVideoId);
+        setActiveVideoId(newVideoId);
+        setVideoSrc(uploaded.video_url);
+        setSubmissions((prev) => [
+          {
+            id: newVideoId,
+            title: selectedFile.name,
+            time: new Date().toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+            // Reflects the real backend state after upload.
+            status: "UPLOADED",
+          },
+          ...prev,
+        ]);
+      }
+
+      // Step 2: actually trigger the analysis pipeline.
+      setAuditPhase("starting");
+      const started = await startAnalysis(videoId);
+      // Adopt the job the backend returned; its state - not a local guess -
+      // drives everything from here.
+      if (started.job) setJob(started.job);
+      setAuditPhase("tracking");
+    } catch (err) {
+      setAuditError(describeError(err, "The audit could not be started."));
+      setAuditPhase("failed");
+    } finally {
+      inFlightRef.current = false;
+    }
+  };
+
+  const launchDisabled =
+    !selectedFile ||
+    auditPhase === "uploading" ||
+    auditPhase === "starting" ||
+    // Locked while the backend still owns a non-terminal job, so a second
+    // run cannot be started over the first.
+    (auditPhase === "tracking" && !job?.is_terminal);
+
+  // The compliance verdict, which is NOT the job state: only a completed job
+  // can be described as clean, and only the server's recorded total decides.
+  const verdict = verdictFor(job, detections.length);
+  const extensions = allowedVideoExtensions();
+
   return (
-    <motion.div 
+    <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       className="space-y-12"
     >
-      {/* Top Navigation / Tabs */}
-      <div className="flex flex-wrap items-center gap-x-12 gap-y-4 border-b border-white/5">
-        {["Overview", "Project Assets", "Telemetry"].map(tab => (
-          <button 
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            className={cn(
-              "pb-6 text-xs font-bold transition-all relative uppercase tracking-widest whitespace-nowrap",
-              activeTab === tab ? "text-primary" : "text-white/20 hover:text-white/40"
-            )}
-          >
-            {tab}
-            {activeTab === tab && (
-              <motion.div layoutId="tab-underline" className="absolute bottom-0 left-0 right-0 h-px bg-primary shadow-glow" />
-            )}
-          </button>
-        ))}
-      </div>
-
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-10 items-start">
-        {/* Left Column: Video & Goal */}
+        {/* Left Column: Video, ingest, findings */}
         <div className="xl:col-span-8 space-y-10">
           {/* Video Feed Area */}
-          <section className="relative overflow-hidden rounded-[2rem] border border-white/5 bg-black/20 shadow-2xl group/video">
+          <section
+            aria-label="Video preview"
+            className="relative overflow-hidden rounded-[2rem] border border-white/5 bg-black/20 shadow-2xl"
+          >
             <div className="aspect-video relative">
-              <video 
-                ref={videoRef}
-                onTimeUpdate={(e) =>
-                  setCurrentTime(e.currentTarget.currentTime)
-                }
-                src={videoSrc || "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"}
-                className="w-full h-full object-cover"
-                controls
-              />
-              
-              {/* Real-Time Bounding Box Overlay */}
-              <div className="absolute inset-0 pointer-events-none">
-                {detections
-                  // Skip malformed model output rather than rendering NaN.
-                  .filter(isRenderableDetection)
-                  .filter(
-                    (d) =>
-                      typeof d.timestamp === "number" &&
-                      Math.abs(d.timestamp - currentTime) < 0.5
-                  )
-                  .map((d, idx) => (
-                  <motion.div
-                    key={idx}
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="absolute border-2 border-critical shadow-glow-critical rounded-md"
-                    style={{
-                      top: `${d.bounding_box![0] / 10}%`,
-                      left: `${d.bounding_box![1] / 10}%`,
-                      height: `${(d.bounding_box![2] - d.bounding_box![0]) / 10}%`,
-                      width: `${(d.bounding_box![3] - d.bounding_box![1]) / 10}%`,
-                    }}
-                  >
-                    <div className="absolute -top-7 left-0 bg-critical text-white text-[10px] font-bold px-3 py-1 rounded-t-md whitespace-nowrap">
-                      {d.category ?? "violation"}
-                      {typeof d.confidence === "number"
-                        ? ` • ${Math.round(d.confidence * 100)}%`
-                        : ""}
-                    </div>
-                  </motion.div>
-                ))}
-              </div>
+              {videoSrc ? (
+                <video
+                  ref={videoRef}
+                  onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+                  src={videoSrc}
+                  className="w-full h-full object-contain"
+                  controls
+                />
+              ) : (
+                /* No stand-in clip. This panel previously played a sample
+                   video hosted by MDN, which looked like a live feed from
+                   the user's own content and was not theirs at all. */
+                <div
+                  data-testid="no-video"
+                  className="flex h-full w-full flex-col items-center justify-center gap-4 px-8 text-center"
+                >
+                  <VideoOff className="h-8 w-8 text-white/15" aria-hidden="true" />
+                  <p className="text-[11px] font-bold uppercase tracking-widest text-white/40">
+                    No video loaded
+                  </p>
+                  <p className="max-w-sm text-[11px] leading-relaxed text-white/25">
+                    Select a video below and launch an audit. The uploaded clip
+                    plays here with any detected violations drawn over it.
+                  </p>
+                </div>
+              )}
+
+              {/* Violation overlay, drawn only for findings near the current
+                  playback position and only from a validated bounding box. */}
+              {videoSrc && (
+                <div className="absolute inset-0 pointer-events-none">
+                  {detections
+                    // Type predicate: skips malformed model output, and
+                    // narrows the box so no assertion is needed below.
+                    .filter(isRenderableDetection)
+                    .filter(
+                      (d) =>
+                        typeof d.timestamp === "number" &&
+                        Math.abs(d.timestamp - currentTime) < 0.5
+                    )
+                    .map((d, idx) => (
+                      <motion.div
+                        key={idx}
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        className="absolute border-2 border-critical shadow-glow-critical rounded-md"
+                        style={{
+                          top: `${d.bounding_box[0] / 10}%`,
+                          left: `${d.bounding_box[1] / 10}%`,
+                          height: `${(d.bounding_box[2] - d.bounding_box[0]) / 10}%`,
+                          width: `${(d.bounding_box[3] - d.bounding_box[1]) / 10}%`,
+                        }}
+                      >
+                        <div className="absolute -top-7 left-0 bg-critical text-white text-[10px] font-bold px-3 py-1 rounded-t-md whitespace-nowrap">
+                          {d.category ?? "violation"}
+                        </div>
+                      </motion.div>
+                    ))}
+                </div>
+              )}
             </div>
           </section>
 
@@ -361,39 +464,80 @@ export default function HUDView() {
             <section className="bg-white/[0.02] border border-white/5 rounded-[2rem] p-10 space-y-8 flex flex-col">
               <div className="flex items-center space-x-4">
                 <div className="w-12 h-12 bg-accent/5 rounded-2xl flex items-center justify-center border border-accent/20">
-                  <Rocket className="w-6 h-6 text-accent" />
+                  <Rocket className="w-6 h-6 text-accent" aria-hidden="true" />
                 </div>
                 <div className="flex-1">
-                  <h2 className="text-sm font-bold text-white uppercase tracking-widest leading-tight">Video Ingest</h2>
-                  <p className="text-[10px] text-white/30 uppercase font-medium tracking-tight mt-1">Ready for Neural Sync</p>
+                  <h2 className="text-sm font-bold text-white uppercase tracking-widest leading-tight">
+                    Video Ingest
+                  </h2>
+                  <p className="text-[10px] text-white/30 uppercase font-medium tracking-tight mt-1">
+                    Upload, then audit
+                  </p>
                 </div>
               </div>
 
-              <div 
+              {/* A real button, so it is reachable by keyboard and announced
+                  as a control. It was a click-only <div>. */}
+              <button
+                type="button"
                 onClick={() => videoInputRef.current?.click()}
+                aria-describedby="file-constraints"
                 className={cn(
-                  "border-2 border-dashed rounded-3xl p-10 flex flex-col items-center justify-center space-y-4 transition-all cursor-pointer flex-1 min-h-[160px]",
-                  selectedFile ? "border-accent/40 bg-accent/5" : "border-white/5 hover:border-white/10 hover:bg-white/[0.01]"
+                  "border-2 border-dashed rounded-3xl p-10 flex flex-col items-center justify-center",
+                  "space-y-4 transition-all flex-1 min-h-[160px] w-full",
+                  "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent",
+                  fileError
+                    ? "border-critical/40 bg-critical/5"
+                    : selectedFile
+                      ? "border-accent/40 bg-accent/5"
+                      : "border-white/5 hover:border-white/10 hover:bg-white/[0.01]"
                 )}
               >
-                <input 
-                  type="file" 
-                  ref={videoInputRef}
-                  accept="video/*" 
-                  className="hidden" 
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (file) setSelectedFile(file);
-                  }}
+                <FileVideo
+                  className={cn("w-10 h-10", selectedFile ? "text-accent" : "text-white/10")}
+                  aria-hidden="true"
                 />
-                <FileVideo className={cn("w-10 h-10", selectedFile ? "text-accent" : "text-white/10")} />
-                <div className="text-center">
-                  <p className="text-xs font-bold text-white/80">
-                    {selectedFile ? selectedFile.name : "Select Video Payload"}
-                  </p>
-                  <p className="text-[10px] text-white/20 uppercase mt-2">Max 60MB / 60S</p>
-                </div>
-              </div>
+                <span className="text-center">
+                  <span className="block text-xs font-bold text-white/80">
+                    {selectedFile ? selectedFile.name : "Select a video file"}
+                  </span>
+                  <span className="block text-[10px] text-white/20 uppercase mt-2">
+                    {selectedFile
+                      ? formatBytes(selectedFile.size)
+                      : "Click to browse"}
+                  </span>
+                </span>
+              </button>
+
+              <input
+                type="file"
+                id="video-file"
+                ref={videoInputRef}
+                accept={extensions.map((ext) => `.${ext}`).join(",")}
+                className="sr-only"
+                aria-label="Video file to audit"
+                onChange={handleFileChange}
+              />
+
+              {/* The real configured limits, not a guess. These mirror the
+                  backend's MAX_UPLOAD_BYTES and ALLOWED_VIDEO_EXTENSIONS;
+                  the server validates independently and wins. */}
+              <p
+                id="file-constraints"
+                className="text-[10px] uppercase tracking-widest text-white/25"
+              >
+                Up to {formatBytes(maxUploadBytes())} · {extensions.join(", ")}
+              </p>
+
+              {fileError && (
+                <p
+                  role="alert"
+                  data-testid="file-error"
+                  className="rounded-2xl border border-critical/40 bg-critical/10 px-5 py-4 text-[10px] font-bold uppercase tracking-widest text-critical"
+                >
+                  {fileError}
+                </p>
+              )}
 
               {/* Workflow status. Every value below comes from the backend's
                   validated job record: "Audit complete" appears only when the
@@ -429,9 +573,7 @@ export default function HUDView() {
                           found
                         </div>
                       ) : job.state === "failed" ? (
-                        <div>
-                          Audit failed: {job.error_summary ?? "unknown error"}
-                        </div>
+                        <div>Audit failed: {job.error_summary ?? "unknown error"}</div>
                       ) : (
                         <div>
                           {job.stage}
@@ -443,6 +585,19 @@ export default function HUDView() {
                       {job.attempt > 1 && (
                         <div className="opacity-60">
                           Attempt {job.attempt} of {job.max_attempts}
+                        </div>
+                      )}
+                      {/* The backend exposes this precisely so an
+                          automatically restarted run is not invisible. */}
+                      {(job.recovered_count ?? 0) > 0 && (
+                        <div className="opacity-60">
+                          Automatically restarted {job.recovered_count} time(s)
+                          after an interrupted run.
+                        </div>
+                      )}
+                      {job.frames_failed != null && job.frames_failed > 0 && (
+                        <div className="opacity-60">
+                          {job.frames_failed} frame(s) could not be analyzed.
                         </div>
                       )}
                     </>
@@ -460,6 +615,7 @@ export default function HUDView() {
                   finished unsuccessfully, and only while attempts remain. */}
               {job?.state === "failed" && job.attempt < job.max_attempts && (
                 <button
+                  type="button"
                   data-testid="retry-audit"
                   disabled={isRetrying}
                   onClick={async () => {
@@ -473,92 +629,34 @@ export default function HUDView() {
                       setAuditPhase("tracking");
                     } catch (err) {
                       setPollNotice(
-                        err instanceof Error
-                          ? err.message
-                          : "Could not retry the analysis."
+                        describeError(err, "Could not retry the analysis.")
                       );
                     } finally {
                       setIsRetrying(false);
                     }
                   }}
-                  className="w-full h-12 rounded-2xl border border-white/10 bg-white/5 hover:bg-white/10 text-white font-bold text-xs uppercase tracking-widest transition-all"
+                  className={cn(
+                    "w-full h-12 rounded-2xl border border-white/10 bg-white/5 text-white",
+                    "font-bold text-xs uppercase tracking-widest transition-all",
+                    "hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-2",
+                    "focus-visible:outline-primary"
+                  )}
                 >
                   {isRetrying ? "Retrying..." : "Retry Analysis"}
                 </button>
               )}
 
               <button
+                type="button"
                 data-testid="launch-audit"
-                disabled={
-                  !selectedFile ||
-                  auditPhase === "uploading" ||
-                  auditPhase === "starting" ||
-                  // Locked while the backend still owns a non-terminal job, so
-                  // a second run cannot be started over the first.
-                  (auditPhase === "tracking" && !job?.is_terminal)
-                }
-                onClick={async () => {
-                  if (!selectedFile) return;
-                  // Hard guard against duplicate submissions.
-                  if (inFlightRef.current) return;
-                  inFlightRef.current = true;
-                  setAuditError(null);
-
-                  try {
-                    // Step 1: upload, unless a previous attempt already
-                    // uploaded this file and only the trigger failed.
-                    let videoId = uploadedVideoId;
-                    if (!videoId) {
-                      setAuditPhase("uploading");
-                      const uploaded = await uploadReel(selectedFile);
-                      videoId = uploaded.video_id;
-                      // Bound to a non-nullable local so the list entry
-                      // cannot be built with a null id.
-                      const newVideoId: string = videoId;
-                      setUploadedVideoId(newVideoId);
-                      setActiveVideoId(newVideoId);
-                      setVideoSrc(uploaded.video_url);
-                      setSubmissions((prev) => [
-                        {
-                          id: newVideoId,
-                          title: selectedFile.name,
-                          time: new Date().toLocaleTimeString([], {
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          }),
-                          // Reflects the real backend state after upload.
-                          status: "UPLOADED",
-                        },
-                        ...prev,
-                      ]);
-                    }
-
-                    // Step 2: actually trigger the analysis pipeline. This
-                    // call was missing entirely, so no upload was ever
-                    // analysed.
-                    setAuditPhase("starting");
-                    const started = await startAnalysis(videoId);
-                    // Adopt the job the backend returned; its state - not a
-                    // local guess - drives everything from here.
-                    if (started.job) setJob(started.job);
-                    setAuditPhase("tracking");
-                  } catch (err) {
-                    setAuditError(
-                      err instanceof Error ? err.message : String(err)
-                    );
-                    setAuditPhase("failed");
-                  } finally {
-                    inFlightRef.current = false;
-                  }
-                }}
+                disabled={launchDisabled}
+                onClick={launchAudit}
                 className={cn(
                   "w-full h-14 rounded-2xl font-bold text-xs uppercase tracking-widest transition-all",
-                  selectedFile &&
-                    auditPhase !== "uploading" &&
-                    auditPhase !== "starting" &&
-                    !(auditPhase === "tracking" && !job?.is_terminal)
+                  "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent",
+                  !launchDisabled
                     ? "bg-accent text-white shadow-xl hover:translate-y-[-2px]"
-                    : "bg-white/5 text-white/10"
+                    : "bg-white/5 text-white/30"
                 )}
               >
                 {auditPhase === "uploading" && "Uploading..."}
@@ -570,99 +668,178 @@ export default function HUDView() {
               </button>
             </section>
 
-            {/* Prompt Area */}
+            {/* Pipeline telemetry */}
             <section className="bg-white/[0.02] border border-white/5 rounded-[2rem] p-10 space-y-8 flex flex-col">
               <div className="flex items-center space-x-4">
                 <div className="w-12 h-12 bg-primary/5 rounded-2xl flex items-center justify-center border border-primary/20">
-                  <Activity className="w-6 h-6 text-primary" />
+                  <Activity className="w-6 h-6 text-primary" aria-hidden="true" />
                 </div>
                 <div className="flex-1">
-                  <h2 className="text-sm font-bold text-white uppercase tracking-widest leading-tight">Neural Command</h2>
-                  <p className="text-[10px] text-white/30 uppercase font-medium tracking-tight mt-1">Task Definition Layer</p>
+                  <h2 className="text-sm font-bold text-white uppercase tracking-widest leading-tight">
+                    Pipeline
+                  </h2>
+                  <p className="text-[10px] text-white/30 uppercase font-medium tracking-tight mt-1">
+                    Stages reported by the backend
+                  </p>
                 </div>
               </div>
 
-              <textarea
-                value={goal}
-                onChange={(e) => setGoal(e.target.value)}
-                placeholder="Enter audit parameters..."
-                className="flex-1 w-full bg-white/[0.01] border border-white/5 rounded-2xl p-6 text-sm focus:outline-none focus:border-primary/20 transition-all placeholder:text-white/10 resize-none min-h-[160px]"
-              />
-
-              <button className="w-full h-14 rounded-2xl bg-white/5 border border-white/10 hover:bg-white/10 text-white font-bold text-xs uppercase tracking-widest transition-all mt-6">
-                Pulse Protocol
-              </button>
-            </section>
-          </div>
-        </div>
-
-        {/* Right Column: Feeds */}
-        <div className="xl:col-span-4 space-y-10">
-          <section className="bg-white/[0.02] border border-white/5 rounded-[2rem] p-10 space-y-10 flex flex-col h-full">
-            <div>
-              <h2 className="text-[10px] font-bold uppercase tracking-[0.3em] text-white/20 mb-8">System Telemetry</h2>
-              <div className="space-y-6">
-                {steps.map((step, i) => (
-                  <div key={i} className="flex space-x-6 items-start">
-                    <div className={cn(
-                      "w-1.5 h-1.5 rounded-full mt-2 shrink-0",
-                      step.status === 'success' ? "bg-primary shadow-glow" : 
-                      step.status === 'error' ? "bg-critical shadow-glow-critical" :
-                      step.status === 'active' ? "bg-accent animate-pulse" : "bg-white/10"
-                    )} />
+              <ol className="space-y-6">
+                {steps.map((step) => (
+                  <li key={step.title} className="flex space-x-6 items-start">
+                    <span
+                      aria-hidden="true"
+                      className={cn(
+                        "w-1.5 h-1.5 rounded-full mt-2 shrink-0",
+                        step.status === "success"
+                          ? "bg-primary shadow-glow"
+                          : step.status === "error"
+                            ? "bg-critical shadow-glow-critical"
+                            : step.status === "active"
+                              ? "bg-accent animate-pulse"
+                              : "bg-white/10"
+                      )}
+                    />
                     <div className="space-y-1">
-                      <div className="flex items-center justify-between gap-4">
-                        <h3 className="text-xs font-bold text-white/90">{step.title}</h3>
-                        {step.time && <span className="text-[9px] font-bold text-primary">{step.time}</span>}
-                      </div>
-                      <p className="text-[10px] text-white/30 font-medium leading-relaxed">{step.desc}</p>
+                      <h3 className="text-xs font-bold text-white/90">
+                        {step.title}
+                        {/* The dot is decorative; the state is also a word. */}
+                        <span className="sr-only">: {step.status}</span>
+                      </h3>
+                      <p className="text-[10px] text-white/30 font-medium leading-relaxed">
+                        {step.desc}
+                      </p>
                     </div>
-                  </div>
+                  </li>
                 ))}
-              </div>
-            </div>
+              </ol>
 
-            <div className="pt-10 border-t border-white/5 space-y-8 flex-1">
-              <h3 className="text-[10px] font-bold uppercase tracking-[0.3em] text-white/20">Audit Pipeline</h3>
-              <div className="space-y-4">
-                {submissions.slice(0, 4).map((sub) => (
-                  <div key={sub.id} className="flex items-center justify-between p-5 rounded-2xl bg-white/[0.01] border border-white/5 hover:bg-white/[0.03] transition-colors group">
-                    <div className="flex items-center space-x-4 min-w-0">
-                      <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center shrink-0">
-                        <Play className="w-4 h-4 text-white/20 group-hover:text-primary transition-colors" />
-                      </div>
-                      <div className="min-w-0">
-                        <p className="text-xs font-bold text-white truncate">{sub.title}</p>
-                        <p className="text-[9px] text-white/20 font-medium uppercase tracking-tighter mt-1">{sub.time}</p>
-                      </div>
-                    </div>
-                    <div className="flex items-center space-x-3 ml-4">
-                      <span className="text-[8px] font-bold text-primary/60 border border-primary/20 px-2 py-0.5 rounded uppercase">{sub.status}</span>
-                      <button className="p-2 transition-colors">
-                        <Eye className="w-4 h-4 text-white/10 group-hover:text-white" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-                {submissions.length === 0 && (
-                  <div className="text-center py-10 opacity-20 italic text-[10px] uppercase font-medium tracking-widest p-6 border border-dashed border-white/5 rounded-3xl">
-                    Awaiting Signals...
-                  </div>
+              <div className="pt-8 border-t border-white/5 space-y-4">
+                <h3 className="text-[10px] font-bold uppercase tracking-[0.3em] text-white/20">
+                  This Session
+                </h3>
+                {submissions.length === 0 ? (
+                  <p className="text-[10px] uppercase tracking-widest text-white/20">
+                    No uploads yet in this session.
+                  </p>
+                ) : (
+                  <ul className="space-y-3">
+                    {submissions.slice(0, 4).map((sub) => (
+                      <li
+                        key={sub.id}
+                        className="flex items-center justify-between gap-4 rounded-2xl bg-white/[0.01] border border-white/5 p-4"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-bold text-white">
+                            {sub.title}
+                          </p>
+                          <p className="mt-1 text-[9px] uppercase tracking-tighter text-white/20">
+                            {sub.time} · {sub.id}
+                          </p>
+                        </div>
+                        <StatusBadge label={sub.status} tone="neutral" />
+                      </li>
+                    ))}
+                  </ul>
                 )}
               </div>
+            </section>
+          </div>
+
+          {/* Findings. Rendered only from persisted results, and only once
+              the backend has reported a terminal state. */}
+          <section
+            aria-label="Audit findings"
+            className="bg-white/[0.02] border border-white/5 rounded-[2rem] p-10 space-y-8"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-6 border-b border-white/5 pb-6">
+              <div className="flex items-center gap-4">
+                <ShieldCheck className="h-6 w-6 text-primary" aria-hidden="true" />
+                <h2 className="text-sm font-bold uppercase tracking-widest text-white">
+                  Findings
+                </h2>
+              </div>
+              {job && (
+                <StatusBadge
+                  label={
+                    verdict === "clean"
+                      ? "No violations found"
+                      : verdict === "flagged"
+                        ? `${job.detections_recorded ?? detections.length} violation(s)`
+                        : verdict === "failed"
+                          ? "Analysis failed"
+                          : "Analysis incomplete"
+                  }
+                  tone={
+                    verdict === "clean"
+                      ? "success"
+                      : verdict === "flagged" || verdict === "failed"
+                        ? "critical"
+                        : "active"
+                  }
+                />
+              )}
             </div>
 
-            <div className="pt-10 border-t border-white/5 grid grid-cols-2 gap-10">
-              {[{ label: "Network", val: 82 }, { label: "Nodes", val: 54 }].map((item, i) => (
-                <div key={i} className="space-y-3">
-                  <p className="text-[9px] font-bold uppercase text-white/20 tracking-widest">{item.label}</p>
-                  <div className="h-1 bg-white/5 rounded-full overflow-hidden">
-                    <motion.div initial={{ width: 0 }} animate={{ width: `${item.val}%` }} className="h-full bg-primary" />
-                  </div>
-                </div>
-              ))}
-            </div>
+            {!job ? (
+              <EmptyState
+                title="No audit yet"
+                hint="Upload a video and launch an audit. Findings appear here once the backend reports the analysis finished."
+              />
+            ) : job.state === "failed" ? (
+              /* A failed analysis is never shown as compliant. There may be
+                 partial detections from frames that were audited before the
+                 failure; they are not a verdict. */
+              <EmptyState
+                title="Analysis failed — no verdict"
+                hint={
+                  job.error_summary ??
+                  "The analysis did not finish, so nothing can be concluded about this video."
+                }
+              />
+            ) : !job.is_terminal ? (
+              <EmptyState
+                title="Analysis in progress"
+                hint={`${job.stage}. Results are loaded only after the backend reports the analysis finished and its results were persisted.`}
+              />
+            ) : detections.length === 0 ? (
+              <EmptyState
+                title="No violations found"
+                hint={`The analysis completed and recorded no violations across ${
+                  job.frames_audited ?? 0
+                } audited frame(s). Frames are sampled at 1 fps, so a violation visible for under about a second can be missed.`}
+              />
+            ) : (
+              <>
+                <ViolationList detections={detections} onSeek={seekTo} />
+                {detections.length > 0 && (
+                  <p className="text-[10px] uppercase tracking-widest text-white/25">
+                    Playback position {formatTimestamp(currentTime) ?? "0:00"} ·
+                    {" "}
+                    {job.frames_audited ?? 0} frame(s) audited
+                  </p>
+                )}
+              </>
+            )}
           </section>
+        </div>
+
+        {/* Right Column */}
+        <div className="xl:col-span-4 space-y-10">
+          {/* Previously a free-text "Neural Command" box with a "Pulse
+              Protocol" button that was wired to nothing. The backend route
+              behind that idea (POST /execute) returns placeholder text from
+              an unimplemented orchestrator, so offering the control would
+              present a stub as a working feature. */}
+          <UnavailablePanel
+            title="Custom audit instructions"
+            explanation="Audits currently run against one fixed brand-safety prompt. Per-client rules, custom instructions and agent automation are not implemented in this build, so there is no control here to pretend otherwise."
+          />
+
+          <UnavailablePanel
+            title="What this build verifies"
+            explanation="Frames are sampled at 1 fps and sent to Amazon Bedrock for analysis. Detection accuracy has not been measured, and no part of this pipeline has been validated against live AWS infrastructure. Treat findings as assistance for a human reviewer, not as a compliance sign-off."
+          />
         </div>
       </div>
     </motion.div>

@@ -1,13 +1,36 @@
 "use client";
 
+/**
+ * Sign in and registration.
+ *
+ * Phase 7 changes:
+ *   - the two inputs now have real <label for> associations, so a screen
+ *     reader announces them and clicking the label focuses the field; the
+ *     error is `role="alert"` so a failure is announced rather than only
+ *     appearing;
+ *   - the role selector is gone. It set local state that was never sent and
+ *     never consulted, so choosing "Agent" changed nothing while implying
+ *     the client could pick its own privilege. The backend derives the role
+ *     from stored account data, and public signup always creates a Client;
+ *   - the footer claiming "Security Hash: SHA-256 (AUTO)" and "AES-256
+ *     Encryption Active" is gone. Passwords are hashed with Argon2id, the
+ *     SHA-256 claim was a leftover from the superseded scheme, and nothing
+ *     in this application performs AES encryption of anything.
+ *
+ * The 429 handling is unchanged and still load-bearing: /auth/login and
+ * /auth/signup are rate limited, so a throttled response must not be shown
+ * as a rejected password - that would push the user into retrying and burning
+ * more of their budget.
+ */
+
 import React, { useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Command, User, Shield, ArrowRight, Loader2, Sparkles } from "lucide-react";
+import { motion } from "framer-motion";
+import { ArrowRight, Command, Loader2 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { cn } from "../lib/utils";
+import { ApiError, login as loginRequest, signup as signupRequest } from "../lib/api";
 
 export default function LoginPage() {
-  const [role, setRole] = useState<"client" | "agent">("client");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [isLogin, setIsLogin] = useState(true);
@@ -20,135 +43,78 @@ export default function LoginPage() {
     setIsLoading(true);
     setError("");
 
-    const endpoint = isLogin ? "/auth/login" : "/auth/signup";
-    const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
     try {
-      const response = await fetch(`${API_URL}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // No role is sent. Registration always creates a least-privileged
-        // account server-side; the agent role is granted by an operator.
-        // Sending a role here would imply the client could choose it.
-        body: JSON.stringify({ username, password }),
-      });
-
-      // A throttled response may not carry a JSON body, so read it
-      // defensively rather than assuming one.
-      let detail: string | undefined;
-      try {
-        const data = await response.json();
-        detail = typeof data?.detail === "string" ? data.detail : undefined;
-
-        if (response.ok) {
-          login(data.access_token, data.role, username);
-          return;
-        }
-      } catch {
-        // Non-JSON body; fall through to the status-based message below.
-      }
-
-      if (response.status === 429) {
+      // No role is sent. Registration always creates a least-privileged
+      // account server-side; the agent role is granted by an operator.
+      const data = isLogin
+        ? await loginRequest(username, password)
+        : await signupRequest(username, password);
+      // Only after the request succeeded. A success message or a redirect
+      // before this point would claim an outcome that had not happened.
+      login(data.access_token, data.role, username);
+      return;
+    } catch (err) {
+      if (err instanceof ApiError && err.isThrottled) {
         // The credential endpoints are rate limited. Surface the wait time
         // from Retry-After so the user knows this is temporary rather than a
         // rejected password.
-        const retryAfter = Number(response.headers.get("Retry-After"));
+        const retryAfter = err.retryAfterSeconds;
         const wait =
-          Number.isFinite(retryAfter) && retryAfter > 0
+          retryAfter !== null
             ? `${retryAfter} second${retryAfter === 1 ? "" : "s"}`
             : "a moment";
         setError(`Too many attempts. Please wait ${wait} and try again.`);
-        return;
+      } else if (err instanceof ApiError) {
+        // The backend's own `detail`, which is written for a reader and
+        // never carries exception text.
+        setError(err.message || "Authentication failed");
+      } else if (err instanceof Error && err.message) {
+        // Network or unexpected failure. Never surface a raw object.
+        setError(err.message);
+      } else {
+        setError("Could not reach the server. Please try again.");
       }
-
-      setError(detail || "Authentication failed");
-    } catch (err: unknown) {
-      // Network or unexpected failure. Never surface a raw object.
-      setError(
-        err instanceof Error && err.message
-          ? err.message
-          : "Could not reach the server. Please try again."
-      );
     } finally {
       setIsLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex items-center justify-center p-6 relative overflow-hidden">
-      {/* Dynamic Background Glows */}
-      <div className="absolute top-0 left-0 w-full h-full pointer-events-none">
-        <motion.div 
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-6 text-foreground">
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute left-0 top-0 h-full w-full"
+      >
+        <motion.div
           animate={{ scale: [1, 1.2, 1], opacity: [0.1, 0.2, 0.1] }}
           transition={{ duration: 8, repeat: Infinity }}
-          className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-primary/20 blur-[120px] rounded-full" 
+          className="absolute left-[-10%] top-[-10%] h-[50%] w-[50%] rounded-full bg-primary/20 blur-[120px]"
         />
-        <motion.div 
+        <motion.div
           animate={{ scale: [1, 1.3, 1], opacity: [0.05, 0.15, 0.05] }}
           transition={{ duration: 10, repeat: Infinity, delay: 1 }}
-          className="absolute bottom-[-10%] right-[-10%] w-[60%] h-[60%] bg-accent/20 blur-[150px] rounded-full" 
+          className="absolute bottom-[-10%] right-[-10%] h-[60%] w-[60%] rounded-full bg-accent/20 blur-[150px]"
         />
       </div>
 
-      <motion.div 
+      <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
-        className="w-full max-w-xl relative z-10"
+        className="relative z-10 w-full max-w-xl"
       >
-        <div className="glass-card p-10 md:p-16 space-y-10 border-white/5 bg-white/[0.02] backdrop-blur-3xl shadow-2xl">
-          {/* Brand Header */}
-          <div className="flex flex-col items-center text-center space-y-4">
-            <div className="w-16 h-16 bg-primary rounded-2xl flex items-center justify-center shadow-glow mb-2">
-              <Command className="text-white w-10 h-10" />
+        <div className="glass-card space-y-10 border-white/5 bg-white/[0.02] p-10 shadow-2xl backdrop-blur-3xl md:p-16">
+          <div className="flex flex-col items-center space-y-4 text-center">
+            <div className="mb-2 flex h-16 w-16 items-center justify-center rounded-2xl bg-primary shadow-glow">
+              <Command className="h-10 w-10 text-white" aria-hidden="true" />
             </div>
             <div>
-              <h1 className="text-4xl font-black tracking-tighter text-white uppercase italic">NovaFlow</h1>
-              <p className="text-[10px] uppercase font-bold text-primary tracking-[0.4em] mt-1">Command Center Access</p>
+              <h1 className="text-4xl font-black uppercase italic tracking-tighter text-white">
+                NovaFlow
+              </h1>
+              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.4em] text-primary">
+                {isLogin ? "Sign in" : "Create an account"}
+              </p>
             </div>
-          </div>
-
-          {/* Role selection is a sign-in convenience only. It grants no
-              privilege: the backend derives the session role from stored
-              account data, and registration always creates a Client account.
-              Hiding or disabling a control is never authorization. */}
-          <div className="grid grid-cols-2 gap-6">
-            {[
-              {
-                id: "client",
-                label: "Client",
-                icon: User,
-                desc: "Organization Owner",
-                signupAllowed: true,
-              },
-              {
-                id: "agent",
-                label: "Agent",
-                icon: Shield,
-                desc: isLogin ? "Operational Unit" : "By approval only",
-                signupAllowed: false,
-              },
-            ].map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                disabled={!isLogin && !item.signupAllowed}
-                onClick={() => setRole(item.id as "client" | "agent")}
-                className={cn(
-                  "p-6 rounded-3xl border transition-all duration-500 text-left group relative overflow-hidden",
-                  role === item.id 
-                    ? "bg-primary border-primary shadow-2xl text-white" 
-                    : "bg-white/[0.02] border-white/10 text-white/40 hover:border-white/20 hover:bg-white/[0.04]"
-                )}
-              >
-                <item.icon className={cn("w-8 h-8 mb-3", role === item.id ? "text-white" : "text-primary/60 group-hover:scale-110 transition-transform")} />
-                <p className="font-bold text-lg uppercase tracking-widest leading-none">{item.label}</p>
-                <p className="text-xs font-semibold opacity-60 mt-1 uppercase tracking-widest leading-none">{item.desc}</p>
-                {role === item.id && (
-                  <motion.div layoutId="role-bg" className="absolute top-4 right-4 p-2">
-                    <Sparkles className="w-4 h-4 text-white/40 animate-pulse" />
-                  </motion.div>
-                )}
-              </button>
-            ))}
           </div>
 
           {!isLogin && (
@@ -158,77 +124,109 @@ export default function LoginPage() {
             </p>
           )}
 
-          {/* Auth Form */}
           <form onSubmit={handleAuth} className="space-y-6">
             <div className="space-y-4">
               <div className="space-y-2">
-                <label className="text-[10px] font-black uppercase tracking-widest text-white/40 ml-4">Identifier</label>
-                <input 
-                  type="text" 
+                <label
+                  htmlFor="username"
+                  className="ml-4 block text-[10px] font-black uppercase tracking-widest text-white/40"
+                >
+                  Username
+                </label>
+                <input
+                  id="username"
+                  name="username"
+                  type="text"
+                  autoComplete="username"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="USERNAME_NODEx"
-                  className="w-full bg-white/[0.03] border border-white/10 rounded-2xl p-5 text-sm focus:outline-none focus:border-primary/50 transition-all font-mono tracking-widest uppercase placeholder:text-white/5"
+                  className={cn(
+                    "w-full rounded-2xl border border-white/10 bg-white/[0.03] p-5 font-mono",
+                    "text-sm tracking-widest transition-all placeholder:text-white/20",
+                    "focus:border-primary/50 focus:outline-2 focus:outline-offset-2 focus:outline-primary"
+                  )}
                   required
                 />
               </div>
               <div className="space-y-2">
-                <label className="text-[10px] font-black uppercase tracking-widest text-white/40 ml-4">Authorization Code</label>
-                <input 
-                  type="password" 
+                <label
+                  htmlFor="password"
+                  className="ml-4 block text-[10px] font-black uppercase tracking-widest text-white/40"
+                >
+                  Password
+                </label>
+                <input
+                  id="password"
+                  name="password"
+                  type="password"
+                  autoComplete={isLogin ? "current-password" : "new-password"}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••••••"
-                  className="w-full bg-white/[0.03] border border-white/10 rounded-2xl p-5 text-sm focus:outline-none focus:border-primary/50 transition-all font-mono tracking-widest placeholder:text-white/5"
+                  className={cn(
+                    "w-full rounded-2xl border border-white/10 bg-white/[0.03] p-5 font-mono",
+                    "text-sm tracking-widest transition-all placeholder:text-white/10",
+                    "focus:border-primary/50 focus:outline-2 focus:outline-offset-2 focus:outline-primary"
+                  )}
                   required
                 />
               </div>
             </div>
 
             {error && (
-              <motion.div 
-                initial={{ opacity: 0, x: -10 }} 
+              <motion.p
+                role="alert"
+                initial={{ opacity: 0, x: -10 }}
                 animate={{ opacity: 1, x: 0 }}
-                className="bg-critical/10 border border-critical/30 p-4 rounded-xl text-[10px] font-black uppercase tracking-widest text-critical text-center"
+                className="rounded-xl border border-critical/30 bg-critical/10 p-4 text-center text-[11px] font-bold tracking-wide text-critical"
               >
-                ACCESS_DENIED: {error}
-              </motion.div>
+                {error}
+              </motion.p>
             )}
 
-            <button 
+            <button
               disabled={isLoading}
               type="submit"
-              className="w-full bg-primary hover:bg-accent disabled:opacity-50 text-white p-6 rounded-3xl font-black text-xs uppercase tracking-[0.3em] shadow-glow hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center justify-center space-x-3 group"
+              className={cn(
+                "group flex w-full items-center justify-center space-x-3 rounded-3xl bg-primary p-6",
+                "text-xs font-black uppercase tracking-[0.3em] text-white shadow-glow transition-all",
+                "hover:bg-accent active:scale-[0.98] disabled:opacity-50",
+                "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              )}
             >
               {isLoading ? (
-                <Loader2 className="w-5 h-5 animate-spin" />
+                <>
+                  <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
+                  <span>{isLogin ? "Signing in" : "Creating account"}</span>
+                </>
               ) : (
                 <>
-                  <span>{isLogin ? "INITIATE_HANDSHAKE" : "REGISTER_IDENTITY"}</span>
-                  <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                  <span>{isLogin ? "Sign in" : "Create account"}</span>
+                  <ArrowRight
+                    className="h-5 w-5 transition-transform group-hover:translate-x-1"
+                    aria-hidden="true"
+                  />
                 </>
               )}
             </button>
           </form>
 
-          {/* Footer Toggle */}
-          <div className="text-center pt-2">
-            <button 
-              onClick={() => setIsLogin(!isLogin)}
-              className="text-[10px] font-black uppercase tracking-widest text-white/20 hover:text-primary transition-colors italic"
+          <div className="pt-2 text-center">
+            <button
+              type="button"
+              onClick={() => {
+                setIsLogin(!isLogin);
+                setError("");
+              }}
+              className={cn(
+                "text-[10px] font-black uppercase italic tracking-widest text-white/30 transition-colors",
+                "hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2",
+                "focus-visible:outline-primary"
+              )}
             >
               {isLogin ? "> PROTOCOL_SIGNUP: NEW_USER" : "> PROTOCOL_LOGIN: EXISTING_USER"}
             </button>
           </div>
-        </div>
-
-        {/* Security Meta */}
-        <div className="mt-8 flex justify-between items-center px-4 opacity-20 text-[9px] font-black uppercase tracking-[0.2em] font-mono">
-           <div className="flex items-center space-x-2">
-              <span className="w-1.5 h-1.5 rounded-full bg-success" />
-              <span>Security Hash: SHA-256 (AUTO)</span>
-           </div>
-           <span>AES-256 Encryption Active</span>
         </div>
       </motion.div>
     </div>

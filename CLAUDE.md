@@ -131,6 +131,40 @@ Browser (:3000)
 **Every route that touches user data requires a JWT and an ownership check.**
 Unauthorized access returns **404, not 403**, so ids cannot be enumerated.
 
+### 2.4.1 Frontend surface **[VERIFIED 2026-10-21, Phase 7]**
+
+Three routes only — `/`, `/login`, and the generated `/_not-found`. The shell
+at `/` switches views in client state, so no view below it is deep-linkable.
+
+| View | Endpoints it calls | Role |
+| :-- | :-- | :-- |
+| `/login` | `POST /auth/login`, `POST /auth/signup` | public |
+| Dashboard | `/upload-reel`, `/analyze/{id}`, `/analyze/{id}/retry`, `/jobs/{id}`, `/violations/{id}` | agent |
+| Your Videos | `/submissions` | agent, client |
+| Audit detail | `/jobs/{id}`, `/violations/{id}`, `/analyze/{id}`, `/analyze/{id}/retry` | agent, client |
+| Compliance Log | `/submissions` | agent, client |
+| Infrastructure | `/health/worker` | agent |
+| Account | `/auth/me` (via the auth context) | agent, client |
+
+**Every fabricated panel was removed in Phase 7**, each with a regression
+test asserting the specific invented strings cannot return. The worst was
+`ProjectDetailView`'s unconditional "AUDIT PASSED / verified by NovaFlow
+Neural Agent #xyz / Compliance & quality standards met" card, rendered for
+every video regardless of job state — a direct violation of the rule in §5
+that an incomplete or failed analysis must never be labelled compliant.
+`frontend/README.md` lists all of them.
+
+Three panels now state that a capability does not exist rather than
+simulating it: custom audit instructions / brand rules (the route behind it,
+`POST /execute`, returns placeholder text — §9 q7), account management (no
+endpoint exists; signing out does not revoke the token), and per-worker
+telemetry (`/health/worker` infers from the queue; it does not contact the
+worker). **Do not wire a control to `POST /execute`** while §9 q7 is open.
+
+Not deep-linkable views, a detail view that loads once instead of polling, and
+client-side-only search over the already-fetched list are known limitations —
+see `frontend/README.md` "Known limitations".
+
 ### 2.5 Known architectural inconsistencies **[VERIFIED]**
 
 - **Bounding-box schemas (partly resolved):** `backend/prompts.py` uses `bounding_box: [ymin,xmin,ymax,xmax]` and the frontend consumes that array form (`HUDView.tsx`), so it is the contract. The `box_2d` variant died with `audit_manager.py`; `detections.parse_frame_analysis` still tolerates it on input. ⚠️ `.agent/skills/video-audit/SKILL.md` still documents `{x,y,width,height}` + `timestamp_ms` and **is wrong** — correcting it is Phase 10.3.
@@ -154,10 +188,10 @@ python -m py_compile backend/*.py analyzer_nova.py prompts.py
 # Backend tests — 679 passed, 42 skipped
 ./.venv/Scripts/python.exe -m pytest backend/tests -q
 
-# Frontend — all four pass; lint reports 0 errors / 18 warnings
-cd frontend && npm test          # 74 tests (Vitest)
+# Frontend — all four pass; lint reports 0 errors / 0 warnings (Phase 7)
+cd frontend && npm test          # 263 tests (Vitest), 14 files
 cd frontend && npm run typecheck # tsc --noEmit, exit 0
-cd frontend && npm run lint      # "eslint app" — now has a target
+cd frontend && npm run lint      # "eslint app"
 cd frontend && npm run build     # routes: / , /_not-found , /login
 ```
 
@@ -244,7 +278,16 @@ Pre-existing application configuration:
 | `API_URL` | `app.py:82` | `http://localhost:8000` |
 | `BEDROCK_GUARDRAIL_ID` | `safety.py:13` | **none** |
 | `BEDROCK_GUARDRAIL_VERSION` | `safety.py:14` | `1` |
-| `NEXT_PUBLIC_API_URL` | 4 frontend files | `http://localhost:8000` |
+| `NEXT_PUBLIC_API_URL` | `frontend/app/lib/api.ts` only (Phase 7) | `http://localhost:8000` |
+| `NEXT_PUBLIC_MAX_UPLOAD_BYTES` | `frontend/app/lib/api.ts` | `104857600` (100 MiB) |
+| `NEXT_PUBLIC_ALLOWED_VIDEO_EXTENSIONS` | `frontend/app/lib/api.ts` | `mp4,mov,avi,webm,mkv` |
+
+⚠️ **The two `NEXT_PUBLIC_*` upload limits only mirror the server's.** The
+browser cannot read `MAX_UPLOAD_BYTES` / `ALLOWED_VIDEO_EXTENSIONS`, so
+client-side validation is a pre-flight courtesy; the backend validates
+independently and its rejection message is surfaced verbatim. **Narrowing the
+server limits without setting these makes the UI advertise a limit the server
+refuses** — exactly the kind of untrue interface Phase 7 removed.
 
 AWS credentials come from the boto3 default chain, not from these variables. The JWT signing key is read from `JWT_SECRET_KEY`; it is no longer in the source.
 
@@ -277,6 +320,10 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **A job is `completed` only when analysis finished AND its results were persisted.** Never set that state from anywhere but `pipeline.run_job`'s final transition, and never infer it on the client. An empty detections list means nothing unless `job.state === "completed"` - that distinction is the whole point of the state machine.
 - **Add new job states to `job_state.py`'s transition table**, not as free-text. `video_repo.transition` validates every move and is conditional on the current state, which is what prevents two workers advancing one job.
 - **Report named stages, never percentages.** The frame total is unknown until extraction finishes, so any earlier percentage is invented.
+- **Frontend: derive every status from `app/lib/jobs.ts`** (Phase 7). `verdictFor` is the single place that decides whether an audit may be described as clean, and it refuses to for any state but `completed`. Four views share it; a view that re-derives a verdict locally is how the unconditional "Audit Passed" card happened. `jobStateOf` reads an unrecognised status as `uploaded` — the state that claims the least — rather than rendering it raw.
+- **Frontend: a missing model field stays missing.** `formatConfidence` returns null when the model reported no confidence, and the UI prints "Not reported". A rendered `0%` asserts certainty the model never expressed. Same for `risk_level`: an unrecognised value is shown verbatim, never mapped to a severity it may not mean.
+- **Frontend: never log a request URL.** `app/lib/api.ts` carries the same rule as `backend/logging_setup.py` — a playback URL has a media token in its query string, so a logged target leaks a credential to the browser console. Errors carry a status and a message.
+- **Frontend: never auto-retry an upload or an analysis start.** A repeated upload stores a second copy; a repeated analysis bills the model again per frame. Retry is always an explicit user action. Polling is scheduled only after the previous request settles, so requests cannot overlap.
 - **Treat model output as untrusted.** Parse it through `detections.parse_frame_analysis`. A missing confidence or an invalid box must stay absent rather than being defaulted - a fabricated `0.0` is worse than nothing.
 - **A pipeline stage must raise, not return `None`, on failure.** `extractor.ExtractionError` messages are shown to the video's owner, so they must carry no path, bucket, or exception text.
 - **Media access uses a scoped token.** A browser `<video>` element cannot send an `Authorization` header, so `GET /uploads/{file}` takes a short-lived token (`MEDIA_TOKEN_TTL_MINUTES`, default 15) bound to one `video_id`. Session tokens and media tokens are not interchangeable.
@@ -303,7 +350,8 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **AWS hardening is a template, not applied.** `infra/iam_policy_least_privilege.json` still has `${PLACEHOLDER}` values an operator must substitute, and `infra/cloudformation/storage.yaml` — which does express the bucket hardening (public-access block, SSE-S3, versioning, TLS-only policy, lifecycle) — **has never been deployed**. The bucket naming conflict was resolved in Phase 5 (§2.5), but nothing in AWS has been verified.
 - **Real-MongoDB integration tests are unverified.** Written and safety-guarded in `tests/test_integration_mongodb.py`, but never executed — no database or Docker daemon was available. Run `pytest -m requires_mongodb`.
 - Upload validation does **not** prove a file is a safe video; there is no content scanning.
-- 22 frontend lint **warnings** remain (unused vars, `<img>` usage); zero errors. None security-relevant.
+- Frontend lint is clean as of Phase 7: **0 errors, 0 warnings** (was 18 warnings — unused imports and `<img>` usage, all on panels that were deleted).
+- **Hiding a frontend control is not authorization.** Role-based navigation is presentation only; the backend remains the sole authority, and Phase 7 added tests that say so explicitly so the nav filter is never mistaken for an access check.
 
 When working in this repo: never print a secret value, never commit one, and if you find one, report its **file and variable name** with the value redacted and recommend rotation — do not delete user files or change cloud permissions yourself.
 
@@ -328,7 +376,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0 through 6 are **complete, committed, and pushed**.
+Phases 0 through 7 are **complete, committed, and pushed**.
 
 | Phase | What landed |
 | :-- | :-- |
@@ -340,14 +388,42 @@ Phases 0 through 6 are **complete, committed, and pushed**.
 | 4.1 | Durable S3 source storage, worker leases, crash recovery, CloudFormation storage template. |
 | 5 | Dead code removed, storage configuration reconciled to one contract, README rewritten. |
 | 6 | Durable worker process, AWS client timeouts, retry classification with backoff, health/readiness probes, Scan replaced by Query on the request path. |
+| 7 | Frontend connected to real compliance data; every fabricated panel removed; findings rendered for the first time; accessibility, TypeScript and API-layer cleanup. |
 
 **Phase 5 detail.** Deleted: the orphaned MongoDB/GridFS pipeline (`audit_manager.py`, `verifier.py`, `check_count.py`), `debug_probe.py`, `aws_config.py`, `frontend_backup/` (72 files), the stray `frontend/Video Compliance Dashboard/`, the orphan `/agents` and `/logs` duplicate routes, `infra/init_s3.py`, and `infra/iam_policy.yaml` — 82 files. `S3_BUCKET_NAME` is now required in production and validated; `MONGO_URI` and `Pillow` are gone with their only consumer. Regression tests assert the deleted modules stay deleted, that nothing imports `gridfs`, and that nothing reimplements the bucket fallback.
 
-**Phases 5 and 6 did NOT make the application production-ready.** Phase 5 made the architecture coherent; Phase 6 made job execution durable and removed a real class of data loss. Everything still open in §5 "Known remaining gaps" stands, and **nothing has ever run against real AWS or Bedrock** — no worker has run against real infrastructure and no process has been SIGKILLed, so crash recovery is verified as logic, not as observed behaviour.
+**Phase 7 detail.** Six views audited against the real route surface and
+rewritten where they claimed more than the backend said. Removed: the invented
+agent cluster and its metrics (`AgentsView`), the fabricated physical-security
+"incidents" (`LogsView`), the unconditional "Audit Passed" card and its
+companion fake telemetry (`ProjectDetailView`), the "VERIFIED" badge keyed to
+a status the API never returns plus the LLaVA/Act-Agent filter tabs and the
+"Post to Social" action (`ClientPortal`), the "Commander Niru" account screen
+and the fake header indicators (`page.tsx`), the MDN placeholder video and the
+"Network/Nodes" gauges (`HUDView`), and the false SHA-256/AES-256 footer and
+non-functional role selector (`/login`). Added: `app/lib/jobs.ts` as the
+single source of status and verdict wording, `app/components/ViolationList.tsx`
+so a finding's description, severity, confidence, timestamp and frame are
+visible at all (they previously existed only as half-second bounding-box
+overlays), `app/components/ui/Feedback.tsx` for consistent loading/empty/error/
+unavailable states, client-side upload validation against the configured
+limits, abort-on-unmount throughout, and 189 new frontend tests. The API
+client is now the only module reading `NEXT_PUBLIC_API_URL`. **No backend file
+was modified** — `git diff` touches `frontend/`, the two READMEs, `.env.example`
+and this file only.
+
+**Phases 5, 6 and 7 did NOT make the application production-ready.** Phase 5 made the architecture coherent; Phase 6 made job execution durable and removed a real class of data loss. Everything still open in §5 "Known remaining gaps" stands, and **nothing has ever run against real AWS or Bedrock** — no worker has run against real infrastructure and no process has been SIGKILLed, so crash recovery is verified as logic, not as observed behaviour.
 
 **Phase 6 detail.** Execution split into two processes: the API queues durably and returns; `backend/worker.py` polls, claims under a lease, and runs. The durable queue is the existing MongoDB `videos` collection — **no SQS, no new AWS resource, no new IAM permission** (`docs/PIPELINE_ARCHITECTURE.md` §8.6 records why SQS was rejected). Also added: `backend/aws_clients.py` so every boto3 client has a finite timeout and a bounded retry budget (only `source_store` had one before); retryable-vs-permanent failure classification with exponential backoff via `not_before`; `/health/live`, `/health/ready` and `/health/worker`; and the per-video frame read moved from a full-table `Scan` to a key-based `Query`. The API response contract is unchanged in both execution modes, and a test asserts it.
 
-**Phase 7 has not been started.** Remaining: 7 (frontend completion), 8 (remediation — needs §9 q4), 9 (reconstruction — needs §9 q3), 10 (tests, CI, docs, release). Do not start one until it is explicitly assigned.
+**Phase 8 has not been started.** Remaining: 8 (remediation — needs §9 q4), 9 (reconstruction — needs §9 q3), 10 (tests, CI, docs, release). Do not start one until it is explicitly assigned.
+
+Deferred out of Phase 7 and still open: frontend views are not URL-addressable
+(the shell switches views in client state), the audit detail view loads once
+rather than polling, search and filtering are client-side over the
+already-fetched list, there is still no end-to-end test from login to review
+and no CI (Phase 10), and `.agent/skills/video-audit/SKILL.md` still documents
+the wrong bounding-box schema (§2.5, Phase 10.3).
 
 ---
 
@@ -379,11 +455,13 @@ Observed in the existing code, for consistency. Several are **bad practices the 
 
 **Frontend (TypeScript/React)**
 - Next.js App Router; `"use client"` on interactive components; default exports for components.
-- Tailwind utility classes with a `cn()` helper — canonically `app/lib/utils.ts:4`, but ⚠️ `HUDView.tsx:20` **duplicates it**. Import the shared one.
+- Tailwind utility classes with a `cn()` helper. ~~Duplicated in four components~~ **RESOLVED in Phase 7** — `app/lib/utils.ts` is the only definition; import it.
 - CSS custom properties for theming in `app/globals.css` (`--background`, `--primary`, `--accent`, `--critical`) — well structured; keep it.
-- `process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'` inline at each call site. ⚠️ Repeated in 5 places; centralise in new code.
-- ⚠️ **`any` types are used liberally** in `HUDView.tsx` despite `strict: true`. Type new code properly.
-- ⚠️ **`alert()` for errors** (`HUDView.tsx:208`). Browser modals block the page and discard the real error — use inline error UI.
+- ~~`process.env.NEXT_PUBLIC_API_URL` inline at each call site~~ **RESOLVED in Phase 7.** `app/lib/api.ts` is the only module that reads it, and every request goes through that file's `requestJson` helper. Do not call `fetch` from a component.
+- ~~**`any` types**~~ and ~~**`alert()` for errors**~~ were already gone before Phase 7; Phase 7 also removed the last non-null assertions, by making `isRenderableDetection` a type predicate that narrows `bounding_box`. **Do not reintroduce `any`, a browser modal, or `@ts-ignore`.**
+- **Use the shared feedback primitives** in `app/components/ui/Feedback.tsx`: `LoadingPanel`, `EmptyState`, `ErrorBanner`, `UnavailablePanel`, `StatusBadge`. They encode the accessibility rules so a view cannot forget them — an error is `role="alert"`, a loading placeholder is labelled and `aria-busy`, and a status badge always carries a word so colour is never the only signal. "Nothing yet", "something went wrong" and "this is not built" are three different components on purpose.
+- **Every data-backed view needs four states**: loading, empty, error (with a retry where the action is safe), and loaded. A view that renders nothing on an empty list is a defect — that was the old asset grid.
+- **Abort on unmount.** Each view creates an `AbortController`, passes `signal` through the API client, and guards `setState` with a `cancelled` flag. ⚠️ In `HUDView` the abort is deliberately on a separate unmount-only effect, *not* the polling effect's cleanup: that cleanup also runs the moment the job turns terminal, which is exactly when the results fetch starts.
 
 ---
 
