@@ -77,27 +77,40 @@ describe("labels", () => {
     }
   });
 
-  it("says explicitly that an approved proposal generated nothing", () => {
-    // The thing a reader would otherwise assume is exactly what has not
-    // happened, so the label names it.
-    expect(remediationLabel("approved")).toBe("Approved, not generated");
+  it("names the step an approved proposal is waiting on", () => {
+    // Phase 9: what it is waiting for is a replacement image, because no
+    // provider can generate one. The label says which step is outstanding
+    // rather than only what has not happened.
+    expect(remediationLabel("approved")).toMatch(/replacement image/i);
   });
 
   it("says an asset does not mean the video changed", () => {
     expect(remediationLabel("asset_ready")).toMatch(/video unchanged/i);
   });
 
-  it("says an applied asset is not verified", () => {
-    expect(remediationLabel("applied")).toMatch(/not verified/i);
+  it("says the original is untouched while a new video is built", () => {
+    expect(remediationLabel("reconstructing")).toMatch(/original unchanged/i);
   });
 
-  it("names a failed verification as not confirming anything", () => {
-    expect(remediationLabel("verification_failed")).toMatch(/did not confirm/i);
+  it("says a built video has not been checked", () => {
+    // The most load-bearing label in the file. An output exists and nothing
+    // has analysed it, so anything resembling "corrected" would be a claim
+    // nobody has verified.
+    const label = remediationLabel("applied").toLowerCase();
+    expect(label).toMatch(/not yet checked/);
+    expect(label).not.toContain("corrected");
+    expect(label).not.toContain("verified:");
   });
 
-  it("claims compliance in no label but the verified one", () => {
+  it("names a failed check as the finding still being there", () => {
+    expect(remediationLabel("verification_failed")).toMatch(/still there/i);
+  });
+
+  it("claims compliance in no label at all", () => {
+    // Not even the verified one: `verified` means the TARGETED finding is
+    // gone, which is not the same as the video being compliant. The default
+    // policy does not require a clean output, so that word must never appear.
     for (const state of REMEDIATION_STATES) {
-      if (state === "verified") continue;
       const label = REMEDIATION_LABELS[state].toLowerCase();
       expect(label).not.toContain("compliant");
       expect(label).not.toContain("corrected");
@@ -117,8 +130,12 @@ describe("tones", () => {
     expect(toneForRemediation("approved")).toBe("neutral");
   });
 
-  it("treats an applied asset as neutral, not a success", () => {
+  it("treats a built-but-unchecked video as neutral, not a success", () => {
     expect(toneForRemediation("applied")).toBe("neutral");
+  });
+
+  it("treats a reconstruction in flight as active", () => {
+    expect(toneForRemediation("reconstructing")).toBe("active");
   });
 
   it("reserves success for the verified state", () => {
@@ -168,17 +185,27 @@ describe("available actions", () => {
     }
   });
 
-  it("allows execution only from approved", () => {
-    expect(canExecute(record("approved"))).toBe(true);
-    for (const state of REMEDIATION_STATES.filter((s) => s !== "approved")) {
+  it("allows building only from asset_ready", () => {
+    // Phase 9: an approved proposal with no replacement image cannot be
+    // built, and the backend refuses it too.
+    expect(canExecute(record("asset_ready"))).toBe(true);
+    for (const state of REMEDIATION_STATES.filter((s) => s !== "asset_ready")) {
       expect(canExecute(record(state))).toBe(false);
     }
   });
 
-  it("allows withdrawal only before anything consequential", () => {
+  it("allows withdrawal only before anything is being built", () => {
     expect(canCancel(record("proposed"))).toBe(true);
     expect(canCancel(record("approved"))).toBe(true);
-    for (const state of ["asset_ready", "applied", "verified", "rejected"] as const) {
+    // An attached asset is still withdrawable; a worker holding the record is
+    // not, and neither is a record with an output.
+    expect(canCancel(record("asset_ready"))).toBe(true);
+    for (const state of [
+      "reconstructing",
+      "applied",
+      "verified",
+      "rejected",
+    ] as const) {
       expect(canCancel(record(state))).toBe(false);
     }
   });

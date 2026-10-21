@@ -257,17 +257,36 @@ def local_fallback_path(record: dict, upload_dir: Path):
 
 
 def expected_key_prefix(video_id: str) -> str:
-    """The only key prefix a given video's source may live under."""
+    """The prefix an UPLOADED video's source lives under."""
     return f"{aws_resources.SOURCE_PREFIX}/{video_id}/"
 
 
-def verify_key_belongs_to(record: dict) -> None:
-    """Assert the stored key is the one this video's id would generate.
+def expected_key_prefixes(video_id: str) -> tuple[str, ...]:
+    """Every prefix a given video id's own bytes may live under.
 
-    The key is server-generated, so a key that does not start with this
-    video's source prefix means the record has been tampered with or crossed
-    with another video's. Refuse rather than process the wrong file under this
-    job's identity and attribute another user's content to this owner.
+    Phase 9 added the second one. A reconstructed output is a first-class
+    video record with its own server-minted id, and its bytes live under
+    `remediated/{its own id}/` rather than `sources/`, so that a
+    reconstruction can never be written over an upload.
+
+    The invariant `verify_key_belongs_to` protects is unchanged and is NOT
+    "the prefix is literally sources/": it is **the key names THIS video id**.
+    Both entries below are built from `video_id`, so a record still cannot
+    point at another video's object under either prefix.
+    """
+    return (
+        f"{aws_resources.SOURCE_PREFIX}/{video_id}/",
+        f"{aws_resources.REMEDIATED_PREFIX}/{video_id}/",
+    )
+
+
+def verify_key_belongs_to(record: dict) -> None:
+    """Assert the stored key is one this video's id would generate.
+
+    The key is server-generated, so a key that names a different video means
+    the record has been tampered with or crossed with another video's. Refuse
+    rather than process the wrong file under this job's identity and attribute
+    another user's content to this owner.
 
     Raises:
         SourceMissing: the key does not belong to this record.
@@ -276,9 +295,9 @@ def verify_key_belongs_to(record: dict) -> None:
     key = str(record.get("s3_key") or "")
     if not video_id:
         return
-    if not key.startswith(expected_key_prefix(str(video_id))):
+    if not key.startswith(expected_key_prefixes(str(video_id))):
         logger.error(
-            "Refusing a source object whose key does not belong to %s", video_id
+            "Refusing a video object whose key does not belong to %s", video_id
         )
         raise SourceMissing(
             "The uploaded video could not be verified. Please upload it again."
@@ -537,6 +556,7 @@ __all__ = (
     "SourceStoreError",
     "delete_source",
     "expected_key_prefix",
+    "expected_key_prefixes",
     "has_durable_source",
     "local_fallback_path",
     "materialise",

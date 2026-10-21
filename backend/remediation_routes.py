@@ -34,7 +34,18 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 import aws_clients
@@ -42,8 +53,11 @@ import aws_resources
 import config
 import image_provider
 import remediation
+import remediation_assets
+import remediation_executor
 import remediation_repo
-from auth import get_current_user
+import verification
+from auth import create_media_token, get_current_user
 from job_state import JobState, coerce as coerce_job_state
 from ownership import require_video_owner
 from remediation import (
@@ -52,6 +66,8 @@ from remediation import (
     build_proposal,
     finding_from_frame_item,
 )
+from remediation_assets import AssetRejected, AssetStoreError
+from remediation_executor import ExecutionError, NotExecutable
 from remediation_repo import RemediationConflict, RemediationNotFound
 from remediation_state import (
     InvalidRemediationTransition,
@@ -104,6 +120,17 @@ class CapabilityResponse(BaseModel):
     applies_assets_to_video: bool
     verifies_compliance: bool
     notes: str
+    # --- Phase 9 --------------------------------------------------------
+    # Whether an owner may supply the replacement image themselves. This is
+    # what makes an end-to-end correction possible with no image provider.
+    asset_upload_supported: bool = False
+    max_asset_bytes: int = 0
+    accepted_asset_types: list[str] = Field(default_factory=list)
+    # Whether an approved remediation can actually be built into a video.
+    reconstruction_available: bool = False
+    reconstruction_unavailable_reason: Optional[str] = None
+    reconstruction_method: Optional[str] = None
+    verification_policy: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +288,8 @@ async def get_capabilities(user: dict = Depends(get_current_user)):
     """
     _require_enabled()
     status_info = image_provider.provider_status()
+    reconstruction_enabled = config.load_reconstruction_enabled()
+
     return CapabilityResponse(
         remediation_enabled=True,
         proposals_supported=True,
@@ -268,16 +297,35 @@ async def get_capabilities(user: dict = Depends(get_current_user)):
         generation_provider=str(status_info["provider"]),
         generation_unavailable_reason=status_info["reason"],
         min_confidence=config.load_remediation_min_confidence(),
-        # Both false, and hardcoded false rather than computed, because no
-        # code exists that could make either true. A later phase changes these
-        # by implementing the capability, not by flipping a flag.
-        applies_assets_to_video=False,
-        verifies_compliance=False,
+        # Phase 9 made both of these true, through the supplied-asset path.
+        # They are read from configuration rather than hardcoded now, because
+        # a deployment without the FFmpeg executable genuinely cannot do it.
+        applies_assets_to_video=reconstruction_enabled,
+        verifies_compliance=reconstruction_enabled,
+        asset_upload_supported=True,
+        max_asset_bytes=config.load_max_asset_bytes(),
+        accepted_asset_types=["image/png", "image/jpeg"],
+        reconstruction_available=reconstruction_enabled,
+        reconstruction_unavailable_reason=(
+            None
+            if reconstruction_enabled
+            else (
+                "Building corrected videos is not enabled on this deployment."
+            )
+        ),
+        # Named plainly so nothing downstream can read more into it. The
+        # replacement is scaled and drawn over the approved region with hard
+        # edges; it conceals that region and does not inpaint, match grain or
+        # track motion.
+        reconstruction_method="scaled_overlay",
+        verification_policy=config.load_verification_policy(),
         notes=(
-            "This deployment supports proposing and reviewing remediations. "
-            "It cannot generate images, cannot modify a video, and cannot "
-            "verify that a change resolved a finding. Approving a proposal "
-            "records your decision and changes no video."
+            "This deployment supports proposing and reviewing remediations, "
+            "and building a corrected video from a replacement image you "
+            "supply. It cannot generate that image: no image provider is "
+            "configured. A correction is only reported as verified after the "
+            "corrected video has been analysed in its own right and the "
+            "configured policy passes. Your original video is never modified."
         ),
     )
 
@@ -524,40 +572,53 @@ async def cancel_proposal(
 
 
 # ---------------------------------------------------------------------------
-# Execution
+# Supplying the replacement asset (Phase 9)
 # ---------------------------------------------------------------------------
 
-@router.post("/{remediation_id}/execute")
-async def execute_proposal(
-    remediation_id: str, user: dict = Depends(get_current_user)
+@router.post("/{remediation_id}/asset")
+async def upload_asset(
+    remediation_id: str,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
 ):
-    """Attempt the approved remediation.
+    """Attach an owner-supplied replacement image to an approved remediation.
 
-    Preconditions, checked in this order and all of them server-side:
+    This is the path that makes an end-to-end correction possible without an
+    image provider: the owner provides the bytes a provider would otherwise
+    have generated. It is NOT a way around review - the remediation must
+    already be `approved`, by this caller, and the finding is re-checked
+    first.
 
-    1. the caller owns the record (404 otherwise);
-    2. the record is `approved` (409 otherwise) - an unapproved proposal can
-       never be executed, and hiding the button is not what enforces that;
-    3. the stored finding still matches (superseded + 409 otherwise);
-    4. the finding met the configured confidence threshold (409 otherwise) -
-       this is what `REMEDIATION_MIN_CONFIDENCE` actually gates;
-    5. an image provider is available.
+    Nothing the client says about the file is trusted. The size limit is
+    enforced on the bytes actually received, and the media type is determined
+    by sniffing them; the declared filename and content type are ignored for
+    every decision, and no part of the filename reaches a storage key.
 
-    (5) currently always fails. The response is 503 with the provider's own
-    reason and the record is left `approved`, because the deployment lacking a
-    capability is not a failure of the remediation. Nothing is written.
+    Moves `approved` -> `asset_ready`. It does NOT start a reconstruction:
+    POST /{id}/execute is a separate, explicit request.
     """
     _require_enabled()
     owner = user["sub"]
     record = await _load_owned(remediation_id, owner)
     current = coerce(record.get("state"))
 
+    if current is RemediationState.ASSET_READY and record.get("asset_key"):
+        # Idempotent-ish: an asset is already attached. Replacing it would
+        # change what was reviewed, so the caller is told to withdraw and
+        # start again rather than silently swapping the file.
+        raise _conflict(
+            "A replacement image is already attached to this remediation. "
+            "Withdraw it and propose again to supply a different one."
+        )
     if current is not RemediationState.APPROVED:
         raise _conflict(
-            f"Only an approved remediation can be executed; this one is "
-            f"{current.value}."
+            f"A replacement image can only be attached to an approved "
+            f"remediation; this one is {current.value}."
         )
 
+    # The finding must still be the one that was approved. Attaching an asset
+    # is consequential - it is what makes the record claimable - so the
+    # staleness check belongs here too, not only at execution.
     record = await _supersede_if_finding_changed(record, owner)
     if coerce(record.get("state")) is RemediationState.SUPERSEDED:
         raise _conflict(
@@ -565,44 +626,354 @@ async def execute_proposal(
             or "This remediation no longer matches the stored finding."
         )
 
+    # The confidence gate, checked before the bytes are read: there is no
+    # point making a user upload a file for a finding whose execution will be
+    # refused. `remediation_executor.prepare` checks it again server-side, so
+    # this is a courtesy rather than the enforcement point.
     gate = (record.get("proposal") or {}).get("confidence_gate")
     if gate != remediation.GATE_PASS:
         raise _conflict(
             "This finding did not meet the configured confidence threshold, "
-            "so automated generation is refused for it. Review it manually."
+            "so building a correction for it is refused. Review it manually."
         )
 
-    provider = image_provider.get_provider()
-    if not provider.is_available():
-        # No state change: see the module docstring. Nothing has been
-        # attempted, so nothing has failed.
-        logger.info(
-            "Remediation execution refused: no image provider (provider=%s)",
+    limit = config.load_max_asset_bytes()
+    data = await _read_bounded(file, limit)
+
+    try:
+        stored = await run_in_threadpool(
+            remediation_assets.store_asset,
+            remediation_id=remediation_id,
+            data=data,
+            source=remediation_assets.SOURCE_UPLOAD,
+        )
+    except AssetRejected as exc:
+        # The file is the problem and the message says how. 422: the request
+        # was well-formed, its content was not acceptable.
+        raise HTTPException(
+            status_code=422, detail=str(exc)
+        )
+    except AssetStoreError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        )
+
+    try:
+        updated = await remediation_repo.transition(
+            remediation_id,
+            owner,
+            RemediationState.ASSET_READY,
+            expected=RemediationState.APPROVED,
+            fields={
+                **stored,
+                # From the authenticated principal, never a request field.
+                "asset_supplied_by": owner,
+                "asset_supplied_at": datetime.now(timezone.utc),
+            },
+        )
+    except (InvalidRemediationTransition, RemediationConflict):
+        # Another request moved the record between our check and this write.
+        # Compensating cleanup: an object no record names is an orphan.
+        await run_in_threadpool(
+            remediation_assets.delete_asset, stored.get("asset_key")
+        )
+        raise _conflict(
+            "This remediation was changed by another request; reload it and "
+            "try again."
+        )
+
+    return remediation_repo.view(updated)
+
+
+async def _read_bounded(file: UploadFile, limit: int) -> bytes:
+    """Read an upload into memory, enforcing the limit as it goes.
+
+    Streamed in chunks and checked on the way, so an oversized body is
+    refused after `limit` bytes rather than after the whole thing has been
+    buffered. A replacement image is small by nature, so holding it in memory
+    is reasonable where a video is not.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(256 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"The replacement image exceeds the maximum size of "
+                    f"{limit} bytes."
+                ),
+            )
+        chunks.append(chunk)
+
+    if total == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="The uploaded file is empty.",
+        )
+    return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+def _dispatch_execution(
+    background_tasks: BackgroundTasks, remediation_id: str, owner: str
+) -> str:
+    """Hand a durably-requested execution to an executor, per the mode.
+
+    The request is ALREADY persisted (`execution_requested`) before this is
+    called, so this function cannot lose work: in `worker` mode it
+    deliberately does nothing and `python backend/worker.py` claims the
+    record on its next poll. That is what lets the API restart without
+    stranding an accepted request.
+
+    `inline` mode runs it in a FastAPI background thread, which is convenient
+    for single-process local development and for the test suite but is not
+    durable - exactly the arrangement `app._dispatch_analysis` already has for
+    video jobs, and for the same reasons.
+    """
+    mode = config.get_settings().job_execution_mode
+    if mode == config.INLINE_MODE:
+        background_tasks.add_task(_run_execution_sync, remediation_id, owner)
+    return mode
+
+
+def _run_execution_sync(remediation_id: str, owner: str) -> None:
+    """Run one execution to completion on a worker thread."""
+    import anyio
+
+    try:
+        anyio.run(remediation_executor.execute, remediation_id, owner)
+    except Exception:
+        # The executor records its own terminal failure; anything reaching
+        # here must not take the thread's caller down with it.
+        logger.exception(
+            "Inline remediation execution failed for %s", remediation_id
+        )
+
+
+@router.post("/{remediation_id}/execute")
+async def execute_remediation(
+    remediation_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    """Build the corrected video for an approved remediation with an asset.
+
+    Returns once the request is durably recorded - not once the video exists.
+    The work is a claimed, leased job run by the worker; poll
+    GET /{id}/status for progress and the eventual verdict.
+
+    Preconditions, all enforced server-side:
+
+    1. the caller owns the record (404 otherwise);
+    2. reconstruction is enabled on this deployment (503 otherwise);
+    3. the record is `asset_ready` with an asset attached (409 otherwise) -
+       an `approved` record with no asset is told to supply one, and is also
+       told that automated generation is unavailable;
+    4. the stored finding still matches (superseded + 409 otherwise);
+    5. attempts remain (409 otherwise).
+
+    Idempotent: a repeat while the work is requested, running, or already
+    finished returns the current record rather than starting a second run.
+    """
+    _require_enabled()
+    owner = user["sub"]
+    record = await _load_owned(remediation_id, owner)
+    current = coerce(record.get("state"))
+
+    # Already past this point: return where it actually is. A client that
+    # retries a dropped response must not start a second reconstruction.
+    if current in {
+        RemediationState.RECONSTRUCTING,
+        RemediationState.APPLIED,
+        RemediationState.VERIFYING,
+        RemediationState.VERIFIED,
+        RemediationState.VERIFICATION_FAILED,
+    }:
+        return remediation_repo.view(record)
+
+    if current is RemediationState.APPROVED:
+        # The gate is checked before the provider branch so a low-confidence
+        # finding gets the specific answer rather than the generic one.
+        gate = (record.get("proposal") or {}).get("confidence_gate")
+        if gate != remediation.GATE_PASS:
+            raise _conflict(
+                "This finding did not meet the configured confidence "
+                "threshold, so building a correction for it is refused. "
+                "Review it manually."
+            )
+
+        provider = image_provider.get_provider()
+        if not provider.is_available():
+            # Phase 8's behaviour, kept: no state change, because nothing was
+            # attempted and nothing failed. The difference in Phase 9 is that
+            # there is now a supported alternative, and the message names it.
+            logger.info(
+                "Execution refused: no asset and no image provider (provider=%s)",
+                provider.name,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "No replacement image is attached, and automated image "
+                    "generation is not configured on this deployment. Upload "
+                    "a replacement image for this remediation first."
+                ),
+            )
+        # Unreachable while NullImageProvider is the only implementation.
+        logger.error(
+            "Image provider %s reports itself available but no generation "
+            "path is implemented",
             provider.name,
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                provider.unavailable_reason()
-                or "Automated image generation is not available."
-            ),
+            detail="Automated image generation is not available.",
         )
 
-    # Unreachable while NullImageProvider is the only implementation. Left as
-    # an explicit refusal rather than a half-written generation path, so no
-    # reader can mistake this for a working pipeline: a provider that reports
-    # itself available but has no execution path wired must fail loudly.
-    logger.error(
-        "Image provider %s reports itself available but no execution path is "
-        "implemented",
-        provider.name,
+    try:
+        await remediation_executor.prepare(remediation_id, owner)
+    except NotExecutable as exc:
+        raise _conflict(str(exc))
+    except ExecutionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        )
+    except RemediationNotFound:
+        raise HTTPException(status_code=404, detail="Remediation not found")
+
+    # Durable acceptance: persisted BEFORE the response, so a restart cannot
+    # lose the request.
+    updated = await remediation_repo.request_execution(remediation_id, owner)
+    if updated is None:
+        raise _conflict(
+            "This remediation was changed by another request; reload it and "
+            "try again."
+        )
+
+    mode = _dispatch_execution(background_tasks, remediation_id, owner)
+    logger.info(
+        "Remediation %s accepted for reconstruction (execution mode %s)",
+        remediation_id,
+        mode,
     )
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail=(
-            "Automated image generation is not available on this deployment."
+    return remediation_repo.view(updated)
+
+
+# ---------------------------------------------------------------------------
+# Status and verification
+# ---------------------------------------------------------------------------
+
+@router.get("/{remediation_id}/status")
+async def get_execution_status(
+    remediation_id: str, user: dict = Depends(get_current_user)
+):
+    """Current state, plus the output's analysis progress and any verdict.
+
+    Calling this also ADVANCES verification when the output's analysis has
+    finished: `verification.advance` reads the persisted per-frame results and
+    records the verdict through the normal conditional transition. That is a
+    trusted server-side evaluation, not a client assertion - the request body
+    is empty and the caller cannot influence the outcome. The worker's sweep
+    does the same thing on a timer, so a verdict is not dependent on anyone
+    asking.
+    """
+    _require_enabled()
+    owner = user["sub"]
+    record = await _load_owned(remediation_id, owner)
+
+    if coerce(record.get("state")) is RemediationState.VERIFYING:
+        record = await verification.advance(remediation_id, owner)
+
+    view = remediation_repo.view(record)
+
+    # The output's own job, so the UI can show real analysis progress rather
+    # than a fabricated percentage.
+    output_video_id = record.get("analysis_job_video_id") or record.get(
+        "output_video_id"
+    )
+    analysis = None
+    if output_video_id:
+        try:
+            import video_repo
+
+            job = await video_repo.get_video(str(output_video_id))
+            if job.get("owner") == owner:
+                analysis = video_repo.job_view(job)
+        except Exception:
+            # Progress is a nicety; its absence must not fail the status read.
+            logger.debug("Could not read the output video's job record")
+
+    return {**view, "output_analysis": analysis}
+
+
+@router.get("/{remediation_id}/output")
+async def get_output_playback(
+    remediation_id: str, user: dict = Depends(get_current_user)
+):
+    """A short-lived, scoped playback URL for the corrected video.
+
+    The storage key is never published. This mints the SAME kind of media
+    token the upload route does - bound to one video id, short-lived - and
+    returns a URL against the existing authorized playback route, which
+    re-checks ownership and the token's video binding on every request.
+
+    404 until an output actually exists. There is deliberately no placeholder
+    URL: a download action must never appear before there is something real
+    behind it.
+    """
+    _require_enabled()
+    owner = user["sub"]
+    record = await _load_owned(remediation_id, owner)
+
+    output_video_id = record.get("output_video_id")
+    if not output_video_id or not record.get("output_key"):
+        raise HTTPException(
+            status_code=404,
+            detail="No corrected video exists for this remediation yet.",
+        )
+
+    # The output is an ordinary video record owned by this user; confirm that
+    # rather than trusting the remediation's copy of the id.
+    try:
+        await require_video_owner(str(output_video_id), user)
+    except HTTPException:
+        logger.error(
+            "Remediation %s names an output video this caller does not own",
+            remediation_id,
+        )
+        raise HTTPException(
+            status_code=404,
+            detail="No corrected video exists for this remediation yet.",
+        )
+
+    import os as _os
+
+    base_url = _os.getenv("API_URL", "http://localhost:8000")
+    token = create_media_token(owner, str(output_video_id))
+    stored_filename = (
+        f"{output_video_id}.{remediation_executor.OUTPUT_EXTENSION}"
+    )
+
+    return {
+        "remediation_id": remediation_id,
+        "output_video_id": output_video_id,
+        # Carries a short-lived token in its query string. Never logged: see
+        # `logging_setup.install_log_redaction`.
+        "playback_url": (
+            f"{base_url}/uploads/{stored_filename}?access_token={token}"
         ),
-    )
+        "duration_seconds": record.get("output_duration_seconds"),
+        "has_audio": record.get("output_has_audio"),
+        "size_bytes": record.get("output_bytes"),
+    }
 
 
 __all__ = ("router",)

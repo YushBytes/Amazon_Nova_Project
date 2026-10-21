@@ -99,25 +99,51 @@ def test_reachable_and_unreachable_sets_partition_the_enum():
     assert not (REACHABLE_IN_THIS_BUILD & UNREACHABLE_IN_THIS_BUILD)
 
 
-def test_verified_is_not_reachable_in_this_build():
-    """No code path can claim compliance, because none can establish it.
+def test_only_the_provider_state_is_unreachable_now():
+    """Phase 9 made the chain reachable through the SUPPLIED-ASSET path.
 
-    Nothing generates an asset, nothing applies one to a video, and nothing
-    re-analyses an output - so `verified` has no precondition this build can
-    satisfy.
+    Phase 8 asserted the opposite, and that assertion was correct then: no
+    asset could be obtained, so nothing downstream of it could happen. Phase 9
+    lets an owner supply the asset themselves, so ASSET_READY onwards are now
+    reachable.
+
+    PROCESSING is the one that is not, and it is the right one to be left:
+    it means "a provider call is in flight", and `image_provider` still ships
+    no provider that can make one.
     """
-    assert RemediationState.VERIFIED in UNREACHABLE_IN_THIS_BUILD
-    assert RemediationState.APPLIED in UNREACHABLE_IN_THIS_BUILD
-    assert RemediationState.ASSET_READY in UNREACHABLE_IN_THIS_BUILD
+    assert UNREACHABLE_IN_THIS_BUILD == {RemediationState.PROCESSING}
+    assert RemediationState.ASSET_READY in REACHABLE_IN_THIS_BUILD
+    assert RemediationState.VERIFIED in REACHABLE_IN_THIS_BUILD
 
 
-def test_the_reachable_set_is_the_review_workflow():
+def test_verified_still_requires_a_completed_re_analysis():
+    """Reachable is not the same as easily reached.
+
+    `verified` remains reachable ONLY from `verifying`, so the state machine
+    still forbids claiming compliance without an analysis of the output
+    having run. `verification.py` is the only module that takes that
+    transition, and only from persisted results.
+    """
+    sources = [
+        s for s in RemediationState if RemediationState.VERIFIED in allowed_targets(s)
+    ]
+    assert sources == [RemediationState.VERIFYING]
+
+
+def test_the_reachable_set_is_the_whole_workflow_except_generation():
     assert REACHABLE_IN_THIS_BUILD == {
         RemediationState.PROPOSED,
         RemediationState.APPROVED,
+        RemediationState.ASSET_READY,
+        RemediationState.RECONSTRUCTING,
+        RemediationState.APPLIED,
+        RemediationState.VERIFYING,
+        RemediationState.VERIFIED,
+        RemediationState.VERIFICATION_FAILED,
         RemediationState.REJECTED,
         RemediationState.CANCELLED,
         RemediationState.SUPERSEDED,
+        RemediationState.FAILED,
     }
 
 
@@ -136,7 +162,12 @@ def test_the_reachable_set_is_the_review_workflow():
         (RemediationState.APPROVED, RemediationState.CANCELLED),
         (RemediationState.PROCESSING, RemediationState.ASSET_READY),
         (RemediationState.PROCESSING, RemediationState.FAILED),
-        (RemediationState.ASSET_READY, RemediationState.APPLIED),
+        (RemediationState.APPROVED, RemediationState.ASSET_READY),
+        (RemediationState.ASSET_READY, RemediationState.RECONSTRUCTING),
+        (RemediationState.ASSET_READY, RemediationState.CANCELLED),
+        (RemediationState.RECONSTRUCTING, RemediationState.APPLIED),
+        (RemediationState.RECONSTRUCTING, RemediationState.FAILED),
+        (RemediationState.RECONSTRUCTING, RemediationState.ASSET_READY),
         (RemediationState.APPLIED, RemediationState.VERIFYING),
         (RemediationState.VERIFYING, RemediationState.VERIFIED),
         (RemediationState.VERIFYING, RemediationState.VERIFICATION_FAILED),
@@ -159,9 +190,10 @@ def test_legal_transitions_are_allowed(current, target):
         (RemediationState.APPROVED, RemediationState.VERIFIED),
         (RemediationState.ASSET_READY, RemediationState.VERIFIED),
         (RemediationState.APPLIED, RemediationState.VERIFIED),
-        # Generation cannot be skipped.
-        (RemediationState.APPROVED, RemediationState.ASSET_READY),
+        # An output video cannot appear without a run that built it.
         (RemediationState.APPROVED, RemediationState.APPLIED),
+        (RemediationState.ASSET_READY, RemediationState.APPLIED),
+        (RemediationState.ASSET_READY, RemediationState.VERIFYING),
         # An asset cannot appear without a provider call.
         (RemediationState.PROPOSED, RemediationState.VERIFYING),
     ],
@@ -184,12 +216,38 @@ def test_verified_requires_a_verifying_stage():
     assert sources == [RemediationState.VERIFYING]
 
 
-def test_applied_requires_an_asset():
-    """APPLIED is only reachable from ASSET_READY."""
+def test_applied_requires_a_reconstruction_run():
+    """APPLIED is only reachable from RECONSTRUCTING.
+
+    Phase 8 had it reachable from ASSET_READY, when there was no run in
+    between. Phase 9 added that run as its own claimed, leased state, so an
+    output video cannot be recorded without a run having built it.
+    """
     sources = [
         s for s in RemediationState if RemediationState.APPLIED in allowed_targets(s)
     ]
+    assert sources == [RemediationState.RECONSTRUCTING]
+
+
+def test_reconstruction_requires_a_ready_asset():
+    """Nothing can be built before a validated asset exists."""
+    sources = [
+        s
+        for s in RemediationState
+        if RemediationState.RECONSTRUCTING in allowed_targets(s)
+    ]
     assert sources == [RemediationState.ASSET_READY]
+
+
+def test_an_asset_can_be_reached_without_a_provider_call():
+    """The supplied-asset path, which is what Phase 9 is built on.
+
+    APPROVED -> ASSET_READY skips PROCESSING because there is no provider call
+    in flight. The asset is still validated and stored before the transition,
+    so ASSET_READY keeps its meaning.
+    """
+    assert can_transition(RemediationState.APPROVED, RemediationState.ASSET_READY)
+    assert can_transition(RemediationState.APPROVED, RemediationState.PROCESSING)
 
 
 def test_processing_requires_approval():
@@ -219,10 +277,33 @@ def test_terminal_states_have_no_exit(terminal):
     assert allowed_targets(terminal) == frozenset()
 
 
-def test_an_asset_cannot_be_superseded():
-    """Once an object exists, losing track of it would orphan it."""
-    assert not can_transition(
+def test_a_stale_asset_ready_record_can_be_superseded():
+    """Phase 9 allowed this, and Phase 8's reasoning did not actually apply.
+
+    Phase 8 forbade it to avoid orphaning a stored object. But
+    `mark_superseded` leaves `asset_key` on the record, so the asset stays
+    named and auditable - nothing is lost. What the prohibition DID cause was
+    worse: a record whose finding changed after an asset was attached kept
+    reporting "ready" while every execution attempt was refused, so its state
+    was a lie about why nothing was happening.
+    """
+    assert can_transition(
         RemediationState.ASSET_READY, RemediationState.SUPERSEDED
+    )
+
+
+def test_work_in_flight_cannot_be_superseded():
+    """A worker holds a RECONSTRUCTING record; a sweep must not yank it.
+
+    This is the prohibition that does still apply: the only way out of
+    RECONSTRUCTING is the worker finishing, failing, or its lease lapsing and
+    `reclaim` returning it - all of which are conditional on its claim id.
+    """
+    assert not can_transition(
+        RemediationState.RECONSTRUCTING, RemediationState.SUPERSEDED
+    )
+    assert not can_transition(
+        RemediationState.APPLIED, RemediationState.SUPERSEDED
     )
 
 

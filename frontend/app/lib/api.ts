@@ -17,6 +17,9 @@
  *   GET|POST /remediations                -> list for a video | propose
  *   GET  /remediations/{id}               -> one record
  *   POST /remediations/{id}/approve|reject|cancel|execute
+ *   POST /remediations/{id}/asset         -> attach a replacement image
+ *   GET  /remediations/{id}/status        -> state + the output's analysis
+ *   GET  /remediations/{id}/output        -> a scoped playback URL
  *
  * `GET /jobs/{id}` is authoritative for progress: treat an empty `detections`
  * list as "no violations found" ONLY when `state === "completed"`, because
@@ -745,15 +748,18 @@ export async function fetchWorkerHealth(
  * mean the result is compliant, and ONLY `verified` may be described as
  * compliant - and it is reachable only after a completed re-analysis.
  *
- * `processing` onwards are unreachable in this build: no image provider is
- * implemented and nothing reconstructs a video. They are typed because the
- * backend defines them, not because the UI can ever receive them.
+ * Phase 9 made all of these reachable EXCEPT `processing`, which means "a
+ * provider call is in flight" - and no image provider is implemented. The rest
+ * are reached through the supplied-asset path: the owner uploads the image a
+ * provider would have generated, the backend builds a new output video, and
+ * that output is analysed in its own right.
  */
 export type RemediationState =
   | "proposed"
   | "approved"
   | "processing"
   | "asset_ready"
+  | "reconstructing"
   | "applied"
   | "verifying"
   | "verified"
@@ -822,14 +828,110 @@ export interface Remediation {
   has_asset: boolean;
   asset_bytes: number | null;
   asset_content_type: string | null;
+  /** "upload" for an owner-supplied file, or a provider name. */
+  asset_source?: string | null;
+  asset_supplied_by?: string | null;
+  asset_supplied_at?: string | null;
+  /**
+   * The output video's id. Safe to hold: it is how playback is requested
+   * through the authorized media route, which re-checks ownership. Its
+   * storage key is never published.
+   */
   output_video_id: string | null;
+  /** Whether an output video actually exists. Not a compliance claim. */
+  has_output?: boolean;
+  output_bytes?: number | null;
+  output_duration_seconds?: number | null;
+  output_has_audio?: boolean | null;
+  /** The audit trail of the reconstruction, written by the backend. */
+  reconstruction?: RemediationReconstruction | null;
+  analysis_job_video_id?: string | null;
+  analysis_submitted_at?: string | null;
+  /** Written only by the backend's verification service, from real results. */
+  verification?: RemediationVerification | null;
   verification_video_id: string | null;
   verified_at: string | null;
   error_code: string | null;
   error_summary: string | null;
   attempt: number;
+  max_attempts?: number;
+  recovered_count?: number;
   created_at: string | null;
   updated_at: string | null;
+}
+
+/** How the output video was built. Everything here is server-measured. */
+export interface RemediationReconstruction {
+  method?: string;
+  region_pixels?: { x: number; y: number; width: number; height: number };
+  window_seconds?: number[];
+  source_width?: number;
+  source_height?: number;
+  source_duration_seconds?: number;
+  source_had_audio?: boolean;
+  output_duration_seconds?: number;
+  output_has_audio?: boolean;
+  audio_preserved?: boolean;
+  warnings?: string[];
+}
+
+/**
+ * The verdict and its evidence.
+ *
+ * Three SEPARATE facts, and the UI must never merge them:
+ *   `target_resolved`  the targeted finding is gone from the output
+ *   `policy_passed`    the output satisfies the configured policy
+ *   `other_findings`   what else the output's analysis reported
+ *
+ * `null` for the first two means "no verdict", which is not the same as
+ * `false`. An `outcome` of "pending" or "inconclusive" is not a failure and
+ * emphatically not a pass.
+ */
+export interface RemediationVerification {
+  outcome?:
+    | "verified"
+    | "verification_failed"
+    | "pending"
+    | "inconclusive"
+    | string;
+  policy?: string;
+  evaluated_at?: string;
+  source_video_id?: string;
+  output_video_id?: string;
+  analysis_job_video_id?: string;
+  analysis_state?: string;
+  frames_extracted?: number | null;
+  frames_audited?: number | null;
+  frames_failed?: number | null;
+  target_category?: string | null;
+  target_timestamp_seconds?: number | null;
+  timestamp_tolerance_seconds?: number;
+  target_resolved?: boolean | null;
+  policy_passed?: boolean | null;
+  target_matches?: Detection[];
+  other_findings?: Detection[];
+  other_finding_count?: number;
+  reason?: string;
+}
+
+/** What GET /remediations/{id}/status returns: the record plus live progress. */
+export interface RemediationStatus extends Remediation {
+  /** The OUTPUT video's own analysis job, or null when there is none yet. */
+  output_analysis: Job | null;
+}
+
+/** What GET /remediations/{id}/output returns. */
+export interface RemediationOutput {
+  remediation_id: string;
+  output_video_id: string;
+  /**
+   * Carries a short-lived media token in its query string. Never log it, and
+   * never persist it: it is scoped to one video and expires.
+   */
+  playback_url: string;
+  duration_seconds: number | null;
+  has_audio: boolean | null;
+  size_bytes: number | null;
 }
 
 /**
@@ -848,6 +950,21 @@ export interface RemediationCapabilities {
   applies_assets_to_video: boolean;
   verifies_compliance: boolean;
   notes: string;
+  /** Phase 9: whether the owner may supply the replacement image themselves. */
+  asset_upload_supported?: boolean;
+  max_asset_bytes?: number;
+  accepted_asset_types?: string[];
+  /** Whether an approved remediation can actually be built into a video. */
+  reconstruction_available?: boolean;
+  reconstruction_unavailable_reason?: string | null;
+  /**
+   * How the replacement is applied. "scaled_overlay" means the image is
+   * scaled to the approved region and drawn over it with hard edges - it
+   * conceals that region and does NOT inpaint, match grain or track motion.
+   * Never render this as "seamless".
+   */
+  reconstruction_method?: string | null;
+  verification_policy?: string | null;
 }
 
 /** Read this deployment's remediation capabilities. */
@@ -954,6 +1071,145 @@ export async function executeRemediation(
     `/remediations/${encodeURIComponent(remediationId)}/execute`,
     { method: "POST" },
     "Could not start this remediation",
+    options
+  );
+}
+
+/**
+ * Attach an owner-supplied replacement image to an approved remediation.
+ *
+ * This is the path that makes an end-to-end correction possible with no image
+ * provider. It is not a way around review: the backend requires the
+ * remediation to be `approved`, re-checks the finding, and validates the
+ * bytes by sniffing them - the filename and the declared type are ignored.
+ *
+ * Never retried automatically: a repeat would be refused anyway (an asset is
+ * already attached), and a retry is the user's action.
+ */
+export async function uploadRemediationAsset(
+  remediationId: string,
+  file: File,
+  options: RequestOptions = {}
+): Promise<Remediation> {
+  const form = new FormData();
+  form.append("file", file);
+
+  // No Content-Type header: the browser must set the multipart boundary.
+  const res = await fetch(
+    `${apiBaseUrl()}/remediations/${encodeURIComponent(remediationId)}/asset`,
+    {
+      method: "POST",
+      headers: authHeaders(),
+      body: form,
+      signal: options.signal,
+    }
+  );
+
+  if (!res.ok) {
+    throw await readError(res, "The replacement image could not be attached");
+  }
+  return (await res.json()) as Remediation;
+}
+
+/**
+ * Validate a chosen replacement image before uploading it.
+ *
+ * Mirrors the backend's own limits so the common mistakes are caught without
+ * a round trip. A pre-flight courtesy only: the backend sniffs the bytes and
+ * remains the authority, and its rejection message is shown verbatim when the
+ * two disagree.
+ */
+export function validateReplacementImage(
+  file: File,
+  capabilities?: RemediationCapabilities | null
+): string | null {
+  const accepted = capabilities?.accepted_asset_types ?? [
+    "image/png",
+    "image/jpeg",
+  ];
+  const limit = capabilities?.max_asset_bytes ?? 8 * 1024 * 1024;
+
+  if (file.size === 0) return "That file is empty.";
+  if (file.size > limit) {
+    return `That image is ${formatBytes(file.size)}; the limit is ${formatBytes(
+      limit
+    )}.`;
+  }
+
+  // The extension is a hint only - the server decides from the bytes - but a
+  // clearly wrong one is worth catching here.
+  const suffix = file.name.replace(/\\/g, "/").split("/").pop() ?? "";
+  const dot = suffix.lastIndexOf(".");
+  const extension = dot > 0 ? suffix.slice(dot + 1).toLowerCase() : "";
+  if (!extension || extension === "jpeg") return null;
+
+  const extensionFor: Record<string, string> = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+  };
+  const allowed = accepted
+    .map((type) => extensionFor[type])
+    .filter((value): value is string => Boolean(value));
+  if (allowed.length > 0 && !allowed.includes(extension)) {
+    return `Replacement images must be ${allowed.join(" or ")}.`;
+  }
+  return null;
+}
+
+/**
+ * Ask the backend to build the corrected video.
+ *
+ * Returns once the request is DURABLY RECORDED, not once the video exists -
+ * the work is a claimed, leased job. Poll `fetchRemediationStatus`.
+ *
+ * Safe to call again: the backend makes a repeat idempotent and returns the
+ * record's current state rather than starting a second reconstruction.
+ */
+export async function startRemediationExecution(
+  remediationId: string,
+  options: RequestOptions = {}
+): Promise<Remediation> {
+  return requestJson<Remediation>(
+    `/remediations/${encodeURIComponent(remediationId)}/execute`,
+    { method: "POST" },
+    "The correction could not be started",
+    options
+  );
+}
+
+/**
+ * Read execution and verification status, with the output's real progress.
+ *
+ * Calling this also lets the backend record a verdict once the output's
+ * analysis has finished. That evaluation is entirely server-side - this
+ * request carries no body and cannot influence the outcome.
+ */
+export async function fetchRemediationStatus(
+  remediationId: string,
+  options: RequestOptions = {}
+): Promise<RemediationStatus> {
+  return requestJson<RemediationStatus>(
+    `/remediations/${encodeURIComponent(remediationId)}/status`,
+    { method: "GET" },
+    "Could not read the correction's status",
+    options
+  );
+}
+
+/**
+ * Get a short-lived, scoped playback URL for the corrected video.
+ *
+ * 404 until an output actually exists, which is deliberate: there must be no
+ * placeholder URL for a download action to point at.
+ */
+export async function fetchRemediationOutput(
+  remediationId: string,
+  options: RequestOptions = {}
+): Promise<RemediationOutput> {
+  return requestJson<RemediationOutput>(
+    `/remediations/${encodeURIComponent(remediationId)}/output`,
+    { method: "GET" },
+    "Could not load the corrected video",
     options
   );
 }

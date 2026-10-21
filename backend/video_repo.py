@@ -216,6 +216,49 @@ async def record_video(
     return document
 
 
+async def set_fields(video_id: str, fields: dict) -> dict | None:
+    """Write non-state metadata onto a video record.
+
+    Phase 9, for the provenance a reconstructed output carries
+    (`derived_from_video_id`, `derived_from_remediation_id`,
+    `is_remediated_output`). An operator looking at a video should be able to
+    tell it was derived rather than uploaded.
+
+    Deliberately REFUSES to touch anything that belongs to the job state
+    machine or the lease: those move only through `transition` and `claim`,
+    whose conditional writes are what keep two workers from advancing one job.
+    A caller that needs one of those fields is using the wrong function.
+
+    Returns the updated record, or None when nothing matched.
+    """
+    protected = {
+        "status",
+        "claim_id",
+        "lease_expires_at",
+        "not_before",
+        "attempt",
+        "owner",
+        "video_id",
+        "s3_key",
+        "s3_bucket",
+    }
+    offending = protected.intersection(fields)
+    if offending:
+        raise ValueError(
+            f"set_fields must not write job-state or identity fields: "
+            f"{sorted(offending)}"
+        )
+
+    col = await _collection()
+    result = await col.update_one(
+        {"video_id": video_id},
+        {"$set": {**fields, "updated_at": _now()}},
+    )
+    if getattr(result, "matched_count", 0) != 1:
+        return None
+    return await get_video(video_id)
+
+
 async def delete_video(video_id: str) -> bool:
     """Remove one video record.
 

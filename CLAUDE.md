@@ -93,7 +93,7 @@ Amazon Nova/                         <- project root (flattened in Phase 0; hold
 - **Frontend:** Next.js 16.1.6, React 19.2.3, TypeScript 5.9.3 (`strict: true`), Tailwind CSS v4, Framer Motion, lucide-react.
 - **Backend:** FastAPI + Uvicorn, `python-jose` JWT (HS256), `motor` (async MongoDB), `boto3`.
 - **AI:** Amazon Bedrock, model `amazon.nova-pro-v1:0`. *(Docs say "Nova 2 Pro"; code says `nova-pro-v1:0`. Unresolved.)*
-- **Storage:** S3 for **both** source videos (`sources/`) and frame JPEGs (`frames/`), one bucket named by `S3_BUCKET_NAME`; DynamoDB (`NovaFlowFrames`, `NovaFlowProjects`) for metadata; MongoDB for accounts (`novaflow.users`), ownership plus job state (`novaflow.videos`), and remediation records (`novaflow.remediations`, Phase 8). Local `backend/uploads/` is **read-only legacy** — pre-Phase-4.1 records only; new uploads never land there.
+- **Storage:** S3 for source videos (`sources/`), frame JPEGs (`frames/`), agent reels (`raw/`), replacement images (`remediation-assets/`, Phase 9) and reconstructed outputs (`remediated/`, Phase 9) — one bucket named by `S3_BUCKET_NAME`; DynamoDB (`NovaFlowFrames`, `NovaFlowProjects`) for metadata; MongoDB for accounts (`novaflow.users`), ownership plus job state (`novaflow.videos`), and remediation records (`novaflow.remediations`, Phase 8). ⚠️ **Nothing writes to `sources/` except an upload** — a reconstruction's output is a separate object under its own video id. Local `backend/uploads/` is **read-only legacy** — pre-Phase-4.1 records only; new uploads never land there.
 - **Video:** `ffmpeg-python` + the FFmpeg binary, 1 fps extraction.
 - **Deploy:** AWS Amplify (frontend only); `backend/Dockerfile` exists with no deployment definition. **Two backend processes** now: the API (`uvicorn app:app`) and the worker (`python backend/worker.py`). Both run from the same image; neither has a deployment definition. §9 question 9 is still open.
 
@@ -121,9 +121,13 @@ Browser (:3000)
   ├─ GET  /violations/{id} ───► DynamoDB NovaFlowFrames (paginated)
   ├─ GET  /submissions ───────► the caller's own videos
   ├─ GET  /uploads/{file}?access_token=… ► S3 stream, scoped media token
-  ├─ /remediations/* (7 routes, Phase 8) ► propose, review, decide
-  │        POST /remediations/{id}/execute ALWAYS 503: no image provider
-  │        exists, and the record is left `approved`, not failed.
+  ├─ /remediations/* (10 routes) ► propose, review, decide, build, check
+  │        POST /{id}/asset   attach an owner-supplied replacement image
+  │        POST /{id}/execute build a NEW output video from it (Phase 9)
+  │        GET  /{id}/status  state + the OUTPUT's analysis + any verdict
+  │        GET  /{id}/output  a short-lived scoped playback URL
+  │        ⚠ /execute from `approved` with no asset is still 503: no image
+  │          provider exists, and the record is left `approved`, not failed.
   └─ /projects/* (6 routes)
 
   ⚠ POST /execute — returns placeholder text; the feature behind it is not
@@ -188,11 +192,14 @@ and `frontend/node_modules` is installed. Use the venv interpreter.
 git rev-parse --show-toplevel                      # ALWAYS run before committing
 python -m py_compile backend/*.py analyzer_nova.py prompts.py
 
-# Backend tests — 925 passed, 42 skipped (Phase 8)
+# Backend tests — 1111 passed, 55 skipped (Phase 9)
+#   55 skips: 26 need MONGODB_TEST_URL, 16 need the FFmpeg binary for
+#   extraction, 13 need it for reconstruction. A skip is NOT a pass.
 ./.venv/Scripts/python.exe -m pytest backend/tests -q
+./.venv/Scripts/python.exe -m pytest backend/tests -m requires_ffmpeg -q   # needs FFmpeg
 
 # Frontend — all four pass; lint reports 0 errors / 0 warnings
-cd frontend && npm test          # 333 tests (Vitest), 17 files
+cd frontend && npm test          # 387 tests (Vitest), 18 files
 cd frontend && npm run typecheck # tsc --noEmit, exit 0
 cd frontend && npm run lint      # "eslint app"
 cd frontend && npm run build     # routes: / , /_not-found , /login
@@ -270,6 +277,12 @@ Pre-existing application configuration:
 | `REMEDIATION_IMAGE_PROVIDER` | `config.load_remediation_image_provider()` | `none` (`nova-canvas` is accepted but **unimplemented**; anything else fails at startup) |
 | `REMEDIATION_MIN_CONFIDENCE` | `config.load_remediation_min_confidence()` | `0.8` — the first code to read the figure `docs/planning.md` has specified since Phase 1 |
 | `MAX_REMEDIATIONS_PER_VIDEO` | `config.load_max_remediations_per_video()` | `200` |
+| `RECONSTRUCTION_ENABLED` | `config.load_reconstruction_enabled()` | `true` — **needs the FFmpeg executable**; set false without it |
+| `RECONSTRUCTION_TIMEOUT_SECONDS` | `config.load_reconstruction_timeout_seconds()` | `300` |
+| `REMEDIATION_WINDOW_SECONDS` | `config.load_remediation_window_seconds()` | `1.0` |
+| `MAX_REMEDIATION_ASSET_BYTES` | `config.load_max_asset_bytes()` | `8388608` (8 MiB) |
+| `REMEDIATION_LEASE_SECONDS` | `remediation_repo.execution_lease_seconds()` | `600` |
+| `VERIFICATION_POLICY` | `config.load_verification_policy()` | `target_only` (`clean_output` also valid; anything else fails at startup) |
 | `MONGODB_DB_NAME` | `db.py` | `novaflow` |
 | `JOB_LEASE_SECONDS` | `video_repo` | `300` |
 | `RECOVER_JOBS_ON_STARTUP` | `app.py` | `true` |
@@ -325,6 +338,11 @@ AWS credentials come from the boto3 default chain, not from these variables. The
 - **Never log a password, hash, token, signing key, or model analysis body.** Log counts, ids, and exception *types*. Tests assert this.
 - **Never put a secret in a `NEXT_PUBLIC_*` variable** — those are compiled into the browser bundle and are public.
 - **A job is `completed` only when analysis finished AND its results were persisted.** Never set that state from anywhere but `pipeline.run_job`'s final transition, and never infer it on the client. An empty detections list means nothing unless `job.state === "completed"` - that distinction is the whole point of the state machine.
+- **A reconstructed output is a first-class video record** (Phase 9), with its own `video_id`, owner and `s3_key` under `remediated/`. That is what lets the existing pipeline analyse it and the existing playback route serve it with no special case. ⚠️ **Never write a reconstruction over its source**: the key is built from a freshly minted output id, `reconstruction.reconstruct` refuses if asked to write over its own input, and a test asserts the source object's bytes are unchanged after a run.
+- **Only `verification.py` may set `verified` or `verification_failed`** (Phase 9), and only from the OUTPUT video's **persisted** analysis with at least one audited frame. A completed job that audited nothing, a failed job, a job still running, and a storage failure reading the results are each explicitly NOT evidence — they produce `pending`/`inconclusive`, never a pass. **Never use the original video's analysis as evidence about the output.**
+- **Keep the three verification facts apart** (Phase 9): `target_resolved`, `policy_passed` and `other_findings` answer different questions, and `null` for the first two means "no verdict", not `false`. "The logo is gone" is not "the video is fine".
+- **Reconstruction refuses rather than guesses.** No bounding box, a malformed or too-small region, a timestamp past the clip's duration, or a zero-length window each fail terminally with a safe message. Never invent a region, a default window, or a whole-frame fallback.
+- **Call it a scaled overlay, never seamless.** It conceals the approved region with hard edges; it does not inpaint, match grain, or track motion. A frontend test asserts "seamless" and "inpaint" never appear.
 - **Never collapse the remediation states into one flag** (Phase 8). `proposed` is not approved, `approved` is not generated, `asset_ready` is not a changed video, `applied` is not compliant. **Only `verified` may be called compliant**, and it is reachable only from `verifying` — i.e. only after a completed re-analysis whose persisted results support the claim. `remediation_repo.view` answers this once in `is_compliance_claim`; never re-derive it from the state string. A `verification_failed` record is NOT clean.
 - **Do not add a Nova Canvas adapter without verifying the payload schema** against authoritative Bedrock documentation (§9 q4, `docs/REMEDIATION.md` §6). `image_provider.NullImageProvider.generate` raises and never returns an image; a provider that returned its input, a placeholder, or a fabricated success would reintroduce the exact defect Phase 2 removed. A test is named for it.
 - **Treat provider output as untrusted.** `image_provider.validate_image_bytes` derives the content type from the bytes and ignores the provider's declaration; a 2xx response is not evidence of an image.
@@ -387,7 +405,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0 through 8 are **complete, committed, and pushed**.
+Phases 0 through 9 are **complete, committed, and pushed**.
 
 | Phase | What landed |
 | :-- | :-- |
@@ -401,6 +419,7 @@ Phases 0 through 8 are **complete, committed, and pushed**.
 | 6 | Durable worker process, AWS client timeouts, retry classification with backoff, health/readiness probes, Scan replaced by Query on the request path. |
 | 7 | Frontend connected to real compliance data; every fabricated panel removed; findings rendered for the first time; accessibility, TypeScript and API-layer cleanup. |
 | 8 | Reviewed remediation workflow: proposal, owner approval, staleness detection, confidence gating, provider contract with a truthful unavailable state. **No image generated, no video modified.** |
+| 9 | End-to-end correction from an owner-supplied image: validated asset storage, FFmpeg overlay reconstruction into a **new** video, output validation, re-analysis through the existing pipeline, and evidence-based verification. **Still no image generation; the original upload is never modified; FFmpeg was unavailable locally so its real-binary tests are skipped.** |
 
 **Phase 5 detail.** Deleted: the orphaned MongoDB/GridFS pipeline (`audit_manager.py`, `verifier.py`, `check_count.py`), `debug_probe.py`, `aws_config.py`, `frontend_backup/` (72 files), the stray `frontend/Video Compliance Dashboard/`, the orphan `/agents` and `/logs` duplicate routes, `infra/init_s3.py`, and `infra/iam_policy.yaml` — 82 files. `S3_BUCKET_NAME` is now required in production and validated; `MONGO_URI` and `Pillow` are gone with their only consumer. Regression tests assert the deleted modules stay deleted, that nothing imports `gridfs`, and that nothing reimplements the bucket fallback.
 
@@ -424,7 +443,7 @@ client is now the only module reading `NEXT_PUBLIC_API_URL`. **No backend file
 was modified** — `git diff` touches `frontend/`, the two READMEs, `.env.example`
 and this file only.
 
-**Phases 5 through 8 did NOT make the application production-ready.** Phase 5 made the architecture coherent; Phase 6 made job execution durable and removed a real class of data loss. Everything still open in §5 "Known remaining gaps" stands, and **nothing has ever run against real AWS or Bedrock** — no worker has run against real infrastructure and no process has been SIGKILLed, so crash recovery is verified as logic, not as observed behaviour.
+**Phases 5 through 9 did NOT make the application production-ready.** Phase 5 made the architecture coherent; Phase 6 made job execution durable and removed a real class of data loss. Everything still open in §5 "Known remaining gaps" stands, and **nothing has ever run against real AWS or Bedrock** — no worker has run against real infrastructure and no process has been SIGKILLed, so crash recovery is verified as logic, not as observed behaviour.
 
 **Phase 6 detail.** Execution split into two processes: the API queues durably and returns; `backend/worker.py` polls, claims under a lease, and runs. The durable queue is the existing MongoDB `videos` collection — **no SQS, no new AWS resource, no new IAM permission** (`docs/PIPELINE_ARCHITECTURE.md` §8.6 records why SQS was rejected). Also added: `backend/aws_clients.py` so every boto3 client has a finite timeout and a bounded retry budget (only `source_store` had one before); retryable-vs-permanent failure classification with exponential backoff via `not_before`; `/health/live`, `/health/ready` and `/health/worker`; and the per-video frame read moved from a full-table `Scan` to a key-based `Query`. The API response contract is unchanged in both execution modes, and a test asserts it.
 
@@ -447,7 +466,31 @@ found and fixed in the process: the analyzer stores bounding boxes as
 int/float, because its input is model JSON) — so reading a stored box back
 silently dropped it. `remediation._normalised_box` converts first.
 
-**Phase 9 has not been started.** Remaining: 9 (reconstruction — needs §9 q3), 10 (tests, CI, docs, release). Do not start one until it is explicitly assigned.
+**Phase 9 detail.** Resolved §9 q3 (see above). New modules:
+`remediation_assets.py` (sniffed, bounded asset storage under a new private
+prefix), `reconstruction.py` (one FFmpeg overlay pass; audio copied, duration
+and dimensions preserved, output probed before anything trusts it),
+`remediation_executor.py` (the claimed, leased service layer), and
+`verification.py` (the only module that may set `verified` /
+`verification_failed`, and only from the OUTPUT's persisted analysis).
+
+Extended: the state machine gained `reconstructing` and the
+`approved → asset_ready` edge; `remediation_repo` gained claim/lease/fencing
+mirroring `video_repo`; `worker.py` drains the remediation queue in the same
+loop and sweeps three recovery cases; `source_store.verify_key_belongs_to`
+accepts two prefixes per video id (the invariant it protects is unchanged —
+*the key names **this** video*); `aws_resources` gained
+`remediation-assets/` and `remediated/`, with matching IAM and CloudFormation
+lifecycle rules; four new routes (`/asset`, `/execute`, `/status`, `/output`).
+
+⚠️ **FFmpeg was not installed on the development host**, so
+`test_integration_ffmpeg_reconstruction.py` is **skipped** — 13 tests, each
+with a precise reason. The reconstruction code is covered at the subprocess
+boundary (the filter graph, the audio handling, every refusal, the cleanup) but
+**no real video has been built by it**. Run `pytest -m requires_ffmpeg` before
+trusting the output.
+
+**Phase 10 has not been started.** Remaining: 10 (tests, CI, docs, release). Do not start it until it is explicitly assigned.
 
 ⚠️ **Nothing in Phase 8 generated an asset or modified a video, and no code
 path can.** `docs/REMEDIATION.md` §8 lists the four things Phase 9 must build,
@@ -506,7 +549,7 @@ These block specific phases. Do not decide them unilaterally.
 
 1. ~~Delete the dead MongoDB/GridFS pipeline?~~ **RESOLVED in Phase 5 — deleted**, per the recommendation recorded here. A regression test keeps it deleted.
 2. Keep MongoDB for users, or consolidate onto DynamoDB? *(Still open. MongoDB now also holds ownership and job state, so this is a larger decision than it was.)*
-3. Is video **reconstruction** in release scope, or is detection + reporting enough for v1?
+3. ~~Is video **reconstruction** in release scope?~~ **RESOLVED in Phase 9 — in scope, built from an owner-supplied replacement image, as a localized overlay over the approved region.** Decision record: `docs/REMEDIATION.md` §9. The output is a **new** video with its own id under `remediated/`; the original upload is never modified. ⚠️ It is a *concealment*, not a repair — hard edges, no grain matching, no motion tracking — and `reconstruction_method` is reported as `scaled_overlay` so nothing downstream can read more into it. **Never describe it as seamless.** Left open deliberately: chained corrections (a second remediation rebuilds from the original, not the first output) and promoting an output to replace its source.
 4. ~~Is **remediation** (Nova Canvas) in release scope?~~ **RESOLVED in Phase 8 — in scope as a reviewed proposal workflow; automated image generation is NOT implemented.** Full decision record and rationale: `docs/REMEDIATION.md`. In short: the Canvas request schema could not be verified from anything in this repository (botocore types `InvokeModel.body` as an opaque blob — verified; the deleted `audit_manager.remediate_frame` admitted in its own comment that the schema was unconfirmed), and the roadmap forbids guessing a provider wire format. So Phase 8 built the proposal/approval lifecycle, the provider interface with its error contract, and a provider that truthfully reports itself unavailable. ⚠️ **Do not add a Canvas adapter without first verifying the payload schema against authoritative Bedrock documentation**, and do not re-add a mock: `test_remediation_provider.py` asserts the shipped provider raises rather than returning an image.
 5. Which bounding-box schema is canonical? *(De facto: the array form in `prompts.py`.)*
 6. Correct model ID — `amazon.nova-pro-v1:0`, or a "Nova 2 Pro" id? Docs and code disagree.

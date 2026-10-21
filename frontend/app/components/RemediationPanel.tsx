@@ -1,54 +1,103 @@
 "use client";
 
 /**
- * Propose, review and decide a remediation for one finding.
+ * Propose, review, decide, build and check a remediation for one finding.
  *
- * Phase 8. Rendered inside `ViolationList` under the finding it addresses, so
- * a reviewer sees the evidence and the proposed change together rather than
- * on separate screens.
+ * Phase 8 built the review half. Phase 9 added the rest: supplying the
+ * replacement image, building a corrected video, and showing what the
+ * re-analysis of THAT video found.
  *
- * WHAT THIS COMPONENT WILL NOT DO
- * -------------------------------
- * It never describes a video as corrected, fixed or compliant. The backend
- * answers that question in `is_compliance_claim` and it is false for every
- * state this build can reach, so the only honest rendering of an approved
- * proposal is "approved, nothing generated".
+ * WHAT THIS COMPONENT WILL NOT SAY
+ * --------------------------------
+ * In order of how damaging each would be:
  *
- * Generation is offered only when `capabilities.generation_available` is true,
- * which it is not on any current deployment. When it is false the panel says
- * so, with the backend's own reason, instead of showing a button that would
- * 503. Disabling that control is a courtesy, NOT the security boundary: the
- * backend refuses an unapproved or unavailable execution on its own, and the
- * route tests assert that directly.
+ * * "corrected" or "compliant" before the backend's own
+ *   `is_compliance_claim` is true, which happens only in `verified`;
+ * * "verified" from a state string - the verdict and its evidence come from
+ *   `record.verification`, written server-side from the output's persisted
+ *   analysis;
+ * * anything resembling success for `applied`, which means a new video exists
+ *   and NOTHING has checked it;
+ * * "compliant" when the target is gone but other findings remain - those are
+ *   separate facts and both are shown;
+ * * a percentage. Progress is the backend's named stage for the output's
+ *   analysis job, or nothing;
+ * * a download link before a real authorized output exists. The URL is
+ *   fetched on demand and 404s until there is one.
+ *
+ * The original video is never modified, and the panel says so at the point
+ * where a reader would most want reassurance - while a new video is being
+ * built.
  */
 
 import React from "react";
-import { AlertTriangle, Check, Loader2, Wrench, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  Clock,
+  Film,
+  Loader2,
+  Upload,
+  Wrench,
+  X,
+} from "lucide-react";
 import { cn } from "../lib/utils";
 import {
   ApiError,
   createRemediation,
   decideRemediation,
   describeError,
-  executeRemediation,
+  fetchRemediationOutput,
+  fetchRemediationStatus,
   isAbortError,
+  startRemediationExecution,
+  uploadRemediationAsset,
+  validateReplacementImage,
   type Detection,
   type Remediation,
   type RemediationCapabilities,
+  type RemediationOutput,
+  type RemediationStatus,
 } from "../lib/api";
 import { formatDateTime } from "../lib/jobs";
 import {
   canCancel,
   canExecute,
+  canRetryExecution,
   claimsCompliance,
   gateLabel,
+  hasOutput,
+  isExecuting,
+  needsAsset,
+  otherFindings,
   remediationLabel,
   toneForGate,
   toneForRemediation,
+  verdictSummary,
 } from "../lib/remediation";
 import { StatusBadge } from "./ui/Feedback";
+import ViolationList from "./ViolationList";
 
-type Busy = "propose" | "approve" | "reject" | "cancel" | "execute" | null;
+type Busy =
+  | "propose"
+  | "approve"
+  | "reject"
+  | "cancel"
+  | "asset"
+  | "execute"
+  | "output"
+  | null;
+
+/**
+ * How often the status is re-read while work is in flight.
+ *
+ * Polled, not pushed. Each poll is scheduled only after the previous one
+ * settles, so requests cannot overlap or stack up behind a slow response.
+ */
+const POLL_INTERVAL_MS = 4000;
+// ~10 minutes. A record still active after this is left alone rather than
+// polled forever; a reload picks it up again.
+const MAX_POLLS = 150;
 
 export default function RemediationPanel({
   videoId,
@@ -68,13 +117,17 @@ export default function RemediationPanel({
 }) {
   const [busy, setBusy] = React.useState<Busy>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [fileError, setFileError] = React.useState<string | null>(null);
+  const [output, setOutput] = React.useState<RemediationOutput | null>(null);
+  const [analysis, setAnalysis] = React.useState<
+    RemediationStatus["output_analysis"]
+  >(null);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
 
-  // Aborts an in-flight decision when the panel goes away, so a late response
-  // cannot update a gone component.
+  // Aborts in-flight work when the panel goes away.
   const abortRef = React.useRef<AbortController | null>(null);
-  // Belt and braces alongside the abort, and the same guard the other views
-  // use: an abort depends on the transport honouring the signal, and a late
-  // response must not reach `onChanged` even if it does not.
+  // Belt and braces alongside the abort: an abort depends on the transport
+  // honouring the signal, and a late response must not reach `onChanged`.
   const mountedRef = React.useRef(true);
   React.useEffect(
     () => () => {
@@ -87,13 +140,88 @@ export default function RemediationPanel({
 
   const frameNumber = detection.frame_number;
   const detectionIndex = detection.detection_index;
-
-  // Without both, the finding has no address the remediation API can take.
-  // This is a real state for a legacy response rather than something to
-  // paper over, so the panel says so and offers nothing.
   const addressable =
     typeof frameNumber === "number" && typeof detectionIndex === "number";
 
+  const remediationId = record?.remediation_id;
+  const shouldPoll = Boolean(record && isExecuting(record));
+
+  // ------------------------------------------------------------------ poll
+  React.useEffect(() => {
+    if (!shouldPoll || !remediationId) {
+      setAnalysis(null);
+      return;
+    }
+
+    let cancelled = false;
+    let polls = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const controller = new AbortController();
+
+    const poll = async () => {
+      if (cancelled) return;
+      polls += 1;
+      try {
+        const status = await fetchRemediationStatus(remediationId, {
+          signal: controller.signal,
+        });
+        if (cancelled) return;
+        setAnalysis(status.output_analysis);
+        onChanged(status);
+        // Terminal, or no longer executing: stop. The record's own state is
+        // the authority on that, never a local guess.
+        if (status.is_terminal || !isExecuting(status)) return;
+      } catch (err) {
+        if (cancelled || isAbortError(err)) return;
+        if (err instanceof ApiError && (err.isUnauthorized || err.isNotFound)) {
+          // Nothing more to poll for; stop rather than hammering a route that
+          // will keep refusing.
+          return;
+        }
+        // A transient failure is not a failed correction. Keep waiting.
+      }
+
+      if (polls >= MAX_POLLS) return;
+      timer = setTimeout(poll, POLL_INTERVAL_MS);
+    };
+
+    void poll();
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) clearTimeout(timer);
+      controller.abort();
+    };
+  }, [shouldPoll, remediationId, onChanged]);
+
+  // Fetch the playback URL only once an output really exists.
+  React.useEffect(() => {
+    if (!record || !hasOutput(record) || !remediationId) {
+      setOutput(null);
+      return;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const result = await fetchRemediationOutput(remediationId, {
+          signal: controller.signal,
+        });
+        if (!cancelled) setOutput(result);
+      } catch (err) {
+        // No placeholder: if the URL cannot be had, no player is offered.
+        if (!cancelled && !isAbortError(err)) setOutput(null);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [record, remediationId]);
+
+  // ------------------------------------------------------------------ run
   const run = async (
     action: Busy,
     operation: (signal: AbortSignal) => Promise<Remediation>
@@ -109,8 +237,6 @@ export default function RemediationPanel({
       onChanged(updated);
     } catch (err) {
       if (isAbortError(err) || !mountedRef.current) return;
-      // A 409 is the backend telling us the record moved underneath us, which
-      // is information rather than a fault; its detail says what happened.
       setError(
         describeError(
           err,
@@ -124,11 +250,22 @@ export default function RemediationPanel({
     }
   };
 
-  if (!capabilities) {
-    // Null while loading, undefined when the capability read failed. Either
-    // way, offering a control would be guessing at what the server supports.
-    return null;
-  }
+  const onFileChosen = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file || !remediationId) return;
+
+    const problem = validateReplacementImage(file, capabilities);
+    if (problem) {
+      setFileError(problem);
+      return;
+    }
+    setFileError(null);
+    void run("asset", (signal) =>
+      uploadRemediationAsset(remediationId, file, { signal })
+    );
+  };
+
+  if (!capabilities) return null;
 
   if (!addressable) {
     return (
@@ -151,12 +288,7 @@ export default function RemediationPanel({
               createRemediation(videoId, frameNumber, detectionIndex, { signal })
             )
           }
-          className={cn(
-            "inline-flex items-center gap-3 rounded-xl border border-white/10 bg-white/5",
-            "px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-white/70",
-            "transition-colors hover:bg-white/10 hover:text-white disabled:opacity-50",
-            "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-          )}
+          className={actionClass}
         >
           {busy === "propose" ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
@@ -174,10 +306,10 @@ export default function RemediationPanel({
 
   // ----------------------------------------------------------------- review
   const proposal = record.proposal;
-  const tone = toneForRemediation(record.state);
-  // Defensive: no state this build can reach sets it, and if a future one
-  // does the claim must come from the server, not from this component.
   const compliant = claimsCompliance(record);
+  const verdict = verdictSummary(record);
+  const others = otherFindings(record);
+  const reconstruction = record.reconstruction;
 
   return (
     <section
@@ -190,11 +322,19 @@ export default function RemediationPanel({
         <h5 className="text-[10px] font-bold uppercase tracking-widest text-white/50">
           Remediation
         </h5>
-        <StatusBadge label={remediationLabel(record.state)} tone={tone} />
-        {!compliant && (
-          /* Stated, not implied. A reader who sees "Approved" must not take
-             it for "resolved". */
-          <StatusBadge label="Video unchanged" tone="neutral" />
+        <StatusBadge
+          label={remediationLabel(record.state)}
+          tone={toneForRemediation(record.state)}
+        />
+        {/* The original is never modified by any phase; said plainly at every
+            stage, because this is where a reader would worry. */}
+        <StatusBadge label="Original unchanged" tone="neutral" />
+        {!compliant && record.state !== "proposed" && (
+          <StatusBadge
+            label="Not a compliance sign-off"
+            tone="neutral"
+            title="Only a completed check of the new video can establish that, and only for the finding it targeted."
+          />
         )}
       </div>
 
@@ -217,8 +357,6 @@ export default function RemediationPanel({
         <span className="text-[10px] text-white/30">{record.stage}</span>
       </div>
 
-      {/* The model's own words, attributed and kept separate from the
-          rationale - an explanation is not evidence that the finding is real. */}
       <blockquote className="border-l-2 border-white/10 pl-4 text-[11px] italic leading-relaxed text-white/35">
         <span className="not-italic font-bold uppercase tracking-widest text-white/25">
           Model said:{" "}
@@ -241,19 +379,11 @@ export default function RemediationPanel({
           {record.decision_note}
         </p>
       )}
-      {record.error_summary && (
-        <p
-          role="status"
-          className="rounded-xl border border-white/10 bg-white/[0.02] p-4 text-[11px] leading-relaxed text-white/50"
-        >
-          {record.error_summary}
-        </p>
-      )}
 
       {/* Decisions */}
       {record.state === "proposed" && (
         <div className="flex flex-wrap items-center gap-3">
-          <DecisionButton
+          <ActionButton
             testId={`approve-${record.remediation_id}`}
             label="Approve"
             busyLabel="Approving..."
@@ -268,7 +398,7 @@ export default function RemediationPanel({
               )
             }
           />
-          <DecisionButton
+          <ActionButton
             testId={`reject-${record.remediation_id}`}
             label="Reject"
             busyLabel="Rejecting..."
@@ -286,43 +416,305 @@ export default function RemediationPanel({
         </div>
       )}
 
-      {canExecute(record) && (
-        <div className="space-y-3">
+      {/* ------------------------------------------------ supply an asset */}
+      {needsAsset(record) && (
+        <div className="space-y-3 rounded-xl border border-white/10 bg-white/[0.02] p-4">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-white/40">
+            Replacement image
+          </p>
           {capabilities.generation_available ? (
-            <DecisionButton
-              testId={`execute-${record.remediation_id}`}
-              label="Generate the corrected frame"
-              busyLabel="Starting..."
-              busy={busy === "execute"}
-              disabled={busy !== null}
-              icon={Wrench}
-              onClick={() =>
-                run("execute", (signal) =>
-                  executeRemediation(record.remediation_id, { signal })
-                )
-              }
-            />
+            <p className="text-[11px] leading-relaxed text-white/40">
+              An image can be generated for this finding, or you can supply
+              your own.
+            </p>
           ) : (
-            /* No control at all, rather than one that would 503. The reason
-               is the backend's own words. */
+            /* Honest about why there is an upload here rather than a
+               "generate" button. */
             <p
               data-testid="generation-unavailable"
-              className="rounded-xl border border-white/10 bg-white/[0.02] p-4 text-[10px] leading-relaxed text-white/40"
+              className="text-[11px] leading-relaxed text-white/40"
             >
               <span className="font-bold uppercase tracking-widest text-white/30">
-                Not available:{" "}
+                Automatic generation unavailable:{" "}
               </span>
               {capabilities.generation_unavailable_reason ??
-                "Automated image generation is not configured on this deployment."}
+                "No image provider is configured on this deployment."}{" "}
+              Supply the replacement image yourself to continue.
+            </p>
+          )}
+
+          {capabilities.reconstruction_available === false ? (
+            <p
+              data-testid="reconstruction-unavailable"
+              className="text-[11px] leading-relaxed text-white/40"
+            >
+              {capabilities.reconstruction_unavailable_reason ??
+                "Building corrected videos is not enabled on this deployment."}
+            </p>
+          ) : (
+            <>
+              <label htmlFor={`asset-${record.remediation_id}`} className="sr-only">
+                Replacement image for this finding
+              </label>
+              <input
+                id={`asset-${record.remediation_id}`}
+                ref={fileInputRef}
+                type="file"
+                accept={(capabilities.accepted_asset_types ?? []).join(",")}
+                className="sr-only"
+                onChange={onFileChosen}
+              />
+              <button
+                type="button"
+                data-testid={`upload-asset-${record.remediation_id}`}
+                disabled={busy !== null}
+                onClick={() => fileInputRef.current?.click()}
+                className={actionClass}
+              >
+                {busy === "asset" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Upload className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                <span>
+                  {busy === "asset"
+                    ? "Uploading..."
+                    : "Choose a replacement image"}
+                </span>
+              </button>
+              <p className="text-[10px] uppercase tracking-widest text-white/25">
+                PNG or JPEG, up to{" "}
+                {Math.floor((capabilities.max_asset_bytes ?? 0) / (1024 * 1024))}{" "}
+                MB
+              </p>
+            </>
+          )}
+
+          {fileError && (
+            <p
+              role="alert"
+              data-testid="asset-file-error"
+              className="text-[10px] font-bold uppercase tracking-widest text-critical"
+            >
+              {fileError}
             </p>
           )}
         </div>
       )}
 
-      {canCancel(record) && record.state === "approved" && (
-        <DecisionButton
+      {record.has_asset && (
+        <p className="text-[10px] uppercase tracking-widest text-white/30">
+          Replacement image attached
+          {record.asset_source === "upload" ? " by you" : ""}
+          {record.asset_supplied_at
+            ? ` · ${formatDateTime(record.asset_supplied_at)}`
+            : ""}
+        </p>
+      )}
+
+      {/* --------------------------------------------- build the new video */}
+      {canExecute(record) && capabilities.reconstruction_available !== false && (
+        <div className="space-y-3">
+          <ActionButton
+            testId={`execute-${record.remediation_id}`}
+            label="Build the new video"
+            busyLabel="Starting..."
+            busy={busy === "execute"}
+            disabled={busy !== null}
+            icon={Film}
+            onClick={() =>
+              run("execute", (signal) =>
+                startRemediationExecution(record.remediation_id, { signal })
+              )
+            }
+          />
+          <p className="text-[10px] leading-relaxed text-white/30">
+            This creates a NEW video. Your original is left exactly as
+            uploaded. The new video is then analysed in its own right, and only
+            that analysis can say whether the finding is gone.
+          </p>
+        </div>
+      )}
+
+      {/* ------------------------------------------------------- progress */}
+      {isExecuting(record) && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid={`progress-${record.remediation_id}`}
+          className="space-y-2 rounded-xl border border-accent/30 bg-accent/5 p-4"
+        >
+          <p className="flex items-center gap-3 text-[10px] font-bold uppercase tracking-widest text-accent">
+            <Clock className="h-3.5 w-3.5" aria-hidden="true" />
+            {record.stage}
+          </p>
+          {/* The backend's named stage for the OUTPUT's analysis job. Never a
+              percentage: the frame total is unknown until extraction ends. */}
+          {analysis && (
+            <p className="text-[10px] uppercase tracking-widest text-accent/70">
+              New video analysis: {analysis.stage}
+              {analysis.frames_extracted != null && (
+                <> · {analysis.frames_extracted} frame(s) extracted</>
+              )}
+            </p>
+          )}
+          {(record.recovered_count ?? 0) > 0 && (
+            <p className="text-[10px] uppercase tracking-widest text-accent/70">
+              Automatically restarted {record.recovered_count} time(s) after an
+              interrupted run.
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* --------------------------------------------------- the new video */}
+      {hasOutput(record) && (
+        <div className="space-y-3 rounded-xl border border-white/10 bg-white/[0.02] p-4">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-white/40">
+            The new video
+          </p>
+          {output ? (
+            <video
+              data-testid={`output-video-${record.remediation_id}`}
+              src={output.playback_url}
+              controls
+              preload="metadata"
+              aria-label="The new video built for this remediation"
+              className="w-full rounded-lg"
+            />
+          ) : (
+            /* No placeholder player and no dead link. */
+            <p className="text-[10px] uppercase tracking-widest text-white/25">
+              Preparing playback...
+            </p>
+          )}
+          {reconstruction && (
+            <dl className="flex flex-wrap gap-x-6 gap-y-1 text-[10px] uppercase tracking-widest text-white/30">
+              <div className="flex gap-2">
+                <dt className="font-bold text-white/25">Method</dt>
+                {/* Named plainly. An overlay conceals a region; it does not
+                    inpaint, and the word "seamless" never appears. */}
+                <dd>
+                  {reconstruction.method === "scaled_overlay"
+                    ? "Scaled overlay over the approved region"
+                    : reconstruction.method}
+                </dd>
+              </div>
+              {reconstruction.window_seconds && (
+                <div className="flex gap-2">
+                  <dt className="font-bold text-white/25">Applied</dt>
+                  <dd>
+                    {reconstruction.window_seconds[0]}s–
+                    {reconstruction.window_seconds[1]}s
+                  </dd>
+                </div>
+              )}
+              <div className="flex gap-2">
+                <dt className="font-bold text-white/25">Audio</dt>
+                <dd>
+                  {reconstruction.audio_preserved
+                    ? "Preserved"
+                    : reconstruction.source_had_audio === false
+                      ? "None in the original"
+                      : "Not preserved"}
+                </dd>
+              </div>
+            </dl>
+          )}
+        </div>
+      )}
+
+      {/* ----------------------------------------------------- the verdict */}
+      {verdict && (
+        <div
+          data-testid={`verdict-${record.remediation_id}`}
+          className={cn(
+            "space-y-3 rounded-xl border p-4",
+            compliant
+              ? "border-success/30 bg-success/5"
+              : record.state === "verification_failed"
+                ? "border-critical/30 bg-critical/5"
+                : "border-white/10 bg-white/[0.02]"
+          )}
+        >
+          <p
+            className={cn(
+              "text-[10px] font-bold uppercase tracking-widest",
+              compliant
+                ? "text-success"
+                : record.state === "verification_failed"
+                  ? "text-critical"
+                  : "text-white/40"
+            )}
+          >
+            {compliant
+              ? "The targeted finding is gone"
+              : record.state === "verification_failed"
+                ? "The targeted finding is still there"
+                : "No conclusion"}
+          </p>
+          <p className="text-[11px] leading-relaxed text-white/50">{verdict}</p>
+
+          {record.verification?.frames_audited != null && (
+            <p className="text-[10px] uppercase tracking-widest text-white/25">
+              Based on {record.verification.frames_audited} audited frame(s) of
+              the new video
+            </p>
+          )}
+
+          {/* Separate from the verdict, deliberately: "the logo is gone" and
+              "the video is fine" are different statements, and the second is
+              not implied by the first. */}
+          {others.length > 0 && (
+            <div className="space-y-3 border-t border-white/10 pt-3">
+              <p
+                data-testid={`other-findings-${record.remediation_id}`}
+                className="text-[10px] font-bold uppercase tracking-widest text-white/40"
+              >
+                {others.length} other finding(s) in the new video
+              </p>
+              <p className="text-[10px] leading-relaxed text-white/30">
+                These were reported by the same analysis. They are not what this
+                remediation targeted, and they are not resolved.
+              </p>
+              <ViolationList detections={others} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {record.error_summary && !verdict && (
+        <p
+          role="status"
+          data-testid={`error-summary-${record.remediation_id}`}
+          className="rounded-xl border border-white/10 bg-white/[0.02] p-4 text-[11px] leading-relaxed text-white/50"
+        >
+          {record.error_summary}
+        </p>
+      )}
+
+      {/* A retry is offered only for a build that failed, never for a check
+          that came back negative - the same asset would build the same video. */}
+      {canRetryExecution(record) && (
+        <ActionButton
+          testId={`retry-${record.remediation_id}`}
+          label="Try building it again"
+          busyLabel="Starting..."
+          busy={busy === "execute"}
+          disabled={busy !== null}
+          icon={Film}
+          onClick={() =>
+            run("execute", (signal) =>
+              startRemediationExecution(record.remediation_id, { signal })
+            )
+          }
+        />
+      )}
+
+      {canCancel(record) && record.state !== "proposed" && (
+        <ActionButton
           testId={`cancel-${record.remediation_id}`}
-          label="Withdraw approval"
+          label="Withdraw"
           busyLabel="Withdrawing..."
           busy={busy === "cancel"}
           disabled={busy !== null}
@@ -342,6 +734,13 @@ export default function RemediationPanel({
   );
 }
 
+const actionClass = cn(
+  "inline-flex items-center gap-3 rounded-xl border border-white/10 bg-white/5",
+  "px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-white/70",
+  "transition-colors hover:bg-white/10 hover:text-white disabled:opacity-50",
+  "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+);
+
 function PanelError({ message }: { message: string }) {
   return (
     <p
@@ -354,7 +753,7 @@ function PanelError({ message }: { message: string }) {
   );
 }
 
-function DecisionButton({
+function ActionButton({
   testId,
   label,
   busyLabel,
@@ -377,12 +776,7 @@ function DecisionButton({
       data-testid={testId}
       disabled={disabled}
       onClick={onClick}
-      className={cn(
-        "inline-flex items-center gap-3 rounded-xl border border-white/10 bg-white/5",
-        "px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-white/70",
-        "transition-colors hover:bg-white/10 hover:text-white disabled:opacity-50",
-        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-      )}
+      className={actionClass}
     >
       {busy ? (
         <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />

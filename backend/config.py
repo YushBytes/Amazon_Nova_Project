@@ -383,6 +383,101 @@ def load_max_remediations_per_video() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Reconstruction and verification (Phase 9)
+# ---------------------------------------------------------------------------
+
+VERIFICATION_POLICY_TARGET_ONLY = "target_only"
+VERIFICATION_POLICY_CLEAN_OUTPUT = "clean_output"
+# Mirrors verification.POLICIES. Duplicated as literals rather than imported
+# because config must not import an application module - config is resolved at
+# import time by app.py and a cycle would break startup. A test holds the two
+# sets equal.
+VERIFICATION_POLICIES = frozenset(
+    {VERIFICATION_POLICY_TARGET_ONLY, VERIFICATION_POLICY_CLEAN_OUTPUT}
+)
+
+
+def load_verification_policy() -> str:
+    """When a re-analysis of the output counts as verifying a remediation.
+
+    "target_only" (default)  The targeted finding is no longer detected.
+                             Other findings in the output are recorded and
+                             exposed but do not block, because a remediation
+                             addresses ONE finding and a video with two
+                             problems should not report the first fix as a
+                             failure.
+    "clean_output"           The output must carry no findings at all.
+
+    An unrecognised value raises rather than defaulting, so a typo cannot
+    silently select the more permissive policy.
+    """
+    raw = (os.getenv("VERIFICATION_POLICY") or "").strip().lower()
+    if not raw:
+        return VERIFICATION_POLICY_TARGET_ONLY
+    if raw not in VERIFICATION_POLICIES:
+        raise ConfigurationError(
+            f"VERIFICATION_POLICY must be one of "
+            f"{sorted(VERIFICATION_POLICIES)}; got {raw!r}."
+        )
+    return raw
+
+
+def load_reconstruction_enabled() -> bool:
+    """Whether an approved remediation may be executed at all.
+
+    Default on. Execution needs the FFmpeg executable, so a deployment
+    without it should turn this off rather than letting every attempt fail
+    after claiming the work - the route then reports the capability as absent
+    up front, which is what the UI renders.
+    """
+    return _bool_env("RECONSTRUCTION_ENABLED", True)
+
+
+def load_reconstruction_timeout_seconds() -> int:
+    """Wall-clock limit for one reconstruction's FFmpeg pass.
+
+    Separate from FFMPEG_TIMEOUT_SECONDS: extraction decodes every sampled
+    frame, while this is one overlay pass that either runs promptly or is
+    stuck.
+    """
+    return _int_env("RECONSTRUCTION_TIMEOUT_SECONDS", 300, minimum=10)
+
+
+def load_remediation_window_seconds() -> float:
+    """Half-width of the interval the replacement is drawn over, in seconds.
+
+    Frames are sampled at FRAME_SAMPLE_FPS, so a finding at t=3 is evidence
+    about the interval around t=3 rather than a single instant. The default of
+    1.0 covers one sampling interval each side without reaching into a
+    neighbouring frame's evidence.
+    """
+    raw = os.getenv("REMEDIATION_WINDOW_SECONDS")
+    if raw is None or not raw.strip():
+        return 1.0
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        raise ConfigurationError(
+            "REMEDIATION_WINDOW_SECONDS must be a number of seconds."
+        )
+    if value != value or not (0.0 < value <= 30.0):
+        raise ConfigurationError(
+            "REMEDIATION_WINDOW_SECONDS must be greater than 0 and at most 30."
+        )
+    return value
+
+
+def load_max_asset_bytes() -> int:
+    """Ceiling on an uploaded replacement image.
+
+    Independent of MAX_UPLOAD_BYTES, which bounds a video. An image that
+    replaces part of one frame has no business being large, and the bound is
+    enforced on the BYTES RECEIVED, before anything is stored.
+    """
+    return _int_env("MAX_REMEDIATION_ASSET_BYTES", 8 * 1024 * 1024, minimum=1024)
+
+
+# ---------------------------------------------------------------------------
 # AWS client timeouts (Phase 6)
 # ---------------------------------------------------------------------------
 #
@@ -747,6 +842,11 @@ class Settings:
         self.ffmpeg_timeout_seconds = load_ffmpeg_timeout_seconds()
         self.bedrock_max_attempts = load_bedrock_max_attempts()
         self.remediation_enabled = load_remediation_enabled()
+        self.reconstruction_enabled = load_reconstruction_enabled()
+        self.reconstruction_timeout_seconds = load_reconstruction_timeout_seconds()
+        self.remediation_window_seconds = load_remediation_window_seconds()
+        self.max_asset_bytes = load_max_asset_bytes()
+        self.verification_policy = load_verification_policy()
         self.remediation_image_provider = load_remediation_image_provider()
         self.remediation_min_confidence = load_remediation_min_confidence()
         self.max_remediations_per_video = load_max_remediations_per_video()
@@ -790,6 +890,8 @@ class Settings:
             f"remediation_enabled={self.remediation_enabled}, "
             f"remediation_image_provider={self.remediation_image_provider!r}, "
             f"remediation_min_confidence={self.remediation_min_confidence}, "
+            f"reconstruction_enabled={self.reconstruction_enabled}, "
+            f"verification_policy={self.verification_policy!r}, "
             f"job_execution_mode={self.job_execution_mode!r}, "
             f"cors_origins={self.cors_origins}, "
             f"rate_limit_enabled={self.rate_limit_enabled}, "

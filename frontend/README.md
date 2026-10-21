@@ -23,7 +23,8 @@ endpoint says so on screen rather than showing invented data — see
 | Dashboard (agent only) | `POST /upload-reel`, `POST /analyze/{id}`, `GET /jobs/{id}`, `GET /violations/{id}`, `POST /analyze/{id}/retry` | Upload → audit → findings, with job-state polling. |
 | Your Videos | `GET /submissions` | The caller's own uploads only, with each one's real job state. |
 | Audit detail | `GET /jobs/{id}`, `GET /violations/{id}` | The verdict and the findings. Can also start or re-run an analysis. |
-| Remediation (inside the audit detail) | `GET /remediations/capabilities`, `GET|POST /remediations`, `POST /remediations/{id}/approve|reject|cancel|execute` | Propose a change for a finding, review it, approve or reject it. **Generates nothing and modifies no video.** |
+| Remediation (inside the audit detail) | `GET /remediations/capabilities`, `GET|POST /remediations`, `POST /remediations/{id}/approve|reject|cancel` | Propose a change for a finding, review it, approve or reject it. |
+| Correction (Phase 9, same panel) | `POST /remediations/{id}/asset`, `POST /remediations/{id}/execute`, `GET /remediations/{id}/status`, `GET /remediations/{id}/output` | Upload the replacement image, build a **new** video from it, watch the output's own analysis, and see the verdict. **The original upload is never modified.** |
 | Compliance Log | `GET /submissions` | The caller's audit history, filterable by real job state. |
 | Infrastructure (agent only) | `GET /health/worker` | Job-queue counts and inferred worker health. |
 | Account | `GET /auth/me` (via the auth context) | The signed-in identity. Nothing else; see below. |
@@ -45,12 +46,15 @@ These panels state that a capability does not exist instead of simulating it:
   browser's token; it does **not** revoke it server-side, and the panel says so.
 - **Per-worker telemetry.** `/health/worker` infers queue health; it does not
   contact the worker process. The endpoint's own caveat is rendered.
-- **Automated remediation image generation.** The remediation panel offers
-  approval and rejection, which are real. It offers **no** generate control,
-  because `GET /remediations/capabilities` reports
+- **Automated remediation image generation.** The panel offers **no** generate
+  control, because `GET /remediations/capabilities` reports
   `generation_available: false` on every deployment — no image provider is
-  implemented. The panel shows the backend's own reason rather than a button
-  that would 503. See `../docs/REMEDIATION.md`.
+  implemented. It shows the backend's own reason and then offers the supported
+  alternative: upload the replacement image yourself. See
+  `../docs/REMEDIATION.md`.
+- **Building a corrected video, where FFmpeg is absent.** When
+  `reconstruction_available` is false the panel says so and offers no build
+  control, rather than accepting work every attempt would fail.
 
 ### Removed in Phase 7
 
@@ -129,13 +133,13 @@ the UI advertises a limit the server refuses.
 ## Checks
 
 ```bash
-npm test          # 333 tests (Vitest + @testing-library/react, jsdom)
+npm test          # 387 tests (Vitest + @testing-library/react, jsdom)
 npm run typecheck # tsc --noEmit
 npm run lint      # eslint app
 npm run build     # next build
 ```
 
-All four pass as of Phase 8: 333 tests, 0 type errors, **0 lint errors and 0
+All four pass as of Phase 9: 387 tests, 0 type errors, **0 lint errors and 0
 lint warnings**, and a successful build of `/`, `/_not-found` and `/login`.
 
 **Order matters after deleting a route.** `npm run typecheck` reads generated
@@ -230,12 +234,25 @@ enumerated.
 - **Bounding-box overlays assume the `[ymin, xmin, ymax, xmax]` 0–1000 form**
   from `backend/prompts.py`, and are positioned as percentages of the player
   box — so they are only correct when the video fills it.
-- **Remediation is review only.** The panel can propose, approve, reject and
-  withdraw. It cannot generate an image, change a video, or verify
-  compliance, and it says so. Approval is per-finding with no bulk action,
+- **Remediation can build a video, but not generate an image.** The panel
+  proposes, approves, rejects, withdraws, accepts a replacement image you
+  supply, triggers the build, and shows the verdict. It cannot generate the
+  image, and it says so. Approval is per-finding with no bulk action,
   deliberately: a bulk approve over unmeasured detections is a way to approve
-  things unread. The panel does not poll — a decision updates its record in
-  place, and other changes need a reload.
+  things unread.
+- **Wording is load-bearing in the remediation panel.** `applied` renders as
+  "New video built, not yet checked"; the word "compliant" appears in no state
+  label at all, not even `verified`, because under the default policy that
+  means *the targeted finding is gone* rather than *the video is fine*. The
+  verdict is read from the server's `verification` evidence, never from the
+  state string, and other findings in the output are shown in their own block
+  below it. Tests enumerate every state and assert this.
+- **Progress while a correction is building is the backend's named stage**, for
+  the output video's own analysis job — never a percentage. The panel polls
+  only while work is in flight and stops on a terminal state or unmount.
+- **The output player appears only once a real output exists.** The playback
+  URL is fetched on demand and 404s until then, so there is no placeholder
+  player and no dead download action.
 - **Nothing here has been exercised against live AWS or Bedrock.** No claim is
   made about detection accuracy, and no video has ever been corrected.
 

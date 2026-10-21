@@ -53,7 +53,9 @@ hashing, `motor` (async MongoDB), `boto3`, `ffmpeg-python`. Tests run on pytest.
 | :-- | :-- | :-- |
 | User accounts | MongoDB `novaflow.users` | Argon2id hashes. Roles: `client`, `agent`. |
 | Video ownership, job state, worker leases | MongoDB `novaflow.videos` | The job state machine lives here. |
-| Remediation proposals and decisions | MongoDB `novaflow.remediations` | Phase 8. Owner-scoped; conditional writes keyed on the record's state. |
+| Remediation proposals and decisions | MongoDB `novaflow.remediations` | Phase 8. Owner-scoped; conditional writes keyed on the record's state. Phase 9 added the worker claim, lease and verification evidence. |
+| Replacement images | S3 `remediation-assets/{remediation_id}/asset.{ext}` | Phase 9. Owner-supplied, accepted only after sniffing the bytes. |
+| Reconstructed output videos | S3 `remediated/{output_video_id}/output.mp4` | Phase 9. A **new** object with its own video id. Nothing overwrites `sources/`. |
 | Source videos | S3 `sources/{video_id}/source.{ext}` | Server-generated keys; no client filename is used. |
 | Extracted frames | S3 `frames/{video_id}/frame_NNNN.jpg` | 1 frame per second by default. |
 | Agent reel uploads | S3 `raw/{project_id}/{agent}/reel.mp4` | Presigned PUT. |
@@ -90,7 +92,7 @@ GET  /auth/me                      POST /analyze/{video_id}/retry
 GET  /status                       GET  /violations/{video_id}
 GET  /submissions                  GET  /uploads/{file}?access_token=...
 POST /execute                      (6 routes under /projects/)
-                                   (7 routes under /remediations/)
+                                   (10 routes under /remediations/)
 
 GET  /health/live                  liveness; touches no dependency
 GET  /health/ready                 config + MongoDB; 503 when not serveable
@@ -111,12 +113,19 @@ element cannot send an `Authorization` header.
 `POST /execute` returns placeholder text — the browser-automation feature behind
 it is not implemented and is awaiting a scope decision (`CLAUDE.md` §9).
 
-`/remediations/*` (Phase 8) is the reviewed remediation workflow: propose a
-change for a persisted finding, read what it would change and on what basis,
-and approve or reject it. **It generates no image and modifies no video** —
-`POST /remediations/{id}/execute` always answers 503 because no image provider
-is implemented, and leaves the record `approved` rather than failed. The
-decision record is `docs/REMEDIATION.md`.
+`/remediations/*` is the remediation workflow: propose a change for a
+persisted finding, read what it would change and on what basis, approve or
+reject it, **supply the replacement image yourself**, have a new output video
+built from it, and see what a fresh analysis **of that output** found.
+
+**It still generates no image** — no provider is implemented, so
+`POST /remediations/{id}/execute` on a proposal with no attached image answers
+503 and leaves the record `approved`. **And it never modifies your original
+upload**: an output is a separate object with its own video id under
+`remediated/`. A remediation is reported as verified only after the output's
+own analysis completed and the configured policy passed, which under the
+default policy means *the targeted finding is gone* — not *the video is
+compliant*. The decision record is `docs/REMEDIATION.md`.
 
 ---
 
@@ -223,16 +232,16 @@ through `POST /auth/signup`. Public signup always assigns the `client` role; the
 
 ```bash
 # Backend
-cd backend && pytest                      # 925 passed, 42 skipped by default
+cd backend && pytest                      # 1111 passed, 55 skipped by default
 pytest -m requires_mongodb                # needs MONGODB_TEST_URL
 pytest -m requires_ffmpeg                 # needs ffmpeg on PATH
 
 # Frontend
-cd frontend && npm test                    # 333 tests (Vitest)
+cd frontend && npm test                    # 387 tests (Vitest)
 npm run lint && npm run typecheck && npm run build
 ```
 
-Frontend: 333 tests pass, 0 type errors, **0 lint errors and 0 lint warnings**,
+Frontend: 387 tests pass, 0 type errors, **0 lint errors and 0 lint warnings**,
 and the build emits `/`, `/_not-found` and `/login`. `fetch` is stubbed at the
 network boundary in every frontend test, so they prove the UI renders the right
 thing for a given API response — and nothing about real backend or AWS
@@ -242,10 +251,12 @@ route: the typecheck reads generated validators under `.next/types/`.
 There is no end-to-end test covering login → upload → analyze → review against
 a live backend, and no browser-automation stack (Phase 10).
 
-42 backend tests are **skipped by default** because they need real dependencies:
-26 require a MongoDB instance (`MONGODB_TEST_URL`, which must name a disposable
-database — setup drops collections) and 16 require the FFmpeg binary. Skipped
-means unverified, not passing.
+55 backend tests are **skipped by default** because they need real
+dependencies: 26 require a MongoDB instance (`MONGODB_TEST_URL`, which must
+name a disposable database — setup drops collections), 16 require the FFmpeg
+binary for frame extraction, and 13 require it for video reconstruction.
+**Skipped means unverified, not passing** — in particular, no video has ever
+been reconstructed by real FFmpeg on the machine this was written on.
 
 No test calls real AWS or incurs cost. Every external service is stubbed.
 
@@ -291,27 +302,41 @@ These are current and deliberate to state plainly.
   backend lacks now say so on screen. Frame remediation and corrected-video
   reconstruction remain **not implemented**, and `POST /execute` still returns
   placeholder text, so no UI control is wired to it.
-- **Remediation is proposal and review only.** Phase 8 resolved whether
-  remediation is in scope (`docs/REMEDIATION.md`): an owner can propose a
-  change for a finding, see what it would change and what it cannot
-  guarantee, and approve or reject it. **No image has ever been generated and
-  no video has ever been modified by this system**, and no code path can do
-  either — the Nova Canvas request schema could not be verified from the
-  pinned SDK or from anything else in the repository, and guessing a provider
-  wire format is forbidden. `verified` — the only state that may be called
-  compliant — is unreachable until Phase 9 builds generation, reconstruction
-  and re-analysis.
+- **Remediation can now build a corrected video, from an image you supply.**
+  Phase 9 resolved whether reconstruction is in scope
+  (`docs/REMEDIATION.md` §9): an owner approves a proposal, uploads the
+  replacement image, and the backend builds a **new** video with it and
+  analyses that output in its own right. **No image has ever been generated by
+  this system** and no code path can generate one — the Nova Canvas request
+  schema could not be verified from the pinned SDK or anything else in the
+  repository, and guessing a provider wire format is forbidden.
+- **The original upload is never modified.** An output is a separate S3 object
+  under its own video id; three independent mechanisms prevent a write to
+  `sources/`, and a test asserts the source bytes are unchanged after a run.
+- **A reconstruction is a concealment, not a repair.** The image is scaled to
+  the approved region and drawn over it with hard edges — no inpainting, no
+  grain matching, no motion tracking. The whole clip is re-encoded once by the
+  video pass; audio is copied and therefore unaffected.
+- **`verified` means the targeted finding is gone, not that the video is
+  compliant.** It requires a completed analysis of the output with at least one
+  audited frame, and under the default policy other findings in the output do
+  not block it — they are recorded and shown separately. A failed, pending or
+  zero-frame analysis is never a pass.
+- **Reconstruction has never run against the real FFmpeg binary** on the
+  machine this was written on: 13 integration tests exist and are **skipped**.
+  Install FFmpeg and run `pytest -m requires_ffmpeg` before trusting the
+  output.
 - **Frontend views are not URL-addressable**, the audit detail view loads once
   rather than polling, and search and filtering run client-side over the list
   already fetched (`GET /submissions` caps at 100 records).
 - The AWS IAM hardening is a reviewed template, not an applied configuration.
 
-Adding a reviewed remediation workflow — the most recent work — gives a human
-the decision about whether a model finding warrants a change, before anything
-consequential can happen. It does **not** make the application
-production-ready: nothing here has run against real AWS, the infrastructure
-template has never been deployed, detection accuracy remains unmeasured, and
-no video has ever been corrected.
+Building a corrected video and checking it — the most recent work — closes the
+loop from a finding to an auditable, evidence-based verdict. It does **not**
+make the application production-ready: nothing here has run against real AWS,
+the infrastructure template has never been deployed, detection accuracy remains
+unmeasured, no image can be generated automatically, and the reconstruction
+code has never executed against the real FFmpeg binary.
 
 ---
 

@@ -289,10 +289,12 @@ describe("reviewing a proposal", () => {
     expect(screen.getByText(/model said/i)).toBeTruthy();
   });
 
-  it("states that the video is unchanged", () => {
+  it("states that the original video is unchanged", () => {
     stubBackend();
     renderPanel({ record: remediation() });
-    expect(screen.getByText("Video unchanged")).toBeTruthy();
+    // Phase 9 builds a NEW video, so the reassurance a reader needs is about
+    // the ORIGINAL specifically.
+    expect(screen.getByText("Original unchanged")).toBeTruthy();
   });
 
   it("reports the confidence gate", () => {
@@ -458,6 +460,18 @@ describe("generation availability", () => {
     );
   });
 
+  it("offers the supplied-asset path instead, and says why", () => {
+    // Phase 9's answer to an unavailable provider: a supported alternative,
+    // not a dead end.
+    stubBackend();
+    renderPanel({ record: remediation("approved") });
+
+    expect(screen.getByTestId("upload-asset-rem_abc123abc123")).toBeTruthy();
+    expect(screen.getByTestId("generation-unavailable").textContent).toMatch(
+      /supply the replacement image yourself/i
+    );
+  });
+
   it("shows the backend's own reason for a configured-but-unimplemented provider", () => {
     stubBackend();
     renderPanel({
@@ -473,21 +487,24 @@ describe("generation availability", () => {
     );
   });
 
-  it("offers the control only when the server says generation is available", () => {
+  it("offers the build control once an asset is ready", () => {
     stubBackend();
-    renderPanel({
-      record: remediation("approved"),
-      caps: capabilities({ generation_available: true }),
-    });
+    renderPanel({ record: remediation("asset_ready", { has_asset: true }) });
     expect(screen.getByTestId("execute-rem_abc123abc123")).toBeTruthy();
-    expect(screen.queryByTestId("generation-unavailable")).toBeNull();
   });
 
-  it("offers no generate control for an unapproved proposal", () => {
+  it("offers no build control for an unapproved proposal", () => {
+    stubBackend();
+    renderPanel({ record: remediation("proposed") });
+    expect(screen.queryByTestId("execute-rem_abc123abc123")).toBeNull();
+    expect(screen.queryByTestId("upload-asset-rem_abc123abc123")).toBeNull();
+  });
+
+  it("offers no build control when reconstruction is disabled", () => {
     stubBackend();
     renderPanel({
-      record: remediation("proposed"),
-      caps: capabilities({ generation_available: true }),
+      record: remediation("asset_ready", { has_asset: true }),
+      caps: capabilities({ reconstruction_available: false }),
     });
     expect(screen.queryByTestId("execute-rem_abc123abc123")).toBeNull();
   });
@@ -496,21 +513,18 @@ describe("generation availability", () => {
     stubBackend({
       "/execute": () =>
         jsonResponse(
-          { detail: "Automated image generation is not available." },
+          { detail: "Building corrected videos is not enabled." },
           503
         ),
     });
-    renderPanel({
-      record: remediation("approved"),
-      caps: capabilities({ generation_available: true }),
-    });
+    renderPanel({ record: remediation("asset_ready", { has_asset: true }) });
 
     fireEvent.click(screen.getByTestId("execute-rem_abc123abc123"));
     await waitFor(() =>
-      expect(screen.getByRole("alert").textContent).toMatch(/not available/i)
+      expect(screen.getByRole("alert").textContent).toMatch(/not enabled/i)
     );
-    // The record is still shown as approved, not failed.
-    expect(screen.getByText("Approved, not generated")).toBeTruthy();
+    // The record is unchanged - nothing was attempted, so nothing failed.
+    expect(screen.getByText("Image ready, video unchanged")).toBeTruthy();
   });
 });
 
@@ -522,6 +536,10 @@ describe("the panel never claims a video was corrected", () => {
   const states: RemediationState[] = [
     "proposed",
     "approved",
+    "asset_ready",
+    "reconstructing",
+    "applied",
+    "verifying",
     "rejected",
     "cancelled",
     "superseded",
@@ -539,13 +557,13 @@ describe("the panel never claims a video was corrected", () => {
     expect(text).not.toContain("fixed");
   });
 
-  it("does not describe an approved proposal as generated or applied", () => {
+  it("names what an approved proposal is still waiting for", () => {
     stubBackend();
     const { container } = renderPanel({ record: remediation("approved") });
     const text = (container.textContent ?? "").toLowerCase();
 
-    expect(screen.getByText("Approved, not generated")).toBeTruthy();
-    expect(screen.getByText("Video unchanged")).toBeTruthy();
+    expect(screen.getByText(/awaiting a replacement image/i)).toBeTruthy();
+    expect(screen.getByText("Original unchanged")).toBeTruthy();
     expect(text).not.toContain("video updated");
   });
 
@@ -558,31 +576,43 @@ describe("the panel never claims a video was corrected", () => {
         asset_content_type: "image/png",
       }),
     });
-    expect(screen.getByText("Asset ready, video unchanged")).toBeTruthy();
-    expect(screen.getByText("Video unchanged")).toBeTruthy();
+    expect(screen.getByText("Image ready, video unchanged")).toBeTruthy();
+    expect(screen.getByText("Original unchanged")).toBeTruthy();
   });
 
-  it("does not treat an applied asset as compliant", () => {
+  it("does not treat a built video as checked or compliant", () => {
     stubBackend();
     const { container } = renderPanel({
-      record: remediation("applied", { source_video_modified: true }),
+      record: remediation("applied", {
+        source_video_modified: true,
+        has_output: true,
+        output_video_id: "vid_0000beef",
+      }),
     });
-    expect(screen.getByText("Applied, not verified")).toBeTruthy();
-    expect((container.textContent ?? "").toLowerCase()).not.toContain(
-      "compliant"
-    );
+    expect(screen.getByText("New video built, not yet checked")).toBeTruthy();
+    const text = (container.textContent ?? "").toLowerCase();
+    expect(text).not.toContain("compliant");
+    expect(text).not.toContain("corrected video is");
+    // The reassurance about the original survives into this state.
+    expect(screen.getByText("Original unchanged")).toBeTruthy();
   });
 
-  it("does not report a failed verification as clean", () => {
+  it("does not report a failed check as clean", () => {
     stubBackend();
     const { container } = renderPanel({
       record: remediation("verification_failed", {
         is_terminal: true,
         source_video_modified: true,
-        error_summary: "The re-analysis still reported this finding.",
+        verification: {
+          outcome: "verification_failed",
+          target_resolved: false,
+          policy_passed: false,
+          reason: "The targeted competitor_logo is still detected.",
+          other_findings: [],
+        },
       }),
     });
-    expect(screen.getByText("Re-analysis did not confirm")).toBeTruthy();
+    expect(screen.getByText("Checked: the finding is still there")).toBeTruthy();
     const text = (container.textContent ?? "").toLowerCase();
     expect(text).not.toContain("compliant");
     expect(text).not.toContain("no violations");
@@ -596,8 +626,15 @@ describe("the panel never claims a video was corrected", () => {
       record: remediation("verified", {
         is_terminal: true,
         is_compliance_claim: false,
+        verification: {
+          outcome: "verified",
+          target_resolved: true,
+          policy_passed: true,
+          reason: "x",
+          other_findings: [],
+        },
       }),
     });
-    expect(screen.getByText("Video unchanged")).toBeTruthy();
+    expect(screen.getByText("Not a compliance sign-off")).toBeTruthy();
   });
 });

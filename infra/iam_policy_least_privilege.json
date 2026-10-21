@@ -42,7 +42,6 @@
     "",
     "Remove this _README key before applying; it is documentation, not policy."
   ],
-
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -60,7 +59,6 @@
         }
       }
     },
-
     {
       "Sid": "BedrockInvokeNovaProOnly",
       "_comment": [
@@ -81,7 +79,6 @@
         "arn:aws:bedrock:${AWS_REGION}::foundation-model/amazon.nova-pro-v1:0"
       ]
     },
-
     {
       "Sid": "S3FrameAndReelObjects",
       "_comment": [
@@ -90,6 +87,15 @@
         "download_file - video_stitcher.py (GetObject under the hood)",
         "generate_presigned_url for put_object - projects.py raw/ uploads",
         "put_object/get_object on sources/ - source_store.py (Phase 4.1)",
+        "put_object/get_object on remediation-assets/ - remediation_assets.py",
+        "  stores the replacement image an owner supplied, and reads it back",
+        "  for the FFmpeg pass (Phase 9)",
+        "put_object on remediated/ - remediation_executor.py writes the output",
+        "  video; get_object on it because the output is a first-class video",
+        "  record that the pipeline analyses and the playback route serves",
+        "  (Phase 9). NOTHING grants write access that could reach an existing",
+        "  sources/ object under a different video's id: every key is built",
+        "  from a server-minted id in aws_resources.py.",
         "Scoped to the three prefixes in use so the role cannot touch anything",
         "else in the bucket. The prefixes are defined in",
         "backend/aws_resources.py MANAGED_PREFIXES; adding one there means",
@@ -103,12 +109,13 @@
       "Resource": [
         "arn:aws:s3:::${S3_BUCKET_NAME}/sources/*",
         "arn:aws:s3:::${S3_BUCKET_NAME}/frames/*",
-        "arn:aws:s3:::${S3_BUCKET_NAME}/raw/*"
+        "arn:aws:s3:::${S3_BUCKET_NAME}/raw/*",
+        "arn:aws:s3:::${S3_BUCKET_NAME}/remediation-assets/*",
+        "arn:aws:s3:::${S3_BUCKET_NAME}/remediated/*"
       ]
     },
-
     {
-      "Sid": "S3DeleteOrphanedSourcesOnly",
+      "Sid": "S3DeleteOrphanedUploadsAndOutputs",
       "_comment": [
         "delete_object - source_store.delete_source, called only when the",
         "ownership write fails after the upload succeeded. Without it that",
@@ -116,13 +123,25 @@
         "billed for.",
         "Deliberately a separate statement scoped to sources/* so the role can",
         "never delete an extracted frame or an agent reel. Expiring those is a",
-        "bucket lifecycle rule, not an application action."
+        "bucket lifecycle rule, not an application action.",
+        "Phase 9 added the two remediation prefixes, for COMPENSATING",
+        "CLEANUP ONLY: an object written before its database record fails",
+        "to be written is an orphan that no route can reach and nobody can",
+        "be billed for sensibly. remediation_assets.delete_asset and",
+        "remediation_executor._delete_object are the only callers, and",
+        "both run on a failure path.",
+        "NOT granted for frames/ or raw/: no code path deletes either, and",
+        "expiring them is a bucket lifecycle rule.",
+        "A RETAINED user output is never deleted by the application."
       ],
       "Effect": "Allow",
       "Action": "s3:DeleteObject",
-      "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/sources/*"
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET_NAME}/sources/*",
+        "arn:aws:s3:::${S3_BUCKET_NAME}/remediation-assets/*",
+        "arn:aws:s3:::${S3_BUCKET_NAME}/remediated/*"
+      ]
     },
-
     {
       "Sid": "S3ListOnlyUsedPrefixes",
       "_comment": [
@@ -142,7 +161,6 @@
         }
       }
     },
-
     {
       "Sid": "DynamoDbFramesTable",
       "_comment": [
@@ -169,7 +187,6 @@
         "arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${DYNAMODB_FRAMES_TABLE}"
       ]
     },
-
     {
       "Sid": "DynamoDbProjectsTable",
       "_comment": [
@@ -188,7 +205,6 @@
         "arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${DYNAMODB_PROJECTS_TABLE}"
       ]
     },
-
     {
       "Sid": "CloudWatchLogs",
       "_comment": "Scoped to this application's log group rather than logs:*:*:*.",
@@ -202,7 +218,6 @@
       ]
     }
   ],
-
   "_NOT_GRANTED": {
     "_comment": [
       "Deliberately withheld. Add only when the corresponding feature is",
@@ -218,7 +233,6 @@
     "dynamodb:CreateTable": "Table provisioning is an operator action; see docs/SECURITY_OPERATIONS.md.",
     "logs:CreateLogGroup": "Create the log group once, out of band, so the running role cannot create arbitrary groups."
   },
-
   "_ROLE_SEPARATION_API_VS_WORKER": {
     "_comment": [
       "Phase 6 split execution into two processes: the API accepts and queues",
@@ -233,7 +247,6 @@
       "",
       "Both roles keep DenyUnencryptedTransport and CloudWatchLogs."
     ],
-
     "ApiRole": {
       "_comment": [
         "The API reads results and serves media. It never analyses a frame,",
@@ -267,7 +280,6 @@
         "the statement split, not a new permission."
       ]
     },
-
     "WorkerRole": {
       "_comment": [
         "The worker extracts frames and analyses them. It is not reachable",
@@ -294,7 +306,6 @@
         "DynamoDbProjectsTable - the worker never touches projects."
       ]
     },
-
     "_NO_NEW_RESOURCES": [
       "The Phase 6 worker introduced NO new AWS resource and therefore no new",
       "permission: the job queue is the existing MongoDB `videos` collection,",
@@ -303,13 +314,11 @@
       "sqs:* (ReceiveMessage/DeleteMessage/ChangeMessageVisibility on one",
       "queue ARN, plus SendMessage for the API) would be added here."
     ],
-
     "_NOT_VERIFIED": [
       "No role was created, attached, or tested against AWS. These are",
       "annotations on a template."
     ]
   },
-
   "_BUCKET_HARDENING_NOT_EXPRESSIBLE_HERE": {
     "_comment": [
       "These are bucket and account settings, not identity-policy statements.",

@@ -267,7 +267,7 @@ describe("remediation on a completed audit", () => {
     render(<ProjectDetailView submission={SUBMISSION} onBack={() => {}} />);
 
     await waitFor(() =>
-      expect(screen.getByText("Approved, not generated")).toBeTruthy()
+      expect(screen.getByText(/awaiting a replacement image/i)).toBeTruthy()
     );
     expect(screen.queryByTestId("propose-3-0")).toBeNull();
     expect(stub.calls.filter((c) => c.startsWith("POST"))).toHaveLength(0);
@@ -285,7 +285,7 @@ describe("remediation on a completed audit", () => {
     fireEvent.click(screen.getByTestId("approve-rem_abc123abc123"));
 
     await waitFor(() =>
-      expect(screen.getByText("Approved, not generated")).toBeTruthy()
+      expect(screen.getByText(/awaiting a replacement image/i)).toBeTruthy()
     );
     const text = (container.textContent ?? "").toLowerCase();
     expect(text).not.toContain("corrected");
@@ -409,20 +409,19 @@ describe("remediation on a completed audit", () => {
     );
     fireEvent.click(screen.getByTestId("approve-rem_abc123abc123"));
     await waitFor(() =>
-      expect(screen.getByText("Approved, not generated")).toBeTruthy()
+      expect(screen.getByText(/awaiting a replacement image/i)).toBeTruthy()
     );
 
     const text = (container.textContent ?? "").toLowerCase();
     for (const forbidden of [
       "audit passed",
       "compliant",
-      "corrected",
       "video updated",
       "no violations found",
     ]) {
       expect(text).not.toContain(forbidden);
     }
     // And the honest statement is present.
-    expect(screen.getByText("Video unchanged")).toBeTruthy();
+    expect(screen.getByText("Original unchanged")).toBeTruthy();
   });
 });

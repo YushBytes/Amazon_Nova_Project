@@ -281,9 +281,97 @@ class Worker:
             if self._run_job(video_id):
                 return True
 
+        # No video job was claimable. Phase 9: the same process also drains
+        # the remediation queue, so a deployment still runs exactly two
+        # processes (API + worker) and there is no second queueing platform.
+        # Video jobs are tried first deliberately: an analysis a user is
+        # waiting on outranks a reconstruction they have just requested.
+        if self._run_remediation():
+            return True
+
         # Every candidate was taken by another worker between the read and the
         # claim. Not an error - that is the race resolving correctly.
         return False
+
+    def _run_remediation(self) -> bool:
+        """Claim and run at most one remediation reconstruction.
+
+        Returns True if one was executed, so the caller polls again
+        immediately rather than sleeping.
+
+        The queue is the `remediations` collection itself, polled with the
+        same conditional-claim-under-a-lease mechanism `video_repo` uses - not
+        a new queue service. A record is claimable only when it is
+        `asset_ready`, its owner has explicitly requested execution, its
+        backoff has elapsed, and its attempts are not exhausted.
+        """
+        import anyio
+        import remediation_repo
+
+        if self.stopping:
+            return False
+
+        try:
+            candidates = anyio.run(remediation_repo.find_claimable, 5)
+        except Exception:
+            logger.exception("Could not read the remediation queue")
+            return False
+
+        if not candidates:
+            return False
+
+        for record in candidates:
+            if self.stopping:
+                return False
+            remediation_id = record.get("remediation_id")
+            owner = record.get("owner")
+            if not remediation_id or not owner:
+                continue
+            if self._execute_remediation(remediation_id, owner):
+                return True
+        return False
+
+    def _execute_remediation(self, remediation_id: str, owner: str) -> bool:
+        """Execute one remediation. Returns False if it could not be claimed."""
+        import anyio
+        import remediation_executor
+        import remediation_repo
+
+        started = time.monotonic()
+        try:
+            record = anyio.run(
+                remediation_executor.execute, remediation_id, owner
+            )
+        except remediation_repo.RemediationConflict:
+            # Another worker won the claim between our read and our write.
+            # That is the race resolving correctly, not an error.
+            logger.debug(
+                "Remediation %s was claimed by another worker", remediation_id
+            )
+            return False
+        except remediation_repo.ClaimLost:
+            # A sweep reclaimed it mid-run. The fencing token did its job and
+            # this attempt has correctly written nothing further.
+            logger.warning(
+                "Remediation %s was reclaimed mid-execution", remediation_id
+            )
+            return True
+        except Exception:
+            # `execute` records its own terminal failure; a breach of that must
+            # not kill the loop.
+            logger.exception(
+                "Remediation %s raised out of execute", remediation_id
+            )
+            return True
+
+        elapsed = time.monotonic() - started
+        logger.info(
+            "Remediation %s finished in %.1fs with state=%s",
+            remediation_id,
+            elapsed,
+            (record or {}).get("state"),
+        )
+        return True
 
     def _run_job(self, video_id: str) -> bool:
         """Run one job. Returns False if it could not be claimed."""
@@ -328,6 +416,8 @@ class Worker:
         """
         if not self.recovery_seconds:
             return
+        # The remediation sweeps run on the same interval; see
+        # `_recover_remediations`, called at the end of this method.
         now = time.monotonic()
         if self._last_recovery_at and now - self._last_recovery_at < self.recovery_seconds:
             return
@@ -342,9 +432,80 @@ class Worker:
             # Never fatal: the jobs stay visibly non-terminal and the next
             # sweep tries again.
             logger.exception("Recovery sweep failed")
-            return
-        if counts.get("requeued") or counts.get("failed"):
-            logger.info("Recovery sweep requeued jobs: %s", counts)
+        else:
+            if counts.get("requeued") or counts.get("failed"):
+                logger.info("Recovery sweep requeued jobs: %s", counts)
+
+        # Phase 9. Three remediation sweeps on the same interval, each
+        # independent so one failing does not stop the others.
+        self._recover_remediations()
+
+    def _recover_remediations(self) -> None:
+        """Heal the three states a crash can strand a remediation in.
+
+        1. RECONSTRUCTING with a lapsed lease - a worker died mid-run. Returned
+           to ASSET_READY for a fresh attempt, conditional on the DEAD worker's
+           claim id so a live-but-slow worker is never robbed of its work.
+        2. APPLIED with no analysis queued - the crash landed between building
+           the output and submitting it. `resume_applied` finishes it.
+        3. VERIFYING whose output analysis has since finished - the verdict is
+           recorded here rather than only when a client asks, so a correction
+           does not sit unverified because nobody opened the page.
+
+        Nothing here decides a verdict itself: (3) calls
+        `verification.advance`, which reads the output's persisted analysis.
+        """
+        import anyio
+        import remediation_executor
+        import remediation_repo
+        import verification
+
+        try:
+            abandoned = anyio.run(remediation_repo.find_expired_execution_leases)
+            reclaimed = 0
+            for record in abandoned:
+                if anyio.run(remediation_repo.reclaim, record) is not None:
+                    reclaimed += 1
+            if reclaimed:
+                logger.info(
+                    "Reclaimed %d abandoned reconstruction(s)", reclaimed
+                )
+        except Exception:
+            logger.exception("Remediation reclaim sweep failed")
+
+        try:
+            resumed = anyio.run(remediation_executor.resume_applied)
+            if resumed:
+                logger.info(
+                    "Resumed %d remediation(s) stranded after reconstruction",
+                    resumed,
+                )
+        except Exception:
+            logger.exception("Remediation resume sweep failed")
+
+        try:
+            pending = anyio.run(remediation_repo.find_awaiting_verification)
+            advanced = 0
+            for record in pending:
+                remediation_id = record.get("remediation_id")
+                owner = record.get("owner")
+                if not remediation_id or not owner:
+                    continue
+                try:
+                    updated = anyio.run(
+                        verification.advance, remediation_id, owner
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not advance verification for %s", remediation_id
+                    )
+                    continue
+                if (updated or {}).get("state") != record.get("state"):
+                    advanced += 1
+            if advanced:
+                logger.info("Recorded %d verification verdict(s)", advanced)
+        except Exception:
+            logger.exception("Verification sweep failed")
 
 
 # ---------------------------------------------------------------------------

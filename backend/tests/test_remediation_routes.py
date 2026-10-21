@@ -37,6 +37,11 @@ from remediation_state import RemediationState, UNREACHABLE_IN_THIS_BUILD
 VIDEO_ID = "vid_abcd1234"
 OTHER_VIDEO_ID = "vid_ffff0000"
 
+# A minimal byte string with a real PNG magic number, long enough to pass the
+# MIN_IMAGE_BYTES floor. The pixels are not meaningful - nothing in the
+# backend decodes the image, it is handed to FFmpeg, which is mocked here.
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 256
+
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -174,22 +179,51 @@ def test_every_route_rejects_a_media_token(client, method, path, body):
 # capabilities: the UI is told the truth
 # ---------------------------------------------------------------------------
 
-def test_capabilities_reports_no_generation_and_no_verification(
+def test_capabilities_reports_no_generation_but_a_supplied_asset_path(
     client, fake_db, alice
 ):
+    """Phase 9 changed two of these deliberately.
+
+    Phase 8 reported `applies_assets_to_video` and `verifies_compliance` as
+    hardcoded false, which was correct then. Phase 9 implements both through
+    the supplied-asset path, so they are now read from configuration - and
+    GENERATION is still unavailable, which is the part that has not changed.
+    """
     response = client.get("/remediations/capabilities", headers=alice)
     assert response.status_code == 200
     body = response.json()
 
     assert body["proposals_supported"] is True
+    # Unchanged: no image provider ships.
     assert body["generation_available"] is False
     assert body["generation_provider"] == "none"
     assert body["generation_unavailable_reason"]
-    # The two claims this build cannot make.
+    # New in Phase 9: the owner can supply the image a provider would have
+    # generated, and the output is then really built and really analysed.
+    assert body["asset_upload_supported"] is True
+    assert body["max_asset_bytes"] > 0
+    assert body["accepted_asset_types"] == ["image/png", "image/jpeg"]
+    assert body["applies_assets_to_video"] is True
+    assert body["verifies_compliance"] is True
+    assert body["reconstruction_available"] is True
+    # Named plainly so nothing reads more into it than a scaled overlay.
+    assert body["reconstruction_method"] == "scaled_overlay"
+    assert body["verification_policy"] == "target_only"
+    assert body["min_confidence"] == pytest.approx(0.8)
+    assert "never modified" in body["notes"]
+
+
+def test_capabilities_reports_reconstruction_off_when_disabled(
+    client, fake_db, alice, monkeypatch
+):
+    """A deployment without FFmpeg should say so rather than fail every run."""
+    monkeypatch.setenv("RECONSTRUCTION_ENABLED", "false")
+    body = client.get("/remediations/capabilities", headers=alice).json()
+
+    assert body["reconstruction_available"] is False
     assert body["applies_assets_to_video"] is False
     assert body["verifies_compliance"] is False
-    assert body["min_confidence"] == pytest.approx(0.8)
-    assert "changes no video" in body["notes"]
+    assert "not enabled" in body["reconstruction_unavailable_reason"]
 
 
 def test_capabilities_names_the_configured_but_unimplemented_provider(
@@ -639,15 +673,25 @@ def test_approval_is_refused_when_the_finding_vanished(client, fake_db, alice):
     assert after["state"] == "superseded"
 
 
-def test_a_superseded_proposal_cannot_be_executed(client, fake_db, alice):
+def test_a_superseded_proposal_cannot_have_an_asset_attached(
+    client, fake_db, alice
+):
+    """Attaching an asset is consequential, so it checks staleness too.
+
+    Phase 9 moved this check onto the asset route as well as execution: an
+    asset is what makes a record claimable by a worker, so a stale proposal
+    must not be able to acquire one.
+    """
     seed_video(fake_db)
     created = create_proposal(client, alice).json()
     _approve(client, alice, created["remediation_id"])
 
-    changed = frame_row(detections=[detection(confidence=Decimal("0.10"))])
+    changed = frame_row(detections=[detection(category="something_else")])
     with patch("aws_clients.get_resource", return_value=dynamo_with(changed)):
         response = client.post(
-            f"/remediations/{created['remediation_id']}/execute", headers=alice
+            f"/remediations/{created['remediation_id']}/asset",
+            files={"file": ("logo.png", PNG_BYTES, "image/png")},
+            headers=alice,
         )
 
     assert response.status_code == 409
@@ -655,6 +699,7 @@ def test_a_superseded_proposal_cannot_be_executed(client, fake_db, alice):
         f"/remediations/{created['remediation_id']}", headers=alice
     ).json()
     assert after["state"] == "superseded"
+    assert after["has_asset"] is False
 
 
 def test_an_unchanged_finding_does_not_supersede(client, fake_db, alice):
@@ -683,6 +728,12 @@ def test_an_unapproved_proposal_cannot_be_executed(client, fake_db, alice):
     )
     assert response.status_code == 409
     assert "approved" in response.json()["detail"]
+    # And nothing was built or recorded.
+    after = client.get(
+        f"/remediations/{created['remediation_id']}", headers=alice
+    ).json()
+    assert after["state"] == "proposed"
+    assert after["has_output"] is False
 
 
 def test_execution_reports_the_provider_as_unavailable(client, fake_db, alice):
@@ -696,7 +747,10 @@ def test_execution_reports_the_provider_as_unavailable(client, fake_db, alice):
         )
 
     assert response.status_code == 503
-    assert "not configured" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert "not configured" in detail
+    # Phase 9: the refusal now names the supported alternative.
+    assert "replacement image" in detail
 
 
 def test_a_refused_execution_leaves_the_record_approved(client, fake_db, alice):

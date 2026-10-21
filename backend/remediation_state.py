@@ -23,6 +23,10 @@ be inferred from one another:
   PROCESSING          A provider call is in flight. It may fail.
   ASSET_READY         A validated asset exists in storage. The source video is
                       UNCHANGED - this is a candidate, not a correction.
+  RECONSTRUCTING      A worker holds this remediation and is building an
+                      output video. Phase 9. Carries the claim and lease, so
+                      this is the state a crashed worker leaves behind and the
+                      one the recovery sweep reclaims.
   APPLIED             The asset was incorporated into an output video. The
                       result's compliance is UNKNOWN.
   VERIFYING           A fresh analysis of that output is running.
@@ -85,6 +89,7 @@ class RemediationState(str, Enum):
     APPROVED = "approved"
     PROCESSING = "processing"
     ASSET_READY = "asset_ready"
+    RECONSTRUCTING = "reconstructing"
     APPLIED = "applied"
     VERIFYING = "verifying"
     VERIFIED = "verified"
@@ -127,33 +132,44 @@ _TERMINAL: frozenset[RemediationState] = frozenset(
 )
 
 _ACTIVE: frozenset[RemediationState] = frozenset(
-    {RemediationState.PROCESSING, RemediationState.VERIFYING}
+    {
+        RemediationState.PROCESSING,
+        RemediationState.RECONSTRUCTING,
+        RemediationState.VERIFYING,
+    }
 )
 
 # States that no code path in this build can produce. Enforced by a test, so
 # that adding a provider or a reconstruction stage also means deliberately
 # removing the name from here.
+# Phase 9 made the whole chain reachable through the SUPPLIED-ASSET path, so
+# only the provider state is left: PROCESSING means "a provider call is in
+# flight", and `image_provider` still ships no provider that can make one.
 UNREACHABLE_IN_THIS_BUILD: frozenset[RemediationState] = frozenset(
-    {
-        RemediationState.PROCESSING,
-        RemediationState.ASSET_READY,
-        RemediationState.APPLIED,
-        RemediationState.VERIFYING,
-        RemediationState.VERIFIED,
-        RemediationState.VERIFICATION_FAILED,
-        RemediationState.FAILED,
-    }
+    {RemediationState.PROCESSING}
 )
 
 # What this build CAN reach, named explicitly so the two sets must stay
 # complementary - a test asserts they partition the enum.
+#
+# Reaching VERIFIED still requires a completed analysis OF THE OUTPUT VIDEO
+# whose persisted results support the claim. Being reachable is not a claim
+# that it is easy to reach, and `verification.py` is the only thing that may
+# take that transition.
 REACHABLE_IN_THIS_BUILD: frozenset[RemediationState] = frozenset(
     {
         RemediationState.PROPOSED,
         RemediationState.APPROVED,
+        RemediationState.ASSET_READY,
+        RemediationState.RECONSTRUCTING,
+        RemediationState.APPLIED,
+        RemediationState.VERIFYING,
+        RemediationState.VERIFIED,
+        RemediationState.VERIFICATION_FAILED,
         RemediationState.REJECTED,
         RemediationState.CANCELLED,
         RemediationState.SUPERSEDED,
+        RemediationState.FAILED,
     }
 )
 
@@ -176,6 +192,12 @@ _ALLOWED: dict[RemediationState, frozenset[RemediationState]] = {
     RemediationState.APPROVED: frozenset(
         {
             RemediationState.PROCESSING,
+            # Phase 9. An asset supplied directly by the owner skips
+            # PROCESSING: that state means "a provider call is in flight", and
+            # there is no call. The asset is still validated, content-sniffed
+            # and stored before this transition is taken, so ASSET_READY keeps
+            # its meaning - a validated asset exists.
+            RemediationState.ASSET_READY,
             RemediationState.CANCELLED,
             RemediationState.SUPERSEDED,
             # An approved proposal can fail before a provider is reached -
@@ -191,7 +213,38 @@ _ALLOWED: dict[RemediationState, frozenset[RemediationState]] = {
         }
     ),
     RemediationState.ASSET_READY: frozenset(
-        {RemediationState.APPLIED, RemediationState.FAILED}
+        {
+            # Phase 9: reconstruction is claimed by a worker, so it gets its
+            # own state. APPLIED is no longer reachable directly from here -
+            # an output video cannot appear without a run that built it.
+            RemediationState.RECONSTRUCTING,
+            # The owner can still withdraw before anything is built. The
+            # stored asset is retained rather than deleted, so the record of
+            # what was supplied stays auditable.
+            RemediationState.CANCELLED,
+            # Phase 9. Phase 8 forbade this, reasoning that "losing track of a
+            # stored object would orphan it". That reasoning was about an
+            # OUTPUT video; it does not apply to an asset, because
+            # `mark_superseded` leaves `asset_key` on the record, so the
+            # object stays named and auditable. Allowing it matters: without
+            # it, a record whose finding changed after an asset was attached
+            # would keep reporting "ready" while every execution attempt was
+            # refused - the state would be a lie about why nothing happens.
+            RemediationState.SUPERSEDED,
+            RemediationState.FAILED,
+        }
+    ),
+    RemediationState.RECONSTRUCTING: frozenset(
+        {
+            RemediationState.APPLIED,
+            RemediationState.FAILED,
+            # Crash recovery only: a worker that died leaves the record here,
+            # and the sweep must be able to return it to the queue. Not a path
+            # a request can take - `remediation_repo.reclaim` makes the write
+            # conditional on the dead worker's claim id, exactly as
+            # `video_repo.reclaim` does.
+            RemediationState.ASSET_READY,
+        }
     ),
     RemediationState.APPLIED: frozenset(
         {RemediationState.VERIFYING, RemediationState.FAILED}
@@ -276,7 +329,8 @@ STAGE_LABELS: dict[RemediationState, str] = {
     RemediationState.PROPOSED: "Proposed; awaiting your review",
     RemediationState.APPROVED: "Approved; no asset generated yet",
     RemediationState.PROCESSING: "Generating a candidate asset",
-    RemediationState.ASSET_READY: "Candidate asset generated; video unchanged",
+    RemediationState.ASSET_READY: "Replacement asset ready; video unchanged",
+    RemediationState.RECONSTRUCTING: "Building an output video; original unchanged",
     RemediationState.APPLIED: "Asset applied to an output video; not yet re-analysed",
     RemediationState.VERIFYING: "Re-analysing the output video",
     RemediationState.VERIFIED: "Re-analysis completed and found no violation here",

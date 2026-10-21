@@ -226,6 +226,25 @@ Resources:
             Prefix: raw/
             ExpirationInDays: !Ref SourceRetentionDays
 
+          # Phase 9. A replacement image is small and is only ever read during
+          # the FFmpeg pass that consumes it, but it is also the AUDIT RECORD
+          # of what an owner supplied for an approved correction - so it is
+          # kept as long as a source video rather than expired aggressively.
+          - Id: ExpireRemediationAssets
+            Status: Enabled
+            Prefix: remediation-assets/
+            ExpirationInDays: !Ref SourceRetentionDays
+
+          # Phase 9. A reconstructed output is a video the user owns and may
+          # be relying on, so it expires on the same schedule as an upload and
+          # NEVER sooner. Nothing in the application deletes a retained
+          # output; only this rule does, and only on the same terms as the
+          # original it was built from.
+          - Id: ExpireRemediatedOutputs
+            Status: Enabled
+            Prefix: remediated/
+            ExpirationInDays: !Ref SourceRetentionDays
+
           - Id: ExpireOldVersions
             Status: Enabled
             NoncurrentVersionExpiration:

@@ -28,10 +28,16 @@ OBJECT PREFIX LAYOUT
     sources/{video_id}/source.{ext}            uploaded source video (4.1)
     frames/{video_id}/frame_{n:04d}.jpg        extracted frames
     raw/{project_id}/{agent}/reel.mp4          agent reel upload (projects.py)
+    remediation-assets/{rem_id}/asset.{ext}    replacement image (Phase 9)
+    remediated/{out_video_id}/output.{ext}     reconstructed video (Phase 9)
 
 Prefixes are part of the contract: the IAM policy and the bucket lifecycle
-rules in infra/ are written against exactly these three, so adding a fourth
+rules in infra/ are written against exactly these five, so adding a sixth
 means updating both.
+
+NOTHING WRITES TO A KEY IT DID NOT GENERATE. Every function below builds its
+key from a server-minted id, so a reconstruction cannot land on the source
+object it was built from: the output has its own video id and its own prefix.
 """
 
 from __future__ import annotations
@@ -71,9 +77,28 @@ FRAME_PREFIX = "frames"
 # rather than a guess.
 RAW_PREFIX = "raw"
 
+# Phase 9. Two new prefixes, kept separate from each other and from the
+# originals:
+#
+#   remediation-assets/  the replacement image an owner supplied (or, one day,
+#                        a provider generated) for one approved remediation.
+#   remediated/          an output video built from a source video plus such
+#                        an asset. A SEPARATE object with its own video id;
+#                        nothing here ever writes to `sources/`, so an
+#                        original upload cannot be overwritten by a
+#                        reconstruction.
+REMEDIATION_ASSET_PREFIX = "remediation-assets"
+REMEDIATED_PREFIX = "remediated"
+
 # Every prefix the application writes. infra/ and the IAM policy enumerate
 # these; a new one must be added here and there together.
-MANAGED_PREFIXES = (SOURCE_PREFIX, FRAME_PREFIX, RAW_PREFIX)
+MANAGED_PREFIXES = (
+    SOURCE_PREFIX,
+    FRAME_PREFIX,
+    RAW_PREFIX,
+    REMEDIATION_ASSET_PREFIX,
+    REMEDIATED_PREFIX,
+)
 
 
 def media_bucket() -> str:
@@ -116,6 +141,28 @@ def raw_reel_key(project_id: str, agent_id: str) -> str:
     return f"{RAW_PREFIX}/{project_id}/{agent_id}/reel.mp4"
 
 
+def remediation_asset_key(remediation_id: str, extension: str) -> str:
+    """Object key for one remediation's replacement asset (Phase 9).
+
+    Fully server-generated. `remediation_id` is a server-minted
+    "rem_" + 12 hex, and `extension` is derived from the SNIFFED bytes by
+    `remediation_assets`, never from a client filename or content type.
+    """
+    return f"{REMEDIATION_ASSET_PREFIX}/{remediation_id}/asset.{extension}"
+
+
+def remediated_video_key(output_video_id: str, extension: str) -> str:
+    """Object key for a reconstructed output video (Phase 9).
+
+    Keyed by the OUTPUT video's own id, not the source's. The output is a
+    first-class video record with its own id and its own analysis job, which
+    is what lets the existing pipeline analyse it with no special case - and
+    what guarantees the key can never collide with the source object it was
+    built from.
+    """
+    return f"{REMEDIATED_PREFIX}/{output_video_id}/output.{extension}"
+
+
 # --- DynamoDB --------------------------------------------------------------
 
 DEFAULT_FRAMES_TABLE = "NovaFlowFrames"
@@ -138,6 +185,10 @@ def projects_table_name() -> str:
 
 
 __all__ = (
+    "REMEDIATED_PREFIX",
+    "REMEDIATION_ASSET_PREFIX",
+    "remediated_video_key",
+    "remediation_asset_key",
     "DEFAULT_BUCKET",
     "DEFAULT_FRAMES_TABLE",
     "DEFAULT_PROJECTS_TABLE",
