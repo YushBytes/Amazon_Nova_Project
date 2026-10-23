@@ -482,23 +482,26 @@ external service mocked. ☐ = needs live infrastructure or an operator action.
 
 ## 4. Tests and CI
 
-| # | Item | Phase | Evidence |
-| :-- | :-- | :-- | :-- |
-| 4.1 | ☐ A test suite exists *(currently **zero tests** — audit §8.2)* | 2 | |
-| 4.2 | ☐ Backend unit tests pass; output quoted | 2+ | |
-| 4.3 | ☐ Frontend component tests pass; output quoted | 7 | |
-| 4.4 | ☐ Integration tests cover the full pipeline with AWS stubbed | 10 | |
-| 4.5 | ☐ At least one end-to-end test: login → upload → analyze → review | 10 | |
-| 4.6 | ☐ Regression test for each critical defect in audit §9.1-9.4 | 2, 8, 9 | |
-| 4.7 | ☐ No test calls real AWS or incurs cost; credential-dependent tests are skipped by default and documented | 10 | |
-| 4.8 | ☐ Coverage meets the agreed target | 10 | |
-| 4.9 | ☐ `pytest` green on a clean checkout | 10 | |
-| 4.10 | ☐ `npm run lint` green, with a real target *(currently `"eslint"` with no path)* | 7 | |
-| 4.11 | ☐ `npx tsc --noEmit` green; a `typecheck` script exists | 7 | |
-| 4.12 | ☐ `npm run build` green | 7 | |
-| 4.13 | ☐ CI workflow exists and gates merges *(no `.github/` today)* | 10 | |
-| 4.14 | ☐ CI runs lint, types, tests, build, secret scan, and dependency audit | 10 | |
-| 4.15 | ☐ CI green on the release commit | 10 | |
+Assessed 2026-10-23 (Phase 10). Every PASS names the command that
+establishes it. A measured number is not a PASS on its own.
+
+| # | Item | Phase | Status | Evidence |
+| :-- | :-- | :-- | :-- | :-- |
+| 4.1 | A test suite exists | 2 | **PASS** | 1212 backend + 391 Vitest + 52 Playwright = 1655 tests. Started this roadmap at zero. |
+| 4.2 | Backend unit tests pass; output quoted | 2+ | **PASS** | `pytest backend/tests -q` → `1212 passed, 26 skipped in 53.10s`, exit 0. |
+| 4.3 | Frontend component tests pass; output quoted | 7 | **PASS** | `npm test` → `Test Files 18 passed / Tests 391 passed`, exit 0. |
+| 4.4 | Integration tests cover the full pipeline with AWS stubbed | 10 | **PASS** | `test_pipeline_e2e.py` plus `test_integration_ffmpeg*.py` (46 `requires_ffmpeg` tests, all passing with real FFmpeg 9.0.1). S3/DynamoDB/Bedrock are in-memory fakes. |
+| 4.5 | At least one end-to-end test: login → upload → analyze → review | 10 | **PARTIAL** | 52 Playwright tests cover login → video list → audit detail → findings → remediation review in Chromium. **Two gaps:** no backend runs (every API response is a `page.route` fixture), and the browser journey does not exercise **upload**. No live-backend E2E exists. |
+| 4.6 | Regression test for each critical defect in audit §9.1-9.4 | 2, 8, 9 | **PASS** | Phase 2 (4 defects), Phase 8 (`Decimal` box), Phase 9.1 (FFmpeg hang, fake image fixtures, real-AWS calls from the suite), Phase 10.1 (missing-`proposal` crash). Each was proven to fail without its fix. |
+| 4.7 | No test calls real AWS or incurs cost; credential-dependent tests skipped by default and documented | 10 | **PASS** | Phase 9.1 found the suite **was** calling real S3 (9 extraction tests, `InvalidAccessKeyId`, no charge and no object written) and bound the fake into every module-scope client. `test_the_fake_s3_fixture_binds_every_module_scope_client` now asserts it. The 26 MongoDB tests skip by default and are documented in the README. |
+| 4.8 | Coverage meets the agreed target | 10 | **N-A — no target agreed** | Measured, not graded: backend **90%** statements (branch coverage on; 11,827 stmts / 979 missed), frontend **96.59%** statements / **89.78%** branch. No threshold is configured, deliberately. A target is a maintainer decision. |
+| 4.9 | `pytest` green on a clean checkout | 10 | **PARTIAL** | Green in the working tree (exit 0). Not yet verified from a fresh clone; `npm ci` was validated (exit 0) but the equivalent Python check is what the first CI run will establish. |
+| 4.10 | `npm run lint` green, with a real target | 7 | **PASS** | Script is `eslint app`; exit 0, 0 errors / 0 warnings. `npx eslint e2e` also exit 0 (the script does not cover `e2e`, so CI runs it separately). |
+| 4.11 | `npx tsc --noEmit` green; a `typecheck` script exists | 7 | **PASS** | `npm run typecheck` → exit 0. |
+| 4.12 | `npm run build` green | 7 | **PASS** | exit 0; emits `/`, `/_not-found`, `/login`. Re-verified after the `next` 16.4.2 upgrade. |
+| 4.13 | CI workflow exists and gates merges | 10 | **PARTIAL** | `.github/workflows/ci.yml` and `security.yml` exist. They do **not** gate merges: no branch protection is configured, and **neither workflow has ever run** (nothing has been pushed). |
+| 4.14 | CI runs lint, types, tests, build, secret scan, and dependency audit | 10 | **PASS (configured), NOT RUN** | ci.yml: py_compile, pytest+coverage, eslint (app and e2e), tsc, Vitest, build, Playwright. security.yml: pip-audit, `npm audit --omit=dev` (build-breaking), gitleaks over full history. All validated by running the equivalent commands locally. |
+| 4.15 | CI green on the release commit | 10 | **NOT RUN** | No release commit exists, and no GitHub Actions run has occurred. **This is the single hard release blocker.** |
 
 ---
 
@@ -563,17 +566,47 @@ external service mocked. ☐ = needs live infrastructure or an operator action.
 
 ---
 
+## 7A. Historical JWT-secret exposure (assessed 2026-10-23)
+
+| # | Item | Status | Evidence |
+| :-- | :-- | :-- | :-- |
+| 7A.1 | Repository visibility established | **PASS (public)** | Authenticated API reports `private: false`; unauthenticated API **and** HTML probes both return HTTP 200. ⚠️ This **contradicts CLAUDE.md §1.2**, which states the repository is private and relies on that for its exposure claim. |
+| 7A.2 | The exposed value located | **PASS** | A 40-char literal assigned to a module-level `SECRET_KEY` in `backend/auth.py` at commits `7e1649c` and `e50ed57`, both reachable from HEAD, used directly by `jwt.encode`/`jwt.decode` in those revisions. Value is not reproduced in any report. |
+| 7A.3 | Was it a usable signing secret? | **PASS — yes, in those revisions** | It *was* the live signing key for any process running that code. Composition (dictionary words, separators, 17 distinct characters over 40) indicates a human-authored **development placeholder**, not a generated key — matching CLAUDE.md's own wording. |
+| 7A.4 | Can current runtime fall back to it? | **PASS — no, verified by execution** | `config._validate_secret` raises `ConfigurationError` for it (executed directly). `load_jwt_secret`: production **fails closed** when `JWT_SECRET_KEY` is absent; development generates `secrets.token_urlsafe(48)`. `auth.SECRET_KEY` no longer exists and a test asserts it cannot return. |
+| 7A.5 | Secrecy is not the control | **PASS** | The value is *deliberately published* in `config.KNOWN_INSECURE_SECRETS` and asserted by `test_known_insecure_secret_list_includes_the_old_value`. The security property is that it is **refused**, not that it is unknown. |
+| 7A.6 | Blocklist comparison is case-robust | **PASS (hardened)** | `_validate_secret` compares `supplied.lower()` against the set, which was correct only while every entry happened to be lower-case — an unenforced invariant. The set is now normalised by construction, with 5 regression tests proven to fail without it. |
+| 7A.7 | No secret in example or deployment config | **PASS** | No `.env` on disk. `.env.example` has `JWT_SECRET_KEY=` **empty** (rejected as empty). `backend/Dockerfile` declares no `ENV`/`ARG`. **No** workflow, compose, or template anywhere sets `JWT_SECRET_KEY`. |
+| 7A.8 | Evidence of a runtime that used it | **NOT FOUND** | No deployment definition sets the variable; nothing has ever been deployed. This bounds the risk but is an **absence of evidence**, not proof no process ever ran with it. |
+| 7A.9 | Rotation performed | **BLOCKED — owner action** | Nothing to rotate in this repository: the code reads the variable and refuses the exposed value. If any environment ever set `JWT_SECRET_KEY` to that literal, it must be replaced there. Requires provider access; **not attempted**. |
+| 7A.10 | History remediation | **ACCEPTED LIMITATION** | Rotation prevents future use; it does not erase past exposure. History is preserved by policy (no rewrite, no force-push). Repository visibility is an owner decision and was **not changed**. |
+
+---
+
 ## 8. Final release gate
 
-All must hold, each with evidence recorded above:
+All must hold, each with evidence recorded above. Assessed 2026-10-23.
 
-- [ ] Every critical and high finding in `docs/PROJECT_AUDIT.md` §9 and §10 is resolved or formally accepted as a documented limitation.
-- [ ] Every roadmap phase 0-10 is accepted.
-- [ ] CI is green on the release commit.
-- [ ] No mock, hardcoded value, or silent fallback is presented anywhere as real AI output.
-- [ ] No feature in the UI or documentation is non-functional.
-- [ ] A full manual end-to-end run has been completed, with evidence.
-- [ ] Every blocker in audit §13 is resolved.
-- [ ] A maintainer has reviewed and signed off.
+| Gate | Status | Evidence / what is missing |
+| :-- | :-- | :-- |
+| Every critical and high finding in `docs/PROJECT_AUDIT.md` §9-§10 resolved or formally accepted | **PASS** | Phases 2-9.1 resolved them, each with a regression test; the rest are accepted limitations recorded in README "Limitations" and CLAUDE.md §5. |
+| Every roadmap phase 0-10 accepted | **BLOCKED** | 0-9.1 are committed and pushed. **10.1-10.4 are complete but UNCOMMITTED and unreviewed** — acceptance is a maintainer action. |
+| CI green on the release commit | **FAIL** | No GitHub Actions run has ever executed, and there is no release commit. Hard blocker. |
+| No mock, hardcoded value, or silent fallback presented as real AI output | **PASS** | `image_provider.NullImageProvider.generate` raises rather than returning an image, and a test is named for it. ⚠️ `orchestrator.py:17` still returns `"Mock Response"` behind `POST /execute`, but **no UI control is wired to it** and Phase 7 replaced that panel with an explicit "not built" state. Pending §9 q7. |
+| No feature in the UI or documentation is non-functional | **PASS** | Phase 7 removed every fabricated panel and added tests asserting the invented strings cannot return. Three panels now state a capability does not exist. |
+| A full manual end-to-end run completed, with evidence | **FAIL** | Never performed. Nothing has run against real AWS, Bedrock, MongoDB, or a deployed worker. The pipeline's accuracy is **unmeasured**. Hard blocker. |
+| Every blocker in audit §13 resolved | **PARTIAL** | The storage/bucket and dead-pipeline blockers were resolved in Phase 5; §13's AWS-deployment items remain open because nothing has been deployed. |
+| A maintainer has reviewed and signed off | **NOT RUN** | Requires a human. |
+
+### The two hard blockers, restated plainly
+
+1. **No CI run has ever happened.** The workflows are new and unexecuted.
+2. **Nothing has ever run against real AWS, Bedrock, or MongoDB.** 1,638 local
+   tests say the code behaves correctly against fakes. They say nothing about
+   whether the deployed system works, and detection accuracy is unmeasured.
+3. **The repository is public and its history contains a former development
+   signing secret.** The current code cannot use it (§7A.4, verified), but the
+   owner must decide on visibility and rotate the variable in any environment
+   that ever set it.
 
 **Sign-off:** _____________________  **Date:** ____________

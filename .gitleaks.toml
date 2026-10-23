@@ -1,0 +1,61 @@
+# Gitleaks configuration for NovaFlow (Phase 10.2).
+#
+# Scope: this file narrows gitleaks' default ruleset so a CI run is
+# ACTIONABLE. Every entry below is a verified false positive or a path that is
+# not part of the repository. Nothing here suppresses a finding in tracked
+# application code, and no rule is disabled.
+#
+# Verified with gitleaks 8.30.1 on 2026-10-23:
+#   gitleaks git --redact   -> 15 commits, 1 finding  (the auth.py FP below)
+#   gitleaks dir --redact   -> 385 findings: 368 in .venv, 16 in .next, 1 FP
+# After this config both scans report zero.
+
+[extend]
+# Keep every default rule. This config only adds allowlists.
+useDefault = true
+
+[allowlist]
+description = "Vendored dependencies, build output, and verified false positives"
+
+paths = [
+  # Installed dependencies. Not repository content, and both are gitignored.
+  # botocore ships ~368 service-example JSON files containing placeholder
+  # values named "...Token" / "...Key", which the generic-api-key rule flags.
+  '''^\.venv/''',
+  '''(^|/)node_modules/''',
+  # Next.js build output. `.next/` is gitignored and NEVER committed, but a
+  # local `dir` scan still walks it. Next generates a RANDOM
+  # previewModeSigningKey / previewModeEncryptionKey / server encryptionKey
+  # per build - they are real generated secrets, which is exactly why the
+  # directory is gitignored rather than allowlisted for being harmless.
+  '''(^|/)\.next/''',
+  # Generated test and coverage artifacts (all gitignored).
+  '''(^|/)coverage/''',
+  '''(^|/)test-results/''',
+  '''(^|/)playwright-report/''',
+  '''(^|/)blob-report/''',
+  # Compiled Python.
+  '''(^|/)__pycache__/''',
+]
+
+# `regexes` is matched against the extracted SECRET by default; the text that
+# identifies this false positive is in the surrounding match, so target that.
+regexTarget = "match"
+
+regexes = [
+  # VERIFIED FALSE POSITIVE, backend/auth.py.
+  #
+  # The generic-api-key rule reads this as a key/value assignment:
+  #
+  #     await _upgrade_password_hash(
+  #         users_collection, user_data, body.password, was_legacy=...
+  #     )
+  #
+  # It is a function call forwarding the request's password field to the
+  # Argon2id rehash path - a parameter name, not a literal credential. There
+  # is no secret on the line.
+  #
+  # Scoped to this exact expression rather than to the file, so a real secret
+  # added to auth.py in future is still reported.
+  '''body\.password, was_legacy=''',
+]

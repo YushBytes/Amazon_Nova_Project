@@ -447,3 +447,62 @@ def test_redaction_keeps_the_token_value_out_entirely():
     out = redact_query_string(f"/uploads/vid_abcd1234.mp4?access_token={token}")
     assert token not in out
     assert "payload" not in out
+
+
+# ---------------------------------------------------------------------------
+# Retry-After must be READABLE by the browser (Phase 10 finalization)
+# ---------------------------------------------------------------------------
+#
+# Setting the header is not enough. `Retry-After` is not a CORS-safelisted
+# response header, so unless the server names it in
+# `Access-Control-Expose-Headers` the browser hides it from JavaScript. The
+# frontend has dedicated code to render it as "Please wait N seconds"
+# (app/lib/api.ts), and cross-origin - which is how this is deployed, API and
+# frontend on different origins - that code could never run: the message
+# degraded silently to "a moment".
+#
+# The jsdom tests could not catch this because they stub `fetch` directly, so
+# no CORS filtering happens. A Playwright journey in a real browser did.
+
+def test_cors_exposes_retry_after_to_the_browser():
+    """Asserted on the live middleware stack, not on a constant."""
+    import app as app_module
+    from fastapi.middleware.cors import CORSMiddleware
+
+    exposed = None
+    for middleware in app_module.app.user_middleware:
+        if middleware.cls is CORSMiddleware:
+            exposed = middleware.kwargs.get("expose_headers")
+
+    assert exposed is not None, "CORSMiddleware sets no expose_headers at all"
+    assert "Retry-After" in exposed, (
+        f"Retry-After is not exposed (expose_headers={exposed}); the browser "
+        f"will hide it and the frontend cannot show the real wait time"
+    )
+
+
+def test_a_cross_origin_throttle_response_advertises_retry_after(client, fake_db):
+    """End to end through the middleware: the 429 both sets and exposes it."""
+    allowed_origin = "http://localhost:3000"
+
+    response = None
+    for _ in range(12):
+        response = client.post(
+            LOGIN_PATH,
+            json={"username": "victim-cors", "password": GOOD_PASSWORD},
+            headers={"Origin": allowed_origin},
+        )
+        if response.status_code == 429:
+            break
+
+    assert response is not None and response.status_code == 429, (
+        "login was never throttled, so the header could not be checked"
+    )
+    # The value itself.
+    assert response.headers.get("Retry-After", "").isdigit()
+    # And the permission that makes it visible to JavaScript.
+    exposed = response.headers.get("access-control-expose-headers", "")
+    assert "Retry-After" in exposed, (
+        f"the 429 does not expose Retry-After (got {exposed!r}), so a browser "
+        f"on another origin cannot read it"
+    )

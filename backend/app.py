@@ -195,6 +195,19 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
+    # `Retry-After` is NOT a CORS-safelisted response header, so without this
+    # the browser hides it from JavaScript even though the 429 carries it.
+    # The frontend has dedicated code to turn it into "Please wait N seconds"
+    # (app/lib/api.ts reads res.headers.get("Retry-After")), and that code
+    # could never run cross-origin - which is how production is deployed, the
+    # API being on a different origin from the Amplify-hosted frontend. The
+    # message silently degraded to "a moment" instead.
+    #
+    # It leaks nothing: the value is the throttle window the client is already
+    # being told about by the 429 itself. Found by a Playwright journey; the
+    # 387 jsdom tests stub `fetch` directly, so CORS filtering never applied
+    # there and every one of them passed over a path that cannot work.
+    expose_headers=["Retry-After"],
 )
 
 UPLOAD_DIR = Path("uploads").resolve()

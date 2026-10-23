@@ -144,7 +144,7 @@ def test_successful_analysis_is_persisted_to_dynamodb(frame_jpeg_bytes):
     assert kwargs["ExpressionAttributeNames"] == {"#s": "status"}
     assert ":t" in values  # updated_at timestamp
     # Phase 4 traceability.
-    assert values[":m"] == analyzer.MODEL_ID
+    assert values[":m"] == analyzer.model_id()
     assert values[":p"] == analyzer.PIPELINE_VERSION
 
 

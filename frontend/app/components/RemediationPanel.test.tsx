@@ -6,6 +6,7 @@ import type {
   Detection,
   Remediation,
   RemediationCapabilities,
+  RemediationProposal,
   RemediationState,
 } from "../lib/api";
 
@@ -62,6 +63,24 @@ function detection(overrides: Partial<Detection> = {}): Detection {
   };
 }
 
+// Typed explicitly so a test that spreads it still satisfies
+// `RemediationProposal`. `Remediation.proposal` is optional - the backend can
+// emit null - so spreading `remediation().proposal` would widen every field to
+// `| undefined`.
+const BASE_PROPOSAL: RemediationProposal = {
+  action: "remove_region",
+  summary: "Obscure the reported competitor_logo in frame 3.",
+  rationale:
+    "The frame analysis flagged a competitor_logo on frame 3. That reflects what the model reported, not a confirmed violation of any specific rule.",
+  model_claim: "A rival mark is visible on the cup.",
+  target_description: "A region covering roughly 20%-40% across the frame.",
+  limitations:
+    "This proposal is derived only from one model's analysis of a single video frame. Approving this proposal records your decision; it does not by itself change any video.",
+  requires_approval: true,
+  confidence_gate: "pass",
+  gate_explanation: "At or above the configured threshold of 0.8.",
+};
+
 function remediation(
   state: RemediationState = "proposed",
   overrides: Partial<Remediation> = {}
@@ -87,19 +106,7 @@ function remediation(
       bounding_box: [100, 200, 300, 400],
       timestamp_seconds: 3,
     },
-    proposal: {
-      action: "remove_region",
-      summary: "Obscure the reported competitor_logo in frame 3.",
-      rationale:
-        "The frame analysis flagged a competitor_logo on frame 3. That reflects what the model reported, not a confirmed violation of any specific rule.",
-      model_claim: "A rival mark is visible on the cup.",
-      target_description: "A region covering roughly 20%-40% across the frame.",
-      limitations:
-        "This proposal is derived only from one model's analysis of a single video frame. Approving this proposal records your decision; it does not by itself change any video.",
-      requires_approval: true,
-      confidence_gate: "pass",
-      gate_explanation: "At or above the configured threshold of 0.8.",
-    },
+    proposal: { ...BASE_PROPOSAL },
     approved_by: null,
     approved_at: null,
     decided_by: null,
@@ -308,7 +315,7 @@ describe("reviewing a proposal", () => {
     renderPanel({
       record: remediation("proposed", {
         proposal: {
-          ...remediation().proposal,
+          ...BASE_PROPOSAL,
           confidence_gate: "below_threshold",
           gate_explanation: "Below the configured threshold of 0.8.",
         },
@@ -636,5 +643,59 @@ describe("the panel never claims a video was corrected", () => {
       }),
     });
     expect(screen.getByText("Not a compliance sign-off")).toBeTruthy();
+  });
+});
+
+/**
+ * Phase 10.1. `Remediation.proposal` is not guaranteed at runtime:
+ * `remediation_repo.view` emits `record.get("proposal")`, so a document stored
+ * without one serialises as `null`, and the backend's own routes already read
+ * it defensively as `(record.get("proposal") or {})`. The API client casts the
+ * list response with `as Remediation[]` and validates nothing.
+ *
+ * Before the guard, `proposal.summary` threw a TypeError that unmounted the
+ * whole audit detail view - the browser showed "Application error: a
+ * client-side exception has occurred" and the findings, the verdict and every
+ * other remediation disappeared with it. Found by the Playwright journey,
+ * which is the only layer that renders the real tree in a real browser.
+ */
+describe("RemediationPanel with an incomplete record", () => {
+  it("renders without crashing when the proposal is missing", () => {
+    stubBackend();
+    const record = remediation("proposed");
+    renderPanel({ record: { ...record, proposal: null } });
+
+    // The state is still reported: it does not depend on the proposal.
+    expect(screen.getByText(/awaiting your review/i)).toBeTruthy();
+  });
+
+  it("says the proposal details are unavailable rather than inventing them", () => {
+    stubBackend();
+    const record = remediation("proposed");
+    renderPanel({ record: { ...record, proposal: null } });
+
+    expect(
+      screen.getByTestId(`proposal-missing-${record.remediation_id}`)
+    ).toBeTruthy();
+  });
+
+  it("still states that the original video is unchanged", () => {
+    stubBackend();
+    const record = remediation("applied");
+    renderPanel({ record: { ...record, proposal: undefined } });
+
+    // The assurance a reader most needs must not be collateral damage.
+    expect(screen.getByText("Original unchanged")).toBeTruthy();
+  });
+
+  it("does not call an unchecked output compliant when the proposal is missing", () => {
+    stubBackend();
+    const record = remediation("applied");
+    const { container } = renderPanel({
+      record: { ...record, proposal: null, is_compliance_claim: false },
+    });
+
+    expect(screen.getByText(/new video built, not yet checked/i)).toBeTruthy();
+    expect(container.textContent ?? "").not.toMatch(/\bcompliant\b/i);
   });
 });

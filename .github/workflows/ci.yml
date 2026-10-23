@@ -1,0 +1,210 @@
+name: CI
+
+# Phase 10.2. The project had no CI before this file.
+#
+# Every command below is one that has been run locally and is documented in
+# CLAUDE.md §3, so a red run means a real regression rather than a workflow
+# that never worked. Nothing here needs AWS credentials, a Bedrock key, or any
+# other secret: the backend suite mocks every external service (conftest.py
+# sets its own dummy environment) and the Playwright suite intercepts every
+# API call. No job can reach a production resource or incur a billed call.
+#
+# NOTE ON FIRST EXECUTION: these workflows have never run on GitHub Actions.
+# They are validated by running the equivalent commands locally - see the
+# Phase 10.2 report. Treat the first remote run as the real verification,
+# particularly the Python 3.11 leg, which no local interpreter could test.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repository, publishes a package,
+# or needs an id-token.
+permissions:
+  contents: read
+
+# A new push to the same ref makes the in-flight run obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The range backend/requirements.txt declares as supported. 3.11 is
+        # the Dockerfile's base image (python:3.11-slim) and is the version
+        # that matters for deployment; 3.14 is what the project is developed
+        # on. Neither is arbitrary.
+        python-version: ["3.11", "3.14"]
+
+    services:
+      # Lets the 26 `requires_mongodb` tests actually execute. Without this
+      # they skip, and a skip is not a pass - they had never been run before
+      # Phase 10.2 configured this service.
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install FFmpeg
+        # 46 tests are marked `requires_ffmpeg` and SKIP without the binary.
+        # Installing it here is what makes the real-media reconstruction and
+        # extraction tests run in CI rather than silently skipping.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+
+      - name: Compile every module
+        # Catches a syntax error on a Python version the developer does not
+        # run locally, before the suite spends time on it.
+        run: python -m py_compile backend/*.py backend/tests/*.py analyzer_nova.py prompts.py
+
+      - name: Run the backend suite with coverage
+        working-directory: backend
+        env:
+          # A disposable database on the service container. The test module's
+          # own guards require the name to contain "test" and the host to be
+          # loopback, and it drops only the two collections it owns.
+          MONGODB_TEST_URL: mongodb://localhost:27017/novaflow_pytest
+        run: |
+          python -m pytest tests -q --cov=. --cov-branch --cov-report=term-missing
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backend-coverage-py${{ matrix.python-version }}
+          path: backend/.coverage*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  frontend:
+    name: Frontend (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the floor Next.js 16 declares (engines.node >= 20.9.0); 24 is
+        # the development environment. Testing both proves the declared floor
+        # is real rather than aspirational.
+        node-version: ["20", "24"]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node ${{ matrix.node-version }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        # `npm ci` installs exactly the lockfile, and fails if package.json and
+        # the lockfile disagree - which is the reproducibility guarantee.
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint the application
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Lint the end-to-end tests
+        # The `lint` script is `eslint app`, so the e2e directory needs its own
+        # invocation or it would never be linted.
+        working-directory: frontend
+        run: npx eslint e2e
+
+      - name: Type-check
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Run unit and component tests
+        working-directory: frontend
+        run: npm test
+
+      - name: Build for production
+        working-directory: frontend
+        run: npm run build
+
+  e2e:
+    name: End-to-end (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install the Chromium browser
+        # Only Chromium: it is the single project in playwright.config.ts, and
+        # pulling three engines would triple the download for no extra
+        # coverage. `--with-deps` adds the system libraries the runner lacks.
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the end-to-end journeys
+        # The config starts `next dev` itself (webServer) and points
+        # NEXT_PUBLIC_API_URL at an unreachable port, so no backend runs and an
+        # un-stubbed request fails fast instead of reaching a real service.
+        working-directory: frontend
+        run: npm run test:e2e
+
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-report
+          # Traces and screenshots are captured on failure only. They contain
+          # fixture data and synthetic tokens - no real credential and no
+          # customer content, because no real service is ever contacted.
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          if-no-files-found: ignore
+          retention-days: 7

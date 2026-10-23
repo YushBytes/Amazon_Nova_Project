@@ -1,0 +1,147 @@
+name: Security
+
+# Phase 10.2. Dependency advisories and committed-secret scanning.
+#
+# Deliberately separate from ci.yml: advisory databases change without the
+# code changing, so this also runs on a schedule. A new CVE in a pinned
+# dependency should surface on its own, not wait for the next push.
+#
+# WHAT LEAVES THE RUNNER. `pip-audit` and `npm audit` send package names and
+# versions to their advisory APIs - dependency metadata, not source code.
+# gitleaks runs entirely offline from a pinned binary, so no private source is
+# submitted to any external scanning service.
+#
+# No job needs a secret, and none can reach AWS, Bedrock, or a database.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays, 07:00 UTC. Catches advisories published since the last push.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-dependencies:
+    name: Python dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        run: pip install pip-audit==2.9.0
+
+      - name: Audit the runtime manifest
+        # Audits the PINNED manifest rather than the resolved environment, so
+        # the result describes what a deployment would actually install.
+        #
+        # Known findings as of 2026-10-23, each assessed in the Phase 10.2
+        # report and none exploitable in this application:
+        #   python-jose 3.5.0  PYSEC-2026-4298  (no fix published)
+        #   ecdsa       0.19.2 PYSEC-2026-1325  (no fix planned, upstream)
+        #   mcp         2.1.1  GHSA-84m7-p3x7-pcfv (transitive, unused path)
+        #
+        # `continue-on-error` because two of the three have NO available fix:
+        # failing the build would make this permanently red and train everyone
+        # to ignore it. The step still prints every finding, and the summary
+        # below is what a reviewer reads. Revisit when fixes ship.
+        continue-on-error: true
+        run: |
+          pip-audit -r backend/requirements.txt --desc --progress-spinner off \
+            --format columns | tee python-audit.txt
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Python dependency audit"
+            echo ""
+            echo '```'
+            cat python-audit.txt || echo "no output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  javascript-dependencies:
+    name: JavaScript dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Audit the shipped dependency tree
+        # THE GATE THAT MATTERS. `--omit=dev` is the code that actually reaches
+        # a user's browser. It was clean (0 vulnerabilities) as of 2026-10-23
+        # after upgrading next 16.1.6 -> 16.4.2, so a failure here is a real
+        # regression in shipped code and SHOULD break the build.
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=low
+
+      - name: Audit development dependencies (advisory only)
+        # Reported, not enforced. The residual findings are in the test runner
+        # and the lint config - never shipped - and clearing them needs a
+        # semver-major vitest upgrade, which is out of Phase 10 scope. See the
+        # Phase 10.2 report for the per-advisory reasoning.
+        continue-on-error: true
+        working-directory: frontend
+        run: npm audit --audit-level=moderate
+
+  secret-scan:
+    name: Committed-secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # gitleaks needs every commit, not just the tip, or a secret
+          # introduced and later removed would go unnoticed.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        # The pinned release binary rather than a marketplace action: it runs
+        # offline, needs no licence key for a private repository, and nothing
+        # is uploaded anywhere.
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version
+
+      - name: Scan the full commit history
+        # `--redact` so a finding's value never reaches the log. The config
+        # allowlists only vendored dependencies, gitignored build output, and
+        # one verified false positive - see .gitleaks.toml.
+        run: ./gitleaks git --redact --no-banner --config .gitleaks.toml .
+
+      - name: Scan the working tree
+        run: ./gitleaks dir --redact --no-banner --config .gitleaks.toml .

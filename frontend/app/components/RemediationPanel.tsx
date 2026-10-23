@@ -338,35 +338,61 @@ export default function RemediationPanel({
         )}
       </div>
 
-      <p className="text-[11px] font-semibold leading-relaxed text-white/70">
-        {proposal.summary}
-      </p>
-      <p className="text-[11px] leading-relaxed text-white/40">
-        {proposal.rationale}
-      </p>
-      <p className="text-[11px] leading-relaxed text-white/40">
-        <span className="font-bold text-white/30">Target: </span>
-        {proposal.target_description}
-      </p>
+      {/* Phase 10.1: `proposal` is typed as required but is NOT guaranteed at
+          runtime. `remediation_repo.view` emits `record.get("proposal")`, so a
+          document stored without one serialises as `null`, and the backend's
+          own routes read it defensively as `(record.get("proposal") or {})`.
+          The API client casts the list response with `as Remediation[]` and
+          validates nothing, so a null reached this component and
+          `proposal.summary` threw a TypeError that blanked the ENTIRE audit
+          detail view - "Application error: a client-side exception has
+          occurred" - rather than degrading. Found by the Playwright journey.
 
-      <div className="flex flex-wrap items-center gap-3">
-        <StatusBadge
-          label={gateLabel(proposal.confidence_gate)}
-          tone={toneForGate(proposal.confidence_gate)}
-        />
-        <span className="text-[10px] text-white/30">{record.stage}</span>
-      </div>
+          The record's state, the "original unchanged" assurance and the
+          actions above do not depend on the proposal, so they still render.
+          Nothing is invented to fill the gap: a missing field stays missing
+          and is reported as such. */}
+      {proposal ? (
+        <>
+          <p className="text-[11px] font-semibold leading-relaxed text-white/70">
+            {proposal.summary}
+          </p>
+          <p className="text-[11px] leading-relaxed text-white/40">
+            {proposal.rationale}
+          </p>
+          <p className="text-[11px] leading-relaxed text-white/40">
+            <span className="font-bold text-white/30">Target: </span>
+            {proposal.target_description}
+          </p>
 
-      <blockquote className="border-l-2 border-white/10 pl-4 text-[11px] italic leading-relaxed text-white/35">
-        <span className="not-italic font-bold uppercase tracking-widest text-white/25">
-          Model said:{" "}
-        </span>
-        {proposal.model_claim}
-      </blockquote>
+          <div className="flex flex-wrap items-center gap-3">
+            <StatusBadge
+              label={gateLabel(proposal.confidence_gate)}
+              tone={toneForGate(proposal.confidence_gate)}
+            />
+            <span className="text-[10px] text-white/30">{record.stage}</span>
+          </div>
 
-      <p className="rounded-xl border border-white/5 bg-white/[0.02] p-4 text-[10px] leading-relaxed text-white/35">
-        {proposal.limitations}
-      </p>
+          <blockquote className="border-l-2 border-white/10 pl-4 text-[11px] italic leading-relaxed text-white/35">
+            <span className="not-italic font-bold uppercase tracking-widest text-white/25">
+              Model said:{" "}
+            </span>
+            {proposal.model_claim}
+          </blockquote>
+
+          <p className="rounded-xl border border-white/5 bg-white/[0.02] p-4 text-[10px] leading-relaxed text-white/35">
+            {proposal.limitations}
+          </p>
+        </>
+      ) : (
+        <p
+          data-testid={`proposal-missing-${record.remediation_id}`}
+          className="text-[11px] leading-relaxed text-white/40"
+        >
+          This remediation&apos;s proposal details are unavailable, so what was
+          proposed and why cannot be shown. Its state above is still accurate.
+        </p>
+      )}
 
       {record.approved_by && (
         <p className="text-[10px] uppercase tracking-widest text-white/30">

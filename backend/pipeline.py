@@ -279,7 +279,7 @@ def _run_claimed(sync, video_id, record, claim_id, file_path):
         return failed
 
     # --- stage 2: analysis ------------------------------------------------
-    from analyzer import MODEL_ID, FrameAuditError, check_pending_frames
+    from analyzer import FrameAuditError, check_pending_frames, model_id
 
     def on_frame_progress(audited: int, analysis_failed: int) -> None:
         """Extend the lease and verify we still hold it.
@@ -327,7 +327,7 @@ def _run_claimed(sync, video_id, record, claim_id, file_path):
         "frames_audited": audited,
         "frames_failed": analysis_failed,
         "detections_recorded": detections,
-        "model_id": MODEL_ID,
+        "model_id": model_id(),
     }
 
     # --- stage 3: terminal state -----------------------------------------

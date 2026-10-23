@@ -21,8 +21,29 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./vitest.setup.ts"],
     include: ["app/**/*.test.{ts,tsx}", "tests/**/*.test.{ts,tsx}"],
-    // Next.js build output and dependencies are not test sources.
-    exclude: ["node_modules/**", ".next/**"],
+    // Next.js build output and dependencies are not test sources. `e2e/**` is
+    // Playwright's (its specs use @playwright/test, not Vitest) and would
+    // fail to run here, so the two runners never collect each other's files.
+    exclude: ["node_modules/**", ".next/**", "e2e/**"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html"],
+      reportsDirectory: "./coverage",
+      // Measure the application only. Build config carries no logic worth
+      // asserting, and `e2e/fixtures` is Playwright-only support code that
+      // Vitest never loads - leaving them in reported 0% for files no unit
+      // test is supposed to cover and diluted the figure that matters.
+      //
+      // No thresholds are set: a threshold here would be a number to satisfy,
+      // and the uncovered branches are listed in the Phase 10.1 report
+      // instead so they can be judged on merit.
+      include: ["app/**/*.{ts,tsx}"],
+      exclude: [
+        "app/**/*.test.{ts,tsx}",
+        "app/layout.tsx",
+        "**/*.d.ts",
+      ],
+    },
   },
   resolve: {
     alias: {

@@ -37,7 +37,7 @@ job survives an API restart — there is no in-memory handoff to lose. The queue
 is the `videos` collection itself, not a separate queue service; see
 `docs/PIPELINE_ARCHITECTURE.md` §8 for why, including why SQS was rejected.
 
-**Frontend** — Next.js 16.1.6, React 19.2.3, TypeScript 5.9.3 (`strict`),
+**Frontend** — Next.js 16.4.2, React 19.2.3, TypeScript 5.9.3 (`strict`),
 Tailwind CSS v4, Framer Motion, lucide-react. Tests run on Vitest. Three
 routes (`/`, `/login`, `/_not-found`); the shell at `/` switches views in
 client state, so individual views are not deep-linkable. Every view is backed
@@ -231,34 +231,68 @@ through `POST /auth/signup`. Public signup always assigns the `client` role; the
 ## Tests
 
 ```bash
-# Backend
-cd backend && pytest                      # 1111 passed, 55 skipped by default
+# Backend  (1212 passed, 26 skipped — measured 2026-10-23)
+cd backend && pytest
+pytest --cov=. --cov-branch --cov-report=term-missing   # 90% statements
 pytest -m requires_mongodb                # needs MONGODB_TEST_URL
-pytest -m requires_ffmpeg                 # needs ffmpeg on PATH
+pytest -m requires_ffmpeg                 # 46 tests; needs ffmpeg on PATH
 
-# Frontend
-cd frontend && npm test                    # 387 tests (Vitest)
+# Frontend  (391 Vitest tests, 18 files)
+cd frontend && npm test
+npm run test:coverage                     # 96.59% statements, 89.78% branch
 npm run lint && npm run typecheck && npm run build
+
+# Browser journeys  (52 Playwright tests)
+npx playwright install chromium           # once
+npm run test:e2e                          # headless
+npm run test:e2e:headed                   # visible browser
+npm run test:e2e:report                   # HTML report after a failure
 ```
 
-Frontend: 387 tests pass, 0 type errors, **0 lint errors and 0 lint warnings**,
-and the build emits `/`, `/_not-found` and `/login`. `fetch` is stubbed at the
-network boundary in every frontend test, so they prove the UI renders the right
-thing for a given API response — and nothing about real backend or AWS
-behaviour. Run `npm run build` before `npm run typecheck` after deleting a
-route: the typecheck reads generated validators under `.next/types/`.
+**What each layer proves, and what it does not.**
 
-There is no end-to-end test covering login → upload → analyze → review against
-a live backend, and no browser-automation stack (Phase 10).
+*Frontend unit tests* (391, Vitest): `fetch` is stubbed at the network
+boundary, so they prove the UI renders the right thing for a given API
+response — and nothing about real backend or AWS behaviour. Run `npm run
+build` before `npm run typecheck` after deleting a route: the typecheck reads
+generated validators under `.next/types/`.
 
-55 backend tests are **skipped by default** because they need real
-dependencies: 26 require a MongoDB instance (`MONGODB_TEST_URL`, which must
-name a disposable database — setup drops collections), 16 require the FFmpeg
-binary for frame extraction, and 13 require it for video reconstruction.
-**Skipped means unverified, not passing** — in particular, no video has ever
-been reconstructed by real FFmpeg on the machine this was written on.
+*Browser journeys* (52, Playwright): these drive the real Next.js app in
+Chromium and cover what jsdom cannot — routing, the auth redirect, hydration,
+and CORS header visibility. **No backend runs during them.** Every API
+response is a `page.route` fixture, and `NEXT_PUBLIC_API_URL` is pointed at an
+unreachable port so a missing fixture fails fast instead of silently reaching
+a local server. They are **not** evidence that the backend works.
+
+**There is still no test that exercises the frontend against a live backend**,
+and none against real AWS or Bedrock.
+
+26 backend tests are **skipped by default** — all of them need a MongoDB
+instance (`MONGODB_TEST_URL`, which must name a disposable database, because
+setup drops collections). **Skipped means unverified, not passing**, and these
+26 have never been executed anywhere. CI configures a MongoDB service so they
+run there; the first CI run is their first real execution.
+
+The 46 `requires_ffmpeg` tests **do** run wherever `ffmpeg` and `ffprobe` are
+on PATH, and 25 of them build and inspect real video. See Limitations for what
+that does and does not establish about a deployment.
 
 No test calls real AWS or incurs cost. Every external service is stubbed.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs the backend suite on Python 3.11 and 3.14 (the
+range `requirements.txt` declares, 3.11 being the Dockerfile's base image) with
+FFmpeg and a MongoDB service installed, the frontend checks on Node 20 and 24,
+and the Playwright journeys on Chromium.
+
+`.github/workflows/security.yml` runs `pip-audit`, `npm audit`, and a gitleaks
+scan of the full commit history, weekly as well as per push. The build-breaking
+gate is `npm audit --omit=dev`: the **shipped** dependency tree must stay clean.
+Development-only advisories are reported without failing the run.
+
+Neither workflow needs a secret, and no job can reach AWS, Bedrock, or a real
+database.
 
 ---
 
@@ -323,8 +357,11 @@ These are current and deliberate to state plainly.
   not block it — they are recorded and shown separately. A failed, pending or
   zero-frame analysis is never a pass.
 - **Reconstruction has never run against the real FFmpeg binary** on the
-  machine this was written on: 13 integration tests exist and are **skipped**.
-  Install FFmpeg and run `pytest -m requires_ffmpeg` before trusting the
+  machine this was written on. FFmpeg 9.0.1 was later installed and those
+  tests now pass there (25 reconstruction tests, verified by sampling real
+  pixels), but a developer machine is not a deployment: no deployed image has
+  been confirmed to carry the binary.
+  Run `pytest -m requires_ffmpeg` in the target environment before trusting the
   output.
 - **Frontend views are not URL-addressable**, the audit detail view loads once
   rather than polling, and search and filtering run client-side over the list

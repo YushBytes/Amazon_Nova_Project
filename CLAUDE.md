@@ -25,9 +25,13 @@ The project is now a correctly-rooted repository at `C:/Users/ayush/OneDrive/Des
 - **Stage files explicitly by path.** Never `git add -A`, `git add .`, or `git commit -a`.
 - Never commit from, or add a remote to, the Desktop repository.
 
-### 1.2 The remote now holds the full project, and is private **[VERIFIED 2026-10-18, Phase 0]**
+### 1.2 The remote now holds the full project, and is PUBLIC **[CORRECTED 2026-10-23]**
 
-`YushBytes/Amazon_Nova_Project` is **PRIVATE** (confirmed by an unauthenticated API probe returning 404) and `main` now contains the complete project — 136 tracked files.
+⚠️ **`YushBytes/Amazon_Nova_Project` is PUBLIC.** Re-verified 2026-10-23: the
+authenticated API reports `private: false`, and unauthenticated probes of both
+the API and the HTML page return **HTTP 200**. This section previously stated
+the repository was PRIVATE on the strength of a 404 probe in Phase 0; that is
+no longer true, however it changed. `main` contains the complete project.
 
 History is linear, with the original commit preserved as its root:
 
@@ -39,7 +43,25 @@ e059a9c  Add files via upload          <- original remote commit, preserved
 
 Before Phase 0 the remote held only 5 root-level files; `backend/`, `frontend/`, `infra/`, `docs/`, and `frontend_backup/` had never been pushed. Four of those five files remain byte-identical to `e059a9c`; only `.gitignore` was intentionally extended. **Never force-push** — published history must be preserved.
 
-The repository was made private *before* the backend was first pushed, so `backend/auth.py` and its hardcoded development JWT secret have never been publicly exposed. That secret is still a live defect (§5) and Roadmap Phase 3 replaces it.
+⚠️ **The claim that the hardcoded secret was never publicly exposed no longer
+holds.** `backend/auth.py` at commits `7e1649c` and `e50ed57` — both reachable
+from HEAD — assigns a 40-character literal to a module-level `SECRET_KEY` that
+`jwt.encode`/`jwt.decode` used directly. With the repository public, that value
+is world-readable in the history, and history is preserved by policy (never
+force-push), so the exposure is permanent.
+
+**What bounds the risk, verified by execution rather than assumed:**
+`config._validate_secret` raises `ConfigurationError` for that value, so it is
+refused in *every* environment; production **fails closed** when
+`JWT_SECRET_KEY` is absent; development generates an ephemeral random key;
+`auth.SECRET_KEY` no longer exists. Secrecy is not the control — the value is
+*deliberately published* in `config.KNOWN_INSECURE_SECRETS`, which is how a
+blocklist works. No `.env` exists, `.env.example` holds an empty placeholder,
+and **no deployment definition anywhere sets `JWT_SECRET_KEY`**.
+
+**Outstanding owner actions:** decide repository visibility, and rotate
+`JWT_SECRET_KEY` in any environment that ever set it to that literal. See
+`docs/RELEASE_CHECKLIST.md` §7A for the full assessment.
 
 ### 1.3 The Phase 1 critical defects are fixed **[VERIFIED by test]**
 
@@ -92,7 +114,10 @@ Amazon Nova/                         <- project root (flattened in Phase 0; hold
 
 - **Frontend:** Next.js 16.1.6, React 19.2.3, TypeScript 5.9.3 (`strict: true`), Tailwind CSS v4, Framer Motion, lucide-react.
 - **Backend:** FastAPI + Uvicorn, `python-jose` JWT (HS256), `motor` (async MongoDB), `boto3`.
-- **AI:** Amazon Bedrock, model `amazon.nova-pro-v1:0`. *(Docs say "Nova 2 Pro"; code says `nova-pro-v1:0`. Unresolved.)*
+- **AI:** Amazon Bedrock. The model is **configurable** via `BEDROCK_MODEL_ID`
+  (default `amazon.nova-pro-v1:0`); it was a hardcoded constant until Phase 10.
+  *(Docs elsewhere say "Nova 2 Pro"; the code default says `nova-pro-v1:0`. The
+  naming question is still open — §9 q6 — but it is no longer a code edit.)*
 - **Storage:** S3 for source videos (`sources/`), frame JPEGs (`frames/`), agent reels (`raw/`), replacement images (`remediation-assets/`, Phase 9) and reconstructed outputs (`remediated/`, Phase 9) — one bucket named by `S3_BUCKET_NAME`; DynamoDB (`NovaFlowFrames`, `NovaFlowProjects`) for metadata; MongoDB for accounts (`novaflow.users`), ownership plus job state (`novaflow.videos`), and remediation records (`novaflow.remediations`, Phase 8). ⚠️ **Nothing writes to `sources/` except an upload** — a reconstruction's output is a separate object under its own video id. Local `backend/uploads/` is **read-only legacy** — pre-Phase-4.1 records only; new uploads never land there.
 - **Video:** `ffmpeg-python` + the FFmpeg binary, 1 fps extraction.
 - **Deploy:** AWS Amplify (frontend only); `backend/Dockerfile` exists with no deployment definition. **Two backend processes** now: the API (`uvicorn app:app`) and the worker (`python backend/worker.py`). Both run from the same image; neither has a deployment definition. §9 question 9 is still open.
@@ -192,7 +217,7 @@ and `frontend/node_modules` is installed. Use the venv interpreter.
 git rev-parse --show-toplevel                      # ALWAYS run before committing
 python -m py_compile backend/*.py analyzer_nova.py prompts.py
 
-# Backend tests — 1169 passed, 26 skipped in 54.51s (Phase 9.1)
+# Backend tests — 1212 passed, 26 skipped in 53.10s (Phase 10)
 #   The 26 remaining skips ALL need MONGODB_TEST_URL. A skip is NOT a pass.
 #   FFmpeg 9.0.1 is now installed on this host, so the 29 formerly-skipped
 #   FFmpeg tests RUN: 46 are marked requires_ffmpeg today (the file grew in
@@ -201,8 +226,14 @@ python -m py_compile backend/*.py analyzer_nova.py prompts.py
 ./.venv/Scripts/python.exe -m pytest backend/tests -q
 ./.venv/Scripts/python.exe -m pytest backend/tests -m requires_ffmpeg -q   # 46 tests
 
+# Coverage (Phase 10.1; pytest-cov is in requirements-dev.txt)
+cd backend && ../.venv/Scripts/python.exe -m pytest tests -q \
+    --cov=. --cov-branch --cov-report=term-missing      # 90% statements
+
 # Frontend — all four pass; lint reports 0 errors / 0 warnings
-cd frontend && npm test          # 387 tests (Vitest), 18 files
+cd frontend && npm test          # 391 tests (Vitest), 18 files
+cd frontend && npm run test:coverage  # 96.59% stmts / 89.78% branch
+cd frontend && npm run test:e2e       # 52 Playwright tests, Chromium
 cd frontend && npm run typecheck # tsc --noEmit, exit 0
 cd frontend && npm run lint      # "eslint app"
 cd frontend && npm run build     # routes: / , /_not-found , /login
@@ -230,14 +261,25 @@ cd backend && python worker.py                  # the durable worker
 cd backend && python worker.py --status         # queue depth; needs MongoDB
 ```
 
-### Does not exist **[VERIFIED 2026-10-20]**
+### Does not exist **[VERIFIED 2026-10-23]**
 
-- **No CI.** No `.github/` directory. Phase 10.2.
-- No Playwright/end-to-end test covering login → upload → analyze → review.
-- No backend linter or type checker is configured — no `pyproject.toml`,
-  `setup.cfg`, `.flake8`, ruff or mypy config. `requirements-dev.txt` holds only
-  pytest, pytest-asyncio and httpx. **Do not claim a Python lint or type pass:
-  there is no tool to run.**
+- ~~**No CI.**~~ **ADDED in Phase 10.2.** `.github/workflows/ci.yml`
+  (backend on Python 3.11/3.14 with FFmpeg and a MongoDB service; frontend on
+  Node 20/24; Playwright on Chromium) and `.github/workflows/security.yml`
+  (pip-audit, npm audit, gitleaks over the full history). ⚠️ **Neither has
+  ever run on GitHub Actions** — they are validated by running the equivalent
+  commands locally. The first remote run is the real verification, especially
+  the Python 3.11 leg, which no local interpreter could test.
+- ~~No Playwright/end-to-end test~~ **ADDED in Phase 10.1.** 52 Playwright
+  tests over 5 journeys, all passing. ⚠️ They drive the real app in a real
+  browser but **no backend runs**: every API response is a fixture, so they
+  are evidence about the frontend only. Still **no test against a live
+  backend**, and none against real AWS or Bedrock.
+- **No backend linter or type checker is configured** — no `pyproject.toml`,
+  `setup.cfg`, `.flake8`, ruff or mypy config. `requirements-dev.txt` holds
+  pytest, pytest-asyncio, httpx and pytest-cov. **Do not claim a Python lint or
+  type pass: there is no tool to run.** `python -m py_compile` and
+  `pytest --cov` are the only Python-side checks that exist.
 - `cfn-lint` is not installed, so `infra/cloudformation/storage.yaml` has only
   ever been validated structurally offline (YAML parse, resource types, and
   Ref/GetAtt/Condition resolution). `aws cloudformation validate-template` is an
@@ -309,6 +351,7 @@ Pre-existing application configuration:
 
 ⚠️ **`AWS_MAX_ATTEMPTS` and `BEDROCK_MAX_ATTEMPTS` multiply.** Their product is the worst-case model invocations for one frame, and every attempt is billed. Raise one, not both.
 | `API_URL` | `app.py:82` | `http://localhost:8000` |
+| `BEDROCK_MODEL_ID` | `config.load_bedrock_model_id()` | `amazon.nova-pro-v1:0` — **set a regional inference profile (`us.amazon.nova-pro-v1:0`) where on-demand access is unavailable**, or real analysis fails with a non-retryable `ValidationException` on every frame. Validated at startup; each frame row and job records the id used. |
 | `BEDROCK_GUARDRAIL_ID` | `safety.py:13` | **none** |
 | `BEDROCK_GUARDRAIL_VERSION` | `safety.py:14` | `1` |
 | `NEXT_PUBLIC_API_URL` | `frontend/app/lib/api.ts` only (Phase 7) | `http://localhost:8000` |
@@ -418,7 +461,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0 through 9.1 are **complete, committed, and pushed**.
+Phases 0 through 9.1 are **complete, committed, and pushed**. Phases 10.1-10.4 are **complete but UNCOMMITTED** — see the Phase 10 report.
 
 | Phase | What landed |
 | :-- | :-- |
@@ -434,6 +477,10 @@ Phases 0 through 9.1 are **complete, committed, and pushed**.
 | 8 | Reviewed remediation workflow: proposal, owner approval, staleness detection, confidence gating, provider contract with a truthful unavailable state. **No image generated, no video modified.** |
 | 9 | End-to-end correction from an owner-supplied image: validated asset storage, FFmpeg overlay reconstruction into a **new** video, output validation, re-analysis through the existing pipeline, and evidence-based verification. **Still no image generation; the original upload is never modified; FFmpeg was unavailable locally so its real-binary tests are skipped.** |
 | 9.1 | FFmpeg 9.0.1 installed, so the real-binary tests ran for the first time. Three genuine defects fixed: an undecodable image made FFmpeg **block** for the full 301s timeout and that timeout was classified retryable; every happy-path image fixture in the suite was itself that undecodable payload; and `fake_s3` left three modules pointing at a real boto3 client, so 9 extraction tests called real AWS. Suite: 1169 passed / 26 skipped in 54.51s, down from 969s. |
+| 10.1 | Playwright introduced (52 tests, 5 journeys) plus 18 backend tests for the `recover_jobs` dry-run boundary and 4 for a crash the browser found. Coverage measured: backend 90% statements, frontend 96.59%/89.78% branch. |
+| 10.2 | CI and security workflows added (never yet run remotely). `next` 16.1.6 -> 16.4.2 clears a CRITICAL advisory; the **shipped** npm tree is now at 0 vulnerabilities. Full git-history gitleaks scan: 15 commits, no leaks. Three Python advisories assessed as present-but-not-exploitable. |
+| 10.3 | `.agent/skills/video-audit/SKILL.md` corrected (it documented a bounding-box schema and a `timestamp_ms` field the code never used); README test/version/CI claims corrected; §9 q5 resolved. |
+| 10.4 | Release checklist assessed against evidence; readiness recommendation recorded. |
 
 **Phase 5 detail.** Deleted: the orphaned MongoDB/GridFS pipeline (`audit_manager.py`, `verifier.py`, `check_count.py`), `debug_probe.py`, `aws_config.py`, `frontend_backup/` (72 files), the stray `frontend/Video Compliance Dashboard/`, the orphan `/agents` and `/logs` duplicate routes, `infra/init_s3.py`, and `infra/iam_policy.yaml` — 82 files. `S3_BUCKET_NAME` is now required in production and validated; `MONGO_URI` and `Pillow` are gone with their only consumer. Regression tests assert the deleted modules stay deleted, that nothing imports `gridfs`, and that nothing reimplements the bucket fallback.
 
@@ -588,8 +635,23 @@ These block specific phases. Do not decide them unilaterally.
 2. Keep MongoDB for users, or consolidate onto DynamoDB? *(Still open. MongoDB now also holds ownership and job state, so this is a larger decision than it was.)*
 3. ~~Is video **reconstruction** in release scope?~~ **RESOLVED in Phase 9 — in scope, built from an owner-supplied replacement image, as a localized overlay over the approved region.** Decision record: `docs/REMEDIATION.md` §9. The output is a **new** video with its own id under `remediated/`; the original upload is never modified. ⚠️ It is a *concealment*, not a repair — hard edges, no grain matching, no motion tracking — and `reconstruction_method` is reported as `scaled_overlay` so nothing downstream can read more into it. **Never describe it as seamless.** Left open deliberately: chained corrections (a second remediation rebuilds from the original, not the first output) and promoting an output to replace its source.
 4. ~~Is **remediation** (Nova Canvas) in release scope?~~ **RESOLVED in Phase 8 — in scope as a reviewed proposal workflow; automated image generation is NOT implemented.** Full decision record and rationale: `docs/REMEDIATION.md`. In short: the Canvas request schema could not be verified from anything in this repository (botocore types `InvokeModel.body` as an opaque blob — verified; the deleted `audit_manager.remediate_frame` admitted in its own comment that the schema was unconfirmed), and the roadmap forbids guessing a provider wire format. So Phase 8 built the proposal/approval lifecycle, the provider interface with its error contract, and a provider that truthfully reports itself unavailable. ⚠️ **Do not add a Canvas adapter without first verifying the payload schema against authoritative Bedrock documentation**, and do not re-add a mock: `test_remediation_provider.py` asserts the shipped provider raises rather than returning an image.
-5. Which bounding-box schema is canonical? *(De facto: the array form in `prompts.py`.)*
-6. Correct model ID — `amazon.nova-pro-v1:0`, or a "Nova 2 Pro" id? Docs and code disagree.
+5. ~~Which bounding-box schema is canonical?~~ **RESOLVED in Phase 10.3 —
+   the array form, `bounding_box: [ymin, xmin, ymax, xmax]`, normalized
+   0-1000.** Verified end to end: `backend/prompts.py` requests it,
+   `detections.BoundingBox.parse` validates it (and tolerates the legacy
+   `box_2d` key and an explicit-keys object on *input* only),
+   `GET /violations/{id}` returns it, and `HUDView.tsx:446-449` consumes it.
+   `.agent/skills/video-audit/SKILL.md` documented `{x, y, width, height}` and
+   a non-existent `timestamp_ms`; it was **wrong** and has been corrected.
+   A box's width and height are differences between edges, never elements.
+6. Correct model ID — `amazon.nova-pro-v1:0`, or a "Nova 2 Pro" id? Docs and code
+   disagree. **Partially addressed in Phase 10:** the id is now configurable
+   (`BEDROCK_MODEL_ID`, validated at startup, recorded on every frame row and
+   job), so changing it is an operator action rather than a code edit, and a
+   regional inference profile can be supplied where on-demand access is
+   unavailable. **Still open:** which id this product should ship as its
+   default. That needs confirmation against the Bedrock model catalogue for
+   the target account and region — do not guess it.
 7. Is Nova Act / browser automation in scope at all? If not, `automation.py`, `orchestrator.py`, `/execute`, and the "Neural Command" UI panel can all go. *(Still open, so Phase 5 retained all of them. `backend/safety.py` is retained for the same reason: it is never imported, but its `intercept_action` is the human-in-the-loop gate for exactly this feature, so deleting it would pre-empt this decision. `backend/s3_trigger.py`, an unreferenced Lambda stub with no deployment definition, was retained as uncertain rather than deleted.)*
 8. ~~Are the `brand-guardian-*` buckets in `infra/` intentional, or leftovers?~~ **RESOLVED in Phase 5 — leftovers.** No application code has ever read them. The two files that created and granted them (`infra/init_s3.py`, `infra/iam_policy.yaml`) were deleted. ⚠️ **No AWS bucket was touched.** If such buckets were ever created in a real account, deleting them there is a separate operator action.
 9. Backend deployment target — ECS, Lambda, App Runner? Only the frontend has a deployment config. *(Phase 6 made this sharper rather than resolving it: there are now **two** long-running processes to place, the API and the worker. The worker is a plain process over MongoDB specifically so this decision stays open — it needs no managed queue. Lambda would not fit the worker as written, since it polls and holds a lease for the length of a job.)*

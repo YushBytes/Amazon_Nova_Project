@@ -63,12 +63,30 @@ table = aws_clients.dynamodb_table(DYNAMO_TABLE)
 # Model configuration, in one place
 # ---------------------------------------------------------------------------
 
-# The model this pipeline is built and prompted for. Switching it changes
-# detection behaviour, so it is a single named constant rather than a literal
-# repeated at each call site. It is NOT read from the environment: an operator
-# silently pointing this at a different model would invalidate every stored
-# result without the pipeline version changing.
-MODEL_ID = "amazon.nova-pro-v1:0"
+# The model this pipeline is built and prompted for. Resolved through
+# `config.load_bedrock_model_id` (env `BEDROCK_MODEL_ID`), defaulting to
+# `amazon.nova-pro-v1:0` so behaviour is unchanged unless it is set.
+#
+# This was a hardcoded constant, whose comment reasoned that reading it from
+# the environment would let an operator "invalidate every stored result
+# without the pipeline version changing". That risk is real but it is
+# addressed by recording the value, not by freezing it: `_store_result` writes
+# the model id onto every frame row (`model_id`) and `pipeline` writes it onto
+# the job, so a result is always attributable to the model that produced it.
+#
+# What freezing it did prevent was running against real Bedrock at all. Many
+# regions have no on-demand access to this model and require an inference
+# profile id (`us.amazon.nova-pro-v1:0`), which `invoke_model` rejects as a
+# ValidationException no amount of retrying fixes - and which an operator
+# could not correct without editing source.
+#
+# A function, not a module constant, so the configured value is read per call
+# rather than frozen at import. `get_settings()` is cached, so this costs
+# nothing per frame.
+def model_id() -> str:
+    """The Bedrock model or inference profile this analyzer invokes."""
+    return get_settings().bedrock_model_id
+
 
 MAX_OUTPUT_TOKENS = 1000
 
@@ -185,7 +203,7 @@ def analyze_frame_with_nova(image_bytes: bytes) -> FrameAnalysis:
 
     for attempt in range(1, max_attempts + 1):
         try:
-            response = bedrock_runtime.invoke_model(modelId=MODEL_ID, body=body)
+            response = bedrock_runtime.invoke_model(modelId=model_id(), body=body)
             raw_text = _read_model_text(response)
             return parse_frame_analysis(raw_text)
 
@@ -306,7 +324,7 @@ def _record_frame_result(
         ":r": json.dumps(report),
         ":d": detections,
         ":t": datetime.now(timezone.utc).isoformat(),
-        ":m": MODEL_ID,
+        ":m": model_id(),
         ":p": PIPELINE_VERSION,
     }
     if attempt is not None:

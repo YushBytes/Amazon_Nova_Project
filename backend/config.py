@@ -25,6 +25,11 @@ Environment variables (names only; never commit values):
                             Default 300.
     BEDROCK_MAX_ATTEMPTS    Optional. Bounded retries per frame for retryable
                             Bedrock errors. Default 3.
+    BEDROCK_MODEL_ID        Optional. The Bedrock model or inference profile
+                            the analyzer invokes. Default
+                            amazon.nova-pro-v1:0. Set this to a regional
+                            inference profile (us.amazon.nova-pro-v1:0) where
+                            on-demand access is unavailable.
     MEDIA_TOKEN_TTL_MINUTES Optional. Lifetime of the video playback token
                             carried in the ?access_token query parameter.
                             Default 15. Keep it short: it appears in URLs.
@@ -91,8 +96,17 @@ MIN_SECRET_LENGTH = 32
 # Values that must never be accepted, regardless of environment. The first
 # entry is the secret that was previously hardcoded in auth.py and is therefore
 # public knowledge for anyone who has seen the repository history.
+#
+# `_validate_secret` compares `supplied.lower()` against this set, which is
+# only correct while every entry is itself lower-case. That was an unenforced
+# invariant: a future entry containing a capital letter would have been
+# compared against a lower-cased input and could therefore NEVER match,
+# silently un-blocking the value it was added to block. Normalising here makes
+# the invariant hold by construction rather than by reviewer vigilance.
+# `test_every_blocklist_entry_is_lowercase` asserts it too.
 KNOWN_INSECURE_SECRETS = frozenset(
-    {
+    value.lower()
+    for value in {
         "brand-guardian-dev-secret-change-in-prod",
         "change-in-prod",
         "changeme",
@@ -490,6 +504,69 @@ def load_max_asset_bytes() -> int:
 # recovered, rather than the worker appearing alive forever.
 
 
+DEFAULT_BEDROCK_MODEL_ID = "amazon.nova-pro-v1:0"
+
+# Deliberately permissive. A Bedrock target can be an on-demand model id
+# (`amazon.nova-pro-v1:0`), a cross-region inference profile id
+# (`us.amazon.nova-pro-v1:0`), or a full inference-profile / provisioned-
+# throughput ARN. Validating the *shape* beyond "no whitespace, sane charset,
+# sane length" would reject targets that work, so this only catches the
+# mistakes that are unambiguous: empty, padded, or containing a space.
+_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,254}$")
+
+
+def load_bedrock_model_id() -> str:
+    """Return the Bedrock model (or inference profile) the analyzer invokes.
+
+    This used to be a hardcoded constant in `analyzer.py`, whose comment gave
+    the reason: an operator silently pointing the pipeline at a different model
+    "would invalidate every stored result without the pipeline version
+    changing".
+
+    That concern is real but it is already answered elsewhere, which is why
+    making this configurable is safe: `analyzer` records the model id it used
+    on **every frame row** (`model_id`) and `pipeline` records it on the job,
+    so a result is always traceable to the model that produced it and results
+    from different models remain distinguishable. Freezing the value in code
+    was not what provided that guarantee.
+
+    What the hardcoding *did* break is running against real Bedrock at all. In
+    many regions on-demand access to this model is unavailable and an
+    **inference profile id** (`us.amazon.nova-pro-v1:0`, `eu.` …) is required;
+    `invoke_model` then fails with a ValidationException that no amount of
+    retrying fixes. An operator could not correct that without editing source.
+
+    The default is the previous constant, so behaviour is unchanged unless
+    `BEDROCK_MODEL_ID` is set. Changing the model changes detection behaviour
+    and invalidates comparisons with older stored results - the stored
+    `model_id` is how you tell.
+    """
+    raw = os.getenv("BEDROCK_MODEL_ID")
+    if raw is None:
+        return DEFAULT_BEDROCK_MODEL_ID
+
+    value = raw.strip()
+    if not value:
+        raise ConfigurationError(
+            "BEDROCK_MODEL_ID is set but empty. Unset it to use the default "
+            f"({DEFAULT_BEDROCK_MODEL_ID}), or give a model id."
+        )
+    if value != raw:
+        raise ConfigurationError(
+            "BEDROCK_MODEL_ID has leading or trailing whitespace. Bedrock "
+            "would reject the padded value with a ValidationException, so it "
+            "is refused here instead of at the first billed call."
+        )
+    if not _MODEL_ID_PATTERN.match(value):
+        raise ConfigurationError(
+            "BEDROCK_MODEL_ID is not a plausible Bedrock model id, inference "
+            "profile id, or ARN. Expected something like "
+            f"{DEFAULT_BEDROCK_MODEL_ID!r} or "
+            "'us.amazon.nova-pro-v1:0'."
+        )
+    return value
+
+
 def load_aws_connect_timeout() -> int:
     """Seconds to wait for a TCP/TLS connection to an AWS endpoint."""
     return _int_env("AWS_CONNECT_TIMEOUT_SECONDS", 10, minimum=1)
@@ -841,6 +918,7 @@ class Settings:
         self.max_frames_per_video = load_max_frames_per_video()
         self.ffmpeg_timeout_seconds = load_ffmpeg_timeout_seconds()
         self.bedrock_max_attempts = load_bedrock_max_attempts()
+        self.bedrock_model_id = load_bedrock_model_id()
         self.remediation_enabled = load_remediation_enabled()
         self.reconstruction_enabled = load_reconstruction_enabled()
         self.reconstruction_timeout_seconds = load_reconstruction_timeout_seconds()

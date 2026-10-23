@@ -71,7 +71,7 @@ def no_sleep(monkeypatch):
 
 def test_request_uses_the_configured_nova_model():
     """The model must not drift silently; it is a named constant."""
-    assert analyzer.MODEL_ID == "amazon.nova-pro-v1:0"
+    assert analyzer.model_id() == "amazon.nova-pro-v1:0"
 
 
 def test_request_body_carries_the_frame_and_the_system_prompt():
@@ -268,7 +268,7 @@ def test_successful_invocation_returns_a_validated_analysis(no_sleep):
     assert result.ok is True
     assert result.detection_count == 1
     assert bedrock.invoke_model.call_count == 1
-    assert bedrock.invoke_model.call_args.kwargs["modelId"] == analyzer.MODEL_ID
+    assert bedrock.invoke_model.call_args.kwargs["modelId"] == analyzer.model_id()
 
 
 def test_throttling_is_retried_then_succeeds(no_sleep):
@@ -574,3 +574,62 @@ def test_check_pending_frames_routes_by_whether_a_video_is_given(fake_frames_tab
          patch.object(analyzer, "_scan_pending_frames", return_value=[]) as scan:
         analyzer.check_pending_frames()
         assert scan.called and not query.called
+
+
+# ---------------------------------------------------------------------------
+# The configured model actually reaches Bedrock (Phase 10 completion)
+# ---------------------------------------------------------------------------
+
+def test_a_configured_inference_profile_reaches_invoke_model(no_sleep, monkeypatch):
+    """The end-to-end point of making the model id configurable.
+
+    Asserting `analyzer.model_id()` alone would pass even if the call site
+    still used a frozen constant, so this pins the value that Bedrock is
+    actually invoked with. The value used here is the case the setting exists
+    for: a regional inference profile, which is what Bedrock requires in
+    regions without on-demand access to this model.
+    """
+    import config
+
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0")
+    config.reset_settings_cache()
+
+    bedrock = MagicMock()
+    bedrock.invoke_model.return_value = _bedrock_response(GOOD_RESPONSE)
+    try:
+        with patch.object(analyzer, "bedrock_runtime", bedrock):
+            result = analyzer.analyze_frame_with_nova(b"frame")
+    finally:
+        config.reset_settings_cache()
+
+    assert result.ok is True
+    assert bedrock.invoke_model.call_args.kwargs["modelId"] == (
+        "us.amazon.nova-pro-v1:0"
+    )
+
+
+def test_the_configured_model_is_recorded_on_the_frame_row(monkeypatch):
+    """Traceability: a result must name the model that produced it.
+
+    This is what makes configurability safe. The original constant's comment
+    worried that an operator could "invalidate every stored result" - the
+    answer is that each row records its own model id, so results from
+    different models stay distinguishable.
+    """
+    import config
+
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0")
+    config.reset_settings_cache()
+
+    table = MagicMock()
+    analysis = FrameAnalysis(scene_description="A frame.", detections=[])
+    try:
+        with patch.object(analyzer, "table", table):
+            analyzer._record_frame_result(
+                "vid_cfg0001", 0, analyzer.STATUS_AUDITED, analysis
+            )
+    finally:
+        config.reset_settings_cache()
+
+    values = table.update_item.call_args.kwargs["ExpressionAttributeValues"]
+    assert values[":m"] == "us.amazon.nova-pro-v1:0"

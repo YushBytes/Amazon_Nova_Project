@@ -358,3 +358,157 @@ def test_no_module_reimplements_the_bucket_fallback():
             if "novaflow-media" in line:
                 offenders.append(f"{path.name}:{number} hardcodes the placeholder")
     assert not offenders, offenders
+
+
+# ---------------------------------------------------------------------------
+# The blocklist comparison is case-robust (Phase 10 finalization)
+# ---------------------------------------------------------------------------
+#
+# `_validate_secret` tests `supplied.lower() in KNOWN_INSECURE_SECRETS`. That
+# is only correct while every entry in the set is itself lower-case: an entry
+# containing a capital letter would be compared against a lower-cased input,
+# could never match, and would silently fail to block the very value it was
+# added for. All twelve entries happened to be lower-case, so the bug was
+# latent rather than live - these tests stop it becoming live.
+
+def test_every_blocklist_entry_is_lowercase():
+    """The invariant `_validate_secret`'s comparison depends on."""
+    offenders = [s for s in config.KNOWN_INSECURE_SECRETS if s != s.lower()]
+    assert not offenders, (
+        f"{offenders} would never match a lower-cased input and so would "
+        f"never actually be blocked"
+    )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "BRAND-GUARDIAN-DEV-SECRET-CHANGE-IN-PROD",
+        "Brand-Guardian-Dev-Secret-Change-In-Prod",
+        "  brand-guardian-dev-secret-change-in-prod  ",
+    ],
+)
+def test_a_cased_or_padded_leaked_secret_is_still_rejected(monkeypatch, variant):
+    """Re-casing or padding the exposed value must not get it past the gate.
+
+    The value is public: it sits in this repository's history, and it is also
+    published deliberately in `KNOWN_INSECURE_SECRETS`. The security property
+    is therefore that it is REFUSED, not that it is unknown - so the refusal
+    has to survive the obvious ways someone might retype it.
+    """
+    monkeypatch.setenv("NOVAFLOW_ENV", "production")
+    monkeypatch.setenv("JWT_SECRET_KEY", variant)
+
+    with pytest.raises(config.ConfigurationError):
+        config.Settings()
+
+
+def test_development_also_refuses_the_leaked_secret(monkeypatch):
+    """Not only production: a supplied insecure value is rejected everywhere.
+
+    Development's convenience is a RANDOM ephemeral key when nothing is set -
+    never a fallback to a known value.
+    """
+    monkeypatch.setenv("NOVAFLOW_ENV", "development")
+    monkeypatch.setenv("JWT_SECRET_KEY", "brand-guardian-dev-secret-change-in-prod")
+
+    with pytest.raises(config.ConfigurationError):
+        config.Settings()
+
+
+def test_an_unset_development_secret_is_random_not_a_known_value(monkeypatch):
+    """Two processes must not share a guessable key."""
+    monkeypatch.setenv("NOVAFLOW_ENV", "development")
+    monkeypatch.delenv("JWT_SECRET_KEY", raising=False)
+
+    first = config.load_jwt_secret()
+    second = config.load_jwt_secret()
+
+    assert first != second, "the development key is not ephemeral"
+    assert first.lower() not in config.KNOWN_INSECURE_SECRETS
+    assert len(first) >= config.MIN_SECRET_LENGTH
+
+
+# ---------------------------------------------------------------------------
+# Bedrock model id is configurable (Phase 10 completion)
+# ---------------------------------------------------------------------------
+#
+# `analyzer.MODEL_ID` was a hardcoded constant. Its comment gave a real
+# reason - an operator repointing the pipeline would "invalidate every stored
+# result" - but that is answered by RECORDING the model id, which the analyzer
+# already does on every frame row and the pipeline on every job. Freezing it
+# was not what provided traceability.
+#
+# What freezing it did prevent was running against real Bedrock at all: many
+# regions have no on-demand access to this model and require an inference
+# profile id (`us.amazon.nova-pro-v1:0`). `invoke_model` rejects the plain id
+# there with a ValidationException, which `analyzer.PERMANENT_ERROR_CODES`
+# correctly refuses to retry - so every frame fails and no operator could fix
+# it without editing source.
+
+def test_the_default_model_is_unchanged(monkeypatch):
+    """Behaviour must be identical unless BEDROCK_MODEL_ID is set."""
+    monkeypatch.delenv("BEDROCK_MODEL_ID", raising=False)
+    assert config.load_bedrock_model_id() == "amazon.nova-pro-v1:0"
+    assert config.DEFAULT_BEDROCK_MODEL_ID == "amazon.nova-pro-v1:0"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "amazon.nova-pro-v1:0",
+        # The reason this setting exists: regional inference profiles.
+        "us.amazon.nova-pro-v1:0",
+        "eu.amazon.nova-pro-v1:0",
+        # A full inference-profile ARN must also be accepted.
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.amazon.nova-pro-v1:0",
+    ],
+)
+def test_a_plausible_bedrock_target_is_accepted(monkeypatch, value):
+    monkeypatch.setenv("BEDROCK_MODEL_ID", value)
+    assert config.load_bedrock_model_id() == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        " amazon.nova-pro-v1:0",      # padded; Bedrock would reject it
+        "amazon.nova-pro-v1:0 ",
+        "amazon nova pro",            # contains a space
+        "-leading-dash",              # must start alphanumeric
+        "ab",                         # implausibly short
+    ],
+)
+def test_an_implausible_model_id_is_refused_before_any_billed_call(
+    monkeypatch, value
+):
+    """Refused at startup, not at the first paid invocation."""
+    monkeypatch.setenv("BEDROCK_MODEL_ID", value)
+    with pytest.raises(config.ConfigurationError):
+        config.load_bedrock_model_id()
+
+
+def test_settings_exposes_the_configured_model(monkeypatch):
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0")
+    assert config.Settings().bedrock_model_id == "us.amazon.nova-pro-v1:0"
+
+
+def test_the_analyzer_uses_the_configured_model(monkeypatch):
+    """The whole point: the analyzer must honour the configured value."""
+    import analyzer
+
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0")
+    config.reset_settings_cache()
+    try:
+        assert analyzer.model_id() == "us.amazon.nova-pro-v1:0"
+    finally:
+        config.reset_settings_cache()
+
+
+def test_the_model_id_error_names_the_variable_not_a_guess(monkeypatch):
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "not a model")
+    with pytest.raises(config.ConfigurationError) as excinfo:
+        config.load_bedrock_model_id()
+    assert "BEDROCK_MODEL_ID" in str(excinfo.value)

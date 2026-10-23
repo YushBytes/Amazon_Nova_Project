@@ -816,7 +816,15 @@ export interface Remediation {
   /** Whether an OUTPUT video exists. The upload is never overwritten. */
   source_video_modified: boolean;
   finding: RemediationFinding;
-  proposal: RemediationProposal;
+  /**
+   * Optional on purpose (Phase 10.1). `remediation_repo.view` emits
+   * `record.get("proposal")`, so a document stored without one serialises as
+   * `null` - and the backend's own routes read it as
+   * `(record.get("proposal") or {})`. Typing it as required made the
+   * non-null dereference in RemediationPanel look safe when it was not, and
+   * a null blanked the whole audit detail view. Guard before use.
+   */
+  proposal?: RemediationProposal | null;
   approved_by: string | null;
   approved_at: string | null;
   decided_by: string | null;
