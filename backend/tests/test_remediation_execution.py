@@ -17,6 +17,11 @@ would do:
 6. A client cannot assert that anything is verified.
 """
 
+import glob
+import os
+import shutil
+import tempfile
+import time
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
@@ -35,16 +40,20 @@ import remediation_executor
 import remediation_repo
 import source_store
 import video_repo
+from conftest import real_jpeg, real_png
 from remediation_state import RemediationState
 
 VIDEO_ID = "vid_abcd1234"
 SOURCE_KEY = f"sources/{VIDEO_ID}/source.mp4"
 SOURCE_BYTES = b"ORIGINAL-SOURCE-BYTES-DO-NOT-TOUCH" * 8
 
-# Real magic numbers so the sniffing validator accepts them, long enough to
-# clear the MIN_IMAGE_BYTES floor. Nothing decodes the pixels.
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 300
-JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 300 + b"\xff\xd9"
+# A REAL, decodable image (Phase 9.1). It used to be a magic number followed
+# by padding, which the old sniff-only validator accepted - but the asset
+# layer now probes for decodability, because that exact shape is what makes
+# FFmpeg block on a `-loop 1` overlay input. A padded header is now correctly
+# rejected, so the happy path needs a genuine image.
+PNG = real_png()
+JPEG = real_jpeg()
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +241,120 @@ def test_an_oversized_asset_is_rejected():
     )
     with pytest.raises(remediation_assets.AssetRejected):
         remediation_assets.validate_asset_bytes(oversized)
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.1: decodability, not just a magic number
+# ---------------------------------------------------------------------------
+#
+# A magic number proves only that the first eight bytes LOOK like a PNG. The
+# bytes below - the PNG signature followed by zeroes - passed every check this
+# layer had, and then made FFmpeg BLOCK when handed to it as a `-loop 1`
+# overlay input: measured at 301s per attempt on FFmpeg 9.0.1, classified
+# retryable, so all three attempts were spent on it. Rejecting it here costs
+# ~60ms and gives the uploader a true answer.
+#
+# These need the real ffprobe: without it `_require_decodable` deliberately
+# degrades to the sniff alone, because on such a host reconstruction is
+# disabled anyway and refusing the upload would block review for no benefit.
+
+PADDED_PNG_HEADER = b"\x89PNG\r\n\x1a\n" + b"\x00" * 300
+
+
+@pytest.mark.requires_ffmpeg
+@pytest.mark.skipif(
+    shutil.which("ffprobe") is None, reason="ffprobe is not on PATH"
+)
+def test_a_padded_png_header_is_rejected_as_undecodable():
+    """The exact payload that used to hang the reconstruction pass."""
+    with pytest.raises(remediation_assets.AssetRejected):
+        remediation_assets.validate_asset_bytes(PADDED_PNG_HEADER)
+
+
+@pytest.mark.requires_ffmpeg
+@pytest.mark.skipif(
+    shutil.which("ffprobe") is None, reason="ffprobe is not on PATH"
+)
+def test_the_decodability_probe_is_fast_and_permanent():
+    """Bounded work, and an answer that will not change on a retry.
+
+    The point is not the exact duration - it is that the refusal arrives
+    without waiting for a 300s FFmpeg timeout.
+    """
+    started = time.perf_counter()
+    with pytest.raises(remediation_assets.AssetRejected):
+        remediation_assets.validate_asset_bytes(PADDED_PNG_HEADER)
+    assert time.perf_counter() - started < 30
+
+
+@pytest.mark.requires_ffmpeg
+@pytest.mark.skipif(
+    shutil.which("ffprobe") is None, reason="ffprobe is not on PATH"
+)
+def test_the_probe_leaves_no_temporary_file_behind():
+    """It stages a real file for ffprobe to seek; it must remove it."""
+    pattern = os.path.join(tempfile.gettempdir(), "novaflow-asset-*")
+    before = set(glob.glob(pattern))
+
+    with pytest.raises(remediation_assets.AssetRejected):
+        remediation_assets.validate_asset_bytes(PADDED_PNG_HEADER)
+    remediation_assets.validate_asset_bytes(PNG)
+
+    assert set(glob.glob(pattern)) == before
+
+
+@pytest.mark.requires_ffmpeg
+@pytest.mark.skipif(
+    shutil.which("ffprobe") is None, reason="ffprobe is not on PATH"
+)
+def test_an_image_smaller_than_the_smallest_region_is_rejected():
+    """Below MIN_ASSET_PIXELS it cannot usefully cover a region."""
+    tiny = real_png(width=4, height=4)
+    with pytest.raises(remediation_assets.AssetRejected):
+        remediation_assets.validate_asset_bytes(tiny)
+
+
+@pytest.mark.requires_ffmpeg
+@pytest.mark.skipif(
+    shutil.which("ffprobe") is None, reason="ffprobe is not on PATH"
+)
+def test_a_real_image_is_still_accepted():
+    """The guard must not reject a legitimate replacement."""
+    assert remediation_assets.validate_asset_bytes(real_png()) == (
+        "image/png",
+        "png",
+    )
+    assert remediation_assets.validate_asset_bytes(real_jpeg()) == (
+        "image/jpeg",
+        "jpg",
+    )
+
+
+def test_the_probe_is_skipped_when_ffprobe_is_absent(monkeypatch):
+    """Degrade, do not block: the sniff and the size bound still apply.
+
+    On a host with no FFmpeg, `RECONSTRUCTION_ENABLED` should be false and
+    nothing will consume the asset, so refusing the upload would break the
+    review workflow for no safety gain.
+    """
+    # `_require_decodable` imports shutil inside the function, so the module
+    # attribute is the thing to patch, not a name on remediation_assets.
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    assert remediation_assets.validate_asset_bytes(PADDED_PNG_HEADER) == (
+        "image/png",
+        "png",
+    )
+    # The cheap checks are not skipped with it.
+    with pytest.raises(remediation_assets.AssetRejected):
+        remediation_assets.validate_asset_bytes(b"GIF89a" + b"\x00" * 300)
+
+
+def test_require_decodable_false_skips_the_probe():
+    """The documented escape hatch, for bytes already probed."""
+    assert remediation_assets.validate_asset_bytes(
+        PADDED_PNG_HEADER, require_decodable=False
+    ) == ("image/png", "png")
 
 
 def test_the_stored_key_is_server_generated(fake_s3):

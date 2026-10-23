@@ -40,8 +40,12 @@ from reconstruction import (
     resolve_window,
     validate_output,
 )
+from conftest import real_png
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 256
+# A REAL, decodable PNG (Phase 9.1): `reconstruct` now probes the asset with
+# ffprobe before building the graph, so a padded magic number is refused
+# before the FFmpeg call these tests are about. See `conftest.real_png`.
+PNG = real_png()
 
 
 def probe(width=1920, height=1080, duration=10.0, audio=True) -> SourceProbe:
@@ -400,11 +404,16 @@ def run_reconstruct(
 
     source_payload = source_probe or ffprobe_payload()
     output_payload = output_probe or ffprobe_payload()
-    probes: list = [source_payload, output_payload]
+    # Phase 9.1 added a third probe between the two: the ASSET is probed for
+    # decodability before the graph is built. Listed explicitly rather than
+    # left to the fallback, so a test that sets a distinctive `output_probe`
+    # cannot have it silently consumed by the asset probe instead.
+    asset_payload = ffprobe_payload(16, 16, duration="0.04", audio=False)
+    probes: list = [source_payload, asset_payload, output_payload]
     captured: dict = {}
 
     def fake_probe(path, *a, **k):
-        # First call probes the source, second the output.
+        # In order: the source, the replacement image, then the output.
         return probes.pop(0) if probes else output_payload
 
     def fake_run_async(self, *a, **k):
@@ -438,7 +447,7 @@ def test_the_filter_graph_overlays_only_inside_the_window(tmp_path):
     # expression, which is FFmpeg's own escaping: an unescaped comma would
     # split `enable=...` into separate filter options and the window would be
     # silently wrong. Asserting the escaped form pins that too.
-    assert "between(t\,2.000\,4.000)" in args
+    assert r"between(t\,2.000\,4.000)" in args
     assert "-filter_complex" in captured["args"]
 
 
@@ -712,3 +721,141 @@ def test_a_closed_workspace_refuses_to_name_a_file():
     workspace = Workspace()
     with pytest.raises(RuntimeError):
         workspace.file("x.txt")
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.1: the asset is probed BEFORE FFmpeg is invoked
+# ---------------------------------------------------------------------------
+#
+# Why these matter more than they look. `loop=1` on an undecodable image does
+# not make FFmpeg exit non-zero - it makes it BLOCK, until the pass hits
+# `timeout_seconds`. That timeout is classified retryable, so the whole
+# attempt budget is spent on bytes that can never work: three waits of five
+# minutes for one permanent answer. Measured on FFmpeg 9.0.1 before the fix:
+# an 8-byte PNG header followed by zeroes consumed 301s per attempt.
+#
+# So the refusal has to happen before the subprocess starts, and it has to be
+# permanent. These assert both, with FFmpeg stubbed - the real-binary
+# counterparts live in test_integration_ffmpeg_reconstruction.py.
+
+def _reconstruct_with_asset(tmp_path, asset_bytes, *, asset_probe_raises=True):
+    """Call `reconstruct` with a given asset, recording whether FFmpeg ran."""
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source-bytes")
+    asset = tmp_path / "asset.png"
+    asset.write_bytes(asset_bytes)
+    output = tmp_path / "out.mp4"
+
+    calls = {"run_async": 0}
+    payloads = [ffprobe_payload()]
+
+    def fake_probe(path, *a, **k):
+        if payloads:
+            return payloads.pop(0)
+        # The asset probe. A real ffprobe reports 0x0 for a padded header.
+        if asset_probe_raises:
+            return {"streams": [{"codec_type": "video", "width": 0, "height": 0}]}
+        return ffprobe_payload(16, 16, duration="0.04", audio=False)
+
+    def fake_run_async(self, *a, **k):
+        calls["run_async"] += 1
+        output.write_bytes(b"x" * 4096)
+        return FakeProcess(returncode=0)
+
+    with patch("ffmpeg.probe", side_effect=fake_probe), patch(
+        "ffmpeg.nodes.OutputStream.run_async", fake_run_async, create=True
+    ):
+        with pytest.raises(ReconstructionError) as exc:
+            reconstruct(
+                source_path=str(source),
+                asset_path=str(asset),
+                bounding_box=[100, 200, 300, 400],
+                timestamp_seconds=3.0,
+                output_path=str(output),
+            )
+    return exc.value, calls, output
+
+
+def test_an_undecodable_asset_is_refused_before_ffmpeg_is_invoked(tmp_path):
+    """The whole point: no subprocess is started, so nothing can block."""
+    error, calls, _output = _reconstruct_with_asset(
+        tmp_path, b"\x89PNG\r\n\x1a\n" + b"\x00" * 400
+    )
+
+    assert calls["run_async"] == 0, (
+        "FFmpeg was invoked with an undecodable image; it would block until "
+        "the reconstruction timeout rather than failing."
+    )
+    assert isinstance(error, ReconstructionError)
+
+
+def test_an_undecodable_asset_is_a_permanent_failure(tmp_path):
+    """Not retryable: the same bytes decode the same way every time.
+
+    Before Phase 9.1 this surfaced as a TIMEOUT, which `_run` marks
+    retryable, so the executor spent all three attempts on it.
+    """
+    error, calls, _output = _reconstruct_with_asset(
+        tmp_path, b"\x89PNG\r\n\x1a\n" + b"\x00" * 400
+    )
+
+    # Both halves matter. Without the first assertion this passes even if the
+    # probe is removed, because a later guard still raises a non-retryable
+    # error - just after FFmpeg has already blocked for the full timeout.
+    assert calls["run_async"] == 0
+    assert error.retryable is False
+
+
+def test_the_refusal_leaves_no_output_and_leaks_no_path(tmp_path):
+    error, _calls, output = _reconstruct_with_asset(
+        tmp_path, b"\x89PNG\r\n\x1a\n" + b"\x00" * 400
+    )
+
+    assert not output.exists()
+    message = str(error)
+    assert str(tmp_path) not in message
+    assert "asset.png" not in message
+    assert ".mp4" not in message
+
+
+def test_an_asset_with_no_video_stream_is_refused(tmp_path):
+    """A container ffprobe can open but that holds no image."""
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source-bytes")
+    asset = tmp_path / "asset.png"
+    asset.write_bytes(real_png())
+    output = tmp_path / "out.mp4"
+
+    payloads = [ffprobe_payload()]
+    calls = {"run_async": 0}
+
+    def fake_probe(path, *a, **k):
+        if payloads:
+            return payloads.pop(0)
+        return {"streams": [{"codec_type": "audio", "codec_name": "aac"}]}
+
+    def fake_run_async(self, *a, **k):
+        calls["run_async"] += 1
+        return FakeProcess(returncode=0)
+
+    with patch("ffmpeg.probe", side_effect=fake_probe), patch(
+        "ffmpeg.nodes.OutputStream.run_async", fake_run_async, create=True
+    ):
+        with pytest.raises(ReconstructionError):
+            reconstruct(
+                source_path=str(source),
+                asset_path=str(asset),
+                bounding_box=[100, 200, 300, 400],
+                timestamp_seconds=3.0,
+                output_path=str(output),
+            )
+
+    assert calls["run_async"] == 0
+
+
+def test_a_decodable_asset_still_reaches_ffmpeg(tmp_path):
+    """The guard must not refuse a legitimate image."""
+    result, captured, _out = run_reconstruct(tmp_path)
+
+    assert result.method == "scaled_overlay"
+    assert "overlay" in " ".join(captured["args"])

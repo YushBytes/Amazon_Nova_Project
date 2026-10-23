@@ -20,9 +20,13 @@ Three things happen here:
    and video-ownership behaviour can be tested without a running database.
 """
 
+import base64
+import importlib
 import io
 import os
+import struct
 import sys
+import zlib
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -226,6 +230,28 @@ def fake_s3(monkeypatch):
 
     store = FakeS3()
     monkeypatch.setattr(source_store, "_client", store)
+
+    # `source_store` lazily builds its client, but `analyzer`, `extractor` and
+    # `video_stitcher` each bind one at MODULE SCOPE (see the note in
+    # CLAUDE.md §8 about boto3 clients built at import time). Patching only
+    # `source_store` left those three pointing at a real boto3 client, so the
+    # safety property claimed above did not actually hold for them.
+    #
+    # It went unnoticed because the only tests that reach `extractor`'s S3 put
+    # are the real-FFmpeg extraction tests, which skipped on every host that
+    # had no FFmpeg. Phase 9.1 installed FFmpeg, they ran, and they attempted
+    # a real `PutObject` against AWS - failing on InvalidAccessKeyId rather
+    # than being mocked. Binding the fake here is what makes the fixture's
+    # promise true.
+    # Imported rather than only patched-if-already-present: whether these
+    # modules happen to be in sys.modules depends on which test files were
+    # selected, and a safety property that holds only for a full-suite run is
+    # not a safety property. Importing them performs no I/O - the boto3 client
+    # is constructed, not connected.
+    for module_name in ("analyzer", "extractor", "video_stitcher"):
+        module = importlib.import_module(module_name)
+        monkeypatch.setattr(module, "s3_client", store, raising=False)
+
     yield store
     monkeypatch.setattr(source_store, "_client", None, raising=False)
 
@@ -440,6 +466,75 @@ def frame_jpeg_bytes() -> bytes:
     Bedrock (mocked in tests). Only the SOI/EOI markers matter for realism.
     """
     return b"\xff\xd8\xff\xe0" + b"\x00" * 32 + b"\xff\xd9"
+
+
+# ---------------------------------------------------------------------------
+# Replacement-image fixtures
+# ---------------------------------------------------------------------------
+
+def real_png(width: int = 16, height: int = 16, rgb=(220, 40, 40)) -> bytes:
+    """A genuinely decodable PNG, built with the standard library alone.
+
+    Phase 9.1. Until now every test that attached a replacement image used
+    ``b"\\x89PNG\\r\\n\\x1a\\n" + b"\\x00" * N`` - the PNG magic number followed
+    by padding. That is not an image: nothing can decode it. It satisfied the
+    old validation, which only sniffed the first eight bytes, so the whole
+    remediation workflow was exercised with a file that could never have been
+    reconstructed from.
+
+    Worse, that exact shape is the payload that makes FFmpeg **block** when it
+    is given as a ``-loop 1`` overlay input, so the fixture was the hang. The
+    asset layer now probes for decodability and rejects it, which is correct -
+    and which is why a valid-path test needs a real image here.
+
+    Deliberately stdlib-only (``zlib`` + ``struct``): no Pillow, no committed
+    binary fixture, and no dependency on FFmpeg being installed to *build* the
+    bytes. 16x16 clears ``remediation_assets.MIN_ASSET_PIXELS`` and the whole
+    file is ~79 bytes.
+    """
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    # 8-bit truecolour (colour type 2), no interlacing.
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    # Each scanline is a filter byte (0 = None) followed by RGB triples.
+    raw = (b"\x00" + bytes(rgb) * width) * height
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+# A real 16x16 baseline JPEG, 224 bytes, produced once with
+#   ffmpeg -f lavfi -i color=c=red:size=16x16 -frames:v 1 -q:v 31 real.jpg
+# and embedded so the fixture needs neither FFmpeg nor Pillow at test time.
+# A JPEG cannot be hand-assembled from zlib the way a PNG can - it needs
+# quantisation and Huffman tables - so this is a literal rather than a builder.
+_REAL_JPEG_B64 = (
+    "/9j/4AAQSkZJRgABAgAAAQABAAD//gAPTGF2YzYzLjEuMTAxAP/bAEMACD4+ST5JVVVV"
+    "VVVVZF1kaGhoZGRkZGhoaHBwcIODg3BwcGhocHB8fIODj5OPh4eDh5OTm5uburqystnZ"
+    "4P/////EAEwAAQEAAAAAAAAAAAAAAAAAAAAGAQEBAAAAAAAAAAAAAAAAAAAGBxABAAAA"
+    "AAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIABAAEAMBIgACEQADEQD/"
+    "2gAMAwEAAhEDEQA/AIsATX9//9k="
+)
+
+
+def real_jpeg() -> bytes:
+    """A genuinely decodable JPEG. See `real_png` for why this matters."""
+    return base64.b64decode(_REAL_JPEG_B64)
+
+
+@pytest.fixture
+def replacement_png() -> bytes:
+    """A real, decodable replacement image for the happy path."""
+    return real_png()
 
 
 # ---------------------------------------------------------------------------

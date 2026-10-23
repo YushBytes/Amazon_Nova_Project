@@ -16,10 +16,12 @@ untouched and remain open.
 > supply the replacement image themselves, have the backend build a **new**
 > video with it, and see what a fresh analysis **of that new video** found.
 > Their original upload is never modified. Automated image generation is still
-> not implemented. Nothing in this phase has run against real AWS, and FFmpeg
-> was not available on the machine it was written on - so the reconstruction
-> code is covered by subprocess-boundary tests and its real-binary tests are
-> **skipped**, not passing.
+> not implemented, and nothing here has run against real AWS or Bedrock.
+> **Phase 9.1 update:** FFmpeg 9.0.1 was installed and the real-binary tests
+> now **run and pass** (25 of 25), with the overlay confirmed by sampling
+> actual pixels rather than by the output file merely existing. Doing so
+> exposed a blocking bug: an undecodable replacement image made FFmpeg hang
+> for the full 301s timeout, which was then classified *retryable*. See §7.
 
 ---
 
@@ -711,13 +713,39 @@ Other guarantees, each with a test:
 - **Nothing has been validated against real AWS or Bedrock.** Every test mocks
   at the service boundary. No provider has ever been called, no S3 object has
   been written, and no Bedrock analysis has run.
-- **FFmpeg was not available where Phase 9 was written.** `which ffmpeg` found
-  nothing, so `backend/tests/test_integration_ffmpeg_reconstruction.py` is
-  **skipped** — 13 tests, each with a precise skip reason. The reconstruction
-  logic is covered by subprocess-boundary tests that stub `ffmpeg.probe` and
-  `run_async`, which pin the filter graph, the audio handling, the refusals and
-  the cleanup. **No real video has been built by this code.** Install FFmpeg
-  and run `pytest -m requires_ffmpeg` before trusting the output.
+- ~~**FFmpeg was not available where Phase 9 was written.**~~ **RESOLVED in
+  Phase 9.1.** FFmpeg 9.0.1 is installed on the development host and
+  `backend/tests/test_integration_ffmpeg_reconstruction.py` **runs** — 25
+  tests, 25 passed. A real video has been built by this code and verified by
+  pixel sampling: inside the approved window the region centre moved from the
+  source's `(253,253,0)` to `(219,38,38)`, the colour painted into the
+  replacement image; before the window, after it, and outside the region the
+  pixels are unchanged. The source file is byte-identical afterwards, and the
+  output's dimensions, duration (delta 0.000s) and audio stream are preserved.
+
+  ⚠️ **This is the development host only.** FFmpeg remains a runtime
+  prerequisite that no deployed environment has been verified to satisfy —
+  `backend/Dockerfile` has never been deployed. Set `RECONSTRUCTION_ENABLED`
+  false on a host without the binary.
+
+- **An undecodable image used to hang the pass, and the hang looked
+  retryable** (found and fixed in Phase 9.1). `-loop 1` on a file that passes
+  the magic-number sniff but cannot be decoded does not make FFmpeg exit
+  non-zero — it makes it **block**. Measured at **301s**, the full
+  `RECONSTRUCTION_TIMEOUT_SECONDS`, and `_run` marks a timeout `retryable`, so
+  all three attempts were spent on bytes that could never work.
+
+  Two independent guards now exist: `remediation_assets.validate_asset_bytes`
+  probes decodability at upload, and `reconstruction.reconstruct` probes the
+  asset again before building the filter graph. Both refuse permanently
+  (`retryable=False`) in ~0.1s and leave no output. The second guard is the
+  load-bearing one, because `reconstruct` is reachable with a stored asset
+  whose bytes the uploader never validated.
+
+  On a host with no `ffprobe` the upload-time probe deliberately degrades to
+  the sniff alone: reconstruction is disabled there anyway, so refusing the
+  upload would block review for no safety gain. The size bound and the format
+  allowlist still apply.
 - **Execution is at-least-once, not exactly-once.** An interrupted attempt
   re-runs from the beginning and produces a new output video; the previous
   attempt's object is retained. No deduplication across attempts is claimed.
@@ -811,9 +839,11 @@ Why this shape rather than the alternatives:
 1. **Install FFmpeg** so `ffmpeg` and `ffprobe` are on PATH, in the API image
    *and* the worker image. Without it `RECONSTRUCTION_ENABLED=false` is the
    honest setting, and the API will report the capability as absent.
-2. **Run `pytest -m requires_ffmpeg`** and confirm the 13 real-binary tests
-   pass. They generate their own clips with FFmpeg's synthetic sources, so no
-   fixture media is needed.
+2. **Run `pytest -m requires_ffmpeg`** and confirm the real-binary tests pass
+   in the target environment. They generate their own clips with FFmpeg's
+   synthetic sources, so no fixture media is needed. 46 tests are marked today
+   and all pass on the development host (FFmpeg 9.0.1); that proves the code,
+   not your image, so run them where it will actually run.
 3. **Deploy the updated `infra/cloudformation/storage.yaml`**, which adds
    lifecycle rules for `remediation-assets/` and `remediated/`. Phase 9 did
    not deploy it, and nothing in AWS was touched.

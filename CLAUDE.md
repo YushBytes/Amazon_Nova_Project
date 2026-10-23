@@ -192,11 +192,14 @@ and `frontend/node_modules` is installed. Use the venv interpreter.
 git rev-parse --show-toplevel                      # ALWAYS run before committing
 python -m py_compile backend/*.py analyzer_nova.py prompts.py
 
-# Backend tests — 1111 passed, 55 skipped (Phase 9)
-#   55 skips: 26 need MONGODB_TEST_URL, 16 need the FFmpeg binary for
-#   extraction, 13 need it for reconstruction. A skip is NOT a pass.
+# Backend tests — 1169 passed, 26 skipped in 54.51s (Phase 9.1)
+#   The 26 remaining skips ALL need MONGODB_TEST_URL. A skip is NOT a pass.
+#   FFmpeg 9.0.1 is now installed on this host, so the 29 formerly-skipped
+#   FFmpeg tests RUN: 46 are marked requires_ffmpeg today (the file grew in
+#   Phase 9.1). Before Phase 9.1 this read 1111 passed / 55 skipped, where
+#   the 55 were 26 MongoDB + 16 extraction + 13 reconstruction.
 ./.venv/Scripts/python.exe -m pytest backend/tests -q
-./.venv/Scripts/python.exe -m pytest backend/tests -m requires_ffmpeg -q   # needs FFmpeg
+./.venv/Scripts/python.exe -m pytest backend/tests -m requires_ffmpeg -q   # 46 tests
 
 # Frontend — all four pass; lint reports 0 errors / 0 warnings
 cd frontend && npm test          # 387 tests (Vitest), 18 files
@@ -215,9 +218,10 @@ there is not a real type error.
 ```bash
 cd backend && uvicorn app:app --host 0.0.0.0 --port 8000   # needs MongoDB + AWS
 pytest -m requires_mongodb                                 # needs MONGODB_TEST_URL
-pytest -m requires_ffmpeg                                  # needs the FFmpeg binary
 
-# CLI utilities — require the FFmpeg binary (NOT installed on this host)
+# CLI utilities — require the FFmpeg binary, which IS now installed here
+# (9.0.1), but these entry points still need AWS credentials and a reachable
+# MongoDB, so they remain unverified end to end.
 cd backend && python extractor.py <video.mp4> [video_id]
 cd backend && python analyzer.py <image.jpg | video_id>
 cd backend && python video_stitcher.py <video_id> [out.mp4]
@@ -241,9 +245,18 @@ cd backend && python worker.py --status         # queue depth; needs MongoDB
 
 When a phase adds tests, run them and **quote the real output**. Never write "tests pass" without it.
 
-### Environment on this machine **[VERIFIED 2026-10-20]**
+### Environment on this machine **[VERIFIED 2026-10-23]**
 
-Python 3.14.6 in `.venv` (Dockerfile targets 3.11 — mismatch) · Node v24.18.1 · npm 11.16.0 · Docker 29.8.0 · git 2.51.0 (`core.autocrlf=false` set locally) · gh 2.97.0 as `YushBytes` · **FFmpeg NOT INSTALLED** · **no MongoDB reachable** · `frontend/node_modules` installed.
+Python 3.14.6 in `.venv` (Dockerfile targets 3.11 — mismatch) · Node v24.18.1 · npm 11.16.0 · Docker 29.8.0 · git 2.51.0 (`core.autocrlf=false` set locally) · gh 2.97.0 as `YushBytes` · **FFmpeg 9.0.1 INSTALLED** (`ffmpeg` and `ffprobe` both on PATH, gyan.dev essentials build) · **no MongoDB reachable** · `frontend/node_modules` installed.
+
+⚠️ **That is this development host, not a deployment claim.** FFmpeg is a
+**runtime prerequisite** of `extractor.py` and `reconstruction.py`: without the
+binary, extraction and reconstruction fail at the subprocess boundary, which
+is why `RECONSTRUCTION_ENABLED` exists and should be set false on a host that
+lacks it. **No production or container environment has been verified to have
+FFmpeg** — `backend/Dockerfile` has never been deployed (§9 question 9), and
+nothing here says otherwise. Installing it locally only means the
+`requires_ffmpeg` tests now run *here*.
 
 ---
 
@@ -405,7 +418,7 @@ Work proceeds phase by phase per `docs/IMPLEMENTATION_ROADMAP.md`. Every session
 
 ### Current phase status
 
-Phases 0 through 9 are **complete, committed, and pushed**.
+Phases 0 through 9.1 are **complete, committed, and pushed**.
 
 | Phase | What landed |
 | :-- | :-- |
@@ -420,6 +433,7 @@ Phases 0 through 9 are **complete, committed, and pushed**.
 | 7 | Frontend connected to real compliance data; every fabricated panel removed; findings rendered for the first time; accessibility, TypeScript and API-layer cleanup. |
 | 8 | Reviewed remediation workflow: proposal, owner approval, staleness detection, confidence gating, provider contract with a truthful unavailable state. **No image generated, no video modified.** |
 | 9 | End-to-end correction from an owner-supplied image: validated asset storage, FFmpeg overlay reconstruction into a **new** video, output validation, re-analysis through the existing pipeline, and evidence-based verification. **Still no image generation; the original upload is never modified; FFmpeg was unavailable locally so its real-binary tests are skipped.** |
+| 9.1 | FFmpeg 9.0.1 installed, so the real-binary tests ran for the first time. Three genuine defects fixed: an undecodable image made FFmpeg **block** for the full 301s timeout and that timeout was classified retryable; every happy-path image fixture in the suite was itself that undecodable payload; and `fake_s3` left three modules pointing at a real boto3 client, so 9 extraction tests called real AWS. Suite: 1169 passed / 26 skipped in 54.51s, down from 969s. |
 
 **Phase 5 detail.** Deleted: the orphaned MongoDB/GridFS pipeline (`audit_manager.py`, `verifier.py`, `check_count.py`), `debug_probe.py`, `aws_config.py`, `frontend_backup/` (72 files), the stray `frontend/Video Compliance Dashboard/`, the orphan `/agents` and `/logs` duplicate routes, `infra/init_s3.py`, and `infra/iam_policy.yaml` — 82 files. `S3_BUCKET_NAME` is now required in production and validated; `MONGO_URI` and `Pillow` are gone with their only consumer. Regression tests assert the deleted modules stay deleted, that nothing imports `gridfs`, and that nothing reimplements the bucket fallback.
 
@@ -483,12 +497,35 @@ accepts two prefixes per video id (the invariant it protects is unchanged —
 `remediation-assets/` and `remediated/`, with matching IAM and CloudFormation
 lifecycle rules; four new routes (`/asset`, `/execute`, `/status`, `/output`).
 
-⚠️ **FFmpeg was not installed on the development host**, so
-`test_integration_ffmpeg_reconstruction.py` is **skipped** — 13 tests, each
-with a precise reason. The reconstruction code is covered at the subprocess
-boundary (the filter graph, the audio handling, every refusal, the cleanup) but
-**no real video has been built by it**. Run `pytest -m requires_ffmpeg` before
-trusting the output.
+~~⚠️ **FFmpeg was not installed on the development host**~~ **RESOLVED in
+Phase 9.1.** FFmpeg 9.0.1 was installed and
+`test_integration_ffmpeg_reconstruction.py` now **runs** — 25 tests, 25
+passed. A real video *has* now been built by this code, and the overlay was
+verified by sampling actual pixels: inside the window the region centre moved
+from the source's `(253,253,0)` to `(219,38,38)`, the painted colour; before
+the window, after it, and outside the region, the pixels are unchanged. The
+source file is byte-identical afterwards (SHA-256 compared), and the output's
+dimensions, duration (delta 0.000s) and audio stream are preserved.
+
+**Phase 9.1 detail.** Installing FFmpeg exposed three real defects, each now
+fixed with a regression test proven to fail without its fix:
+
+| Defect | Where | Fix |
+| :-- | :-- | :-- |
+| An undecodable image made FFmpeg **block**, not fail. `-loop 1` on a padded PNG header consumed the full `RECONSTRUCTION_TIMEOUT_SECONDS` — measured at **301s** — and `_run` classifies a timeout as `retryable`, so all 3 attempts were spent on bytes that can never work. | `reconstruction.reconstruct` built the filter graph without ever probing the asset. | `probe_image` is now called **before** the graph is built. Refusal in ~0.1s, `retryable=False`, no partial output. `remediation_assets.validate_asset_bytes` independently probes at upload. |
+| The test suite's `PNG` fixture *was* that payload — `b"\x89PNG\r\n\x1a\n" + b"\x00" * N` — so the whole remediation workflow was exercised with a file nothing could decode. | `test_remediation_execution.py`, `test_remediation_routes.py`, `test_reconstruction.py` | `conftest.real_png()` builds a genuine 16x16 PNG from `zlib`+`struct` (stdlib only, no Pillow, no committed binary); `conftest.real_jpeg()` is a real 224-byte JPEG. |
+| **The suite made real AWS S3 calls.** `fake_s3` patched only `source_store._client`, but `analyzer`, `extractor` and `video_stitcher` bind `s3_client` at module scope. 9 extraction tests attempted a real `PutObject`, failing on `InvalidAccessKeyId`. Hidden for as long as those tests always skipped. | `tests/conftest.py` | The fixture now imports those three modules and binds the fake into each. `test_the_fake_s3_fixture_binds_every_module_scope_client` asserts it. **No charge was incurred and no object was written, but the suite had left the machine.** |
+
+Also fixed: `test_a_short_ffmpeg_timeout_is_reported_not_hung` patched
+`subprocess.Popen.wait` globally, which broke the ffprobe call that runs
+*first* — it asserted a timeout it had never actually induced. The patch is
+now scoped to the extraction process.
+
+⚠️ **Still true after Phase 9.1:** no image is generated (the provider still
+raises), the original upload is never modified, the overlay is a
+**concealment** with hard edges — never call it seamless — and **nothing has
+run against real AWS or Bedrock**. The 26 MongoDB integration tests remain
+unexecuted.
 
 **Phase 10 has not been started.** Remaining: 10 (tests, CI, docs, release). Do not start it until it is explicitly assigned.
 

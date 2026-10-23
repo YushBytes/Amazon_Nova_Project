@@ -38,6 +38,7 @@ never carry a media type that a browser would execute.
 from __future__ import annotations
 
 import logging
+import os
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -49,6 +50,14 @@ logger = logging.getLogger(__name__)
 
 # Source labels recorded on the record. "upload" is the only one reachable.
 SOURCE_UPLOAD = "upload"
+
+# Pixel bounds on a replacement image (Phase 9.1). The floor matches
+# `reconstruction.MIN_REGION_PIXELS`: an image smaller than the smallest
+# region we will edit cannot usefully cover one. The ceiling bounds the
+# scaler's work - an 8 MiB PNG can still decode to something enormous, and
+# `MAX_IMAGE_BYTES` alone does not bound dimensions.
+MIN_ASSET_PIXELS = 8
+MAX_ASSET_PIXELS = 8192
 
 # Extension per sniffed media type. Only the two formats
 # `image_provider.validate_image_bytes` accepts appear here, so an unknown
@@ -97,17 +106,32 @@ def _s3_client():
     return source_store.s3_client()
 
 
-def validate_asset_bytes(data: object) -> tuple[str, str]:
+def validate_asset_bytes(data: object, *, require_decodable: bool = True) -> tuple[str, str]:
     """Return (content_type, extension) for acceptable bytes, else raise.
 
-    Delegates the actual sniffing and bounds to
-    `image_provider.validate_image_bytes`, so an owner-supplied file and a
-    provider-generated one are held to exactly the same standard: non-empty,
-    not truncated, within the size cap, and a recognised image format.
+    Two checks, and the second matters more than it looks:
+
+    1. **Sniffing and bounds**, delegated to
+       `image_provider.validate_image_bytes`, so an owner-supplied file and a
+       provider-generated one are held to exactly the same standard:
+       non-empty, not truncated, within the size cap, and a recognised format.
+
+    2. **Decodability** (Phase 9.1). A magic number proves only that the first
+       few bytes look like PNG or JPEG. A file that passes the sniff and then
+       fails to decode is not harmless: handed to FFmpeg as a looping overlay
+       input it **blocks**, so the reconstruction pass runs until its timeout
+       expires - and a timeout is retryable, so the whole attempt budget is
+       spent on a file that can never work. Measured against FFmpeg 9.0.1, an
+       8-byte PNG header followed by zeroes consumed the full 300s timeout,
+       three times over. Rejecting it here costs ~60ms and gives the uploader
+       an accurate answer instead.
+
+    `require_decodable=False` skips (2). Used only where the bytes have
+    already been probed, never to get a stubborn file through.
 
     Raises:
         AssetRejected: the bytes are empty, truncated, oversized, not bytes,
-            or not a supported image.
+            not a supported image, or not decodable as one.
     """
     try:
         content_type = image_provider.validate_image_bytes(data)
@@ -121,7 +145,62 @@ def validate_asset_bytes(data: object) -> tuple[str, str]:
         # Defence in depth: unreachable unless the two modules drift apart,
         # which a test asserts they do not.
         raise AssetRejected("That image format is not supported.")
+
+    if require_decodable:
+        _require_decodable(bytes(data), extension)  # type: ignore[arg-type]
+
     return content_type, extension
+
+
+def _require_decodable(data: bytes, extension: str) -> None:
+    """Probe the bytes as an image, rejecting anything that will not decode.
+
+    Degrades deliberately when FFmpeg is absent: on such a host
+    `RECONSTRUCTION_ENABLED` should be false, so nothing will consume the
+    asset and refusing the upload would block the review workflow for no
+    benefit. The sniff and the size bound still applied.
+    """
+    import shutil
+    import tempfile
+
+    import reconstruction
+
+    if shutil.which("ffprobe") is None:
+        logger.info(
+            "ffprobe is unavailable; accepting an asset on its magic number "
+            "and size alone. Reconstruction should be disabled on this host."
+        )
+        return
+
+    # A real file, because ffprobe needs to seek. Removed on every path.
+    handle = tempfile.NamedTemporaryFile(
+        suffix=f".{extension}", delete=False, prefix="novaflow-asset-"
+    )
+    try:
+        handle.write(data)
+        handle.close()
+        try:
+            width, height = reconstruction.probe_image(handle.name)
+        except reconstruction.ReconstructionError as exc:
+            # `probe_image` messages are already user-facing and name the
+            # problem with the file, not an internal detail.
+            raise AssetRejected(str(exc)) from exc
+
+        if width < MIN_ASSET_PIXELS or height < MIN_ASSET_PIXELS:
+            raise AssetRejected(
+                f"That image is {width}x{height} pixels, which is too small "
+                f"to use as a replacement."
+            )
+        if width > MAX_ASSET_PIXELS or height > MAX_ASSET_PIXELS:
+            raise AssetRejected(
+                f"That image is {width}x{height} pixels, which is larger than "
+                f"the {MAX_ASSET_PIXELS}px limit."
+            )
+    finally:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            logger.warning("Could not remove a staged asset probe file")
 
 
 def store_asset(
@@ -244,6 +323,8 @@ def delete_asset(key: str | None) -> None:
 
 
 __all__ = (
+    "MAX_ASSET_PIXELS",
+    "MIN_ASSET_PIXELS",
     "SOURCE_UPLOAD",
     "AssetError",
     "AssetRejected",

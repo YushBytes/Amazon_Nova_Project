@@ -234,11 +234,20 @@ def test_a_short_ffmpeg_timeout_is_reported_not_hung(
 
     # Force wait() to time out regardless of how fast the clip decodes, so
     # the test does not depend on finding a clip slow enough to really hang.
-    class InducedTimeout(Exception):
-        pass
+    #
+    # Scoped to the EXTRACTION process (Phase 9.1). `extract_and_store` probes
+    # the clip with ffprobe before it extracts, and ffprobe waits on its own
+    # child; patching `Popen.wait` unconditionally broke that probe instead,
+    # so the call failed with "The video could not be inspected." and this
+    # test asserted a timeout it had never actually induced. It never showed
+    # up because the whole file skipped on a host with no FFmpeg.
+    original_wait = subprocess.Popen.wait
 
     def patched_wait(self, timeout=None):
-        raise InducedTimeout("induced timeout")
+        args = self.args if isinstance(self.args, (list, tuple)) else [self.args]
+        if any("ffprobe" in str(arg) for arg in args):
+            return original_wait(self, timeout=timeout)
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout or 0)
 
     with patch.object(subprocess.Popen, "wait", patched_wait):
         with pytest.raises(ExtractionError, match="took too long"):

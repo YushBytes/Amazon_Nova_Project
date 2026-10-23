@@ -302,3 +302,38 @@ def test_no_module_hardcodes_a_mongo_connection_string():
             if re.match(r"""^[A-Z_]+\s*=\s*["']mongodb(\+srv)?://""", stripped):
                 offenders.append(f"{path.name}:{number}")
     assert not offenders, f"hardcoded MongoDB connection strings: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.1: the test harness must not reach real S3
+# ---------------------------------------------------------------------------
+
+def test_the_fake_s3_fixture_binds_every_module_scope_client(fake_s3):
+    """No test may hold a real boto3 S3 client while `fake_s3` is active.
+
+    `source_store` builds its client lazily, so patching that one module was
+    enough for every test that went through the upload path. But `analyzer`,
+    `extractor` and `video_stitcher` each bind a client at MODULE SCOPE, and
+    those were left pointing at a real boto3 client.
+
+    It stayed hidden because the only tests that reach `extractor`'s PutObject
+    are the real-FFmpeg extraction tests, and they skipped on every host
+    without FFmpeg. Phase 9.1 installed FFmpeg 9.0.1, they ran, and nine of
+    them attempted a real `PutObject` against AWS - failing on
+    InvalidAccessKeyId rather than being mocked. No charge was incurred and no
+    object was written, but the suite had left the machine.
+
+    This asserts the fixture's promise directly, so the next module-scope
+    client cannot quietly reintroduce it.
+    """
+    import importlib
+
+    # Imported here, not read out of sys.modules: skipping an absent module
+    # would make this assertion pass vacuously whenever the file is run on its
+    # own, which is exactly when a regression would slip through.
+    for module_name in ("analyzer", "extractor", "video_stitcher"):
+        module = importlib.import_module(module_name)
+        assert getattr(module, "s3_client", None) is fake_s3, (
+            f"{module_name}.s3_client is not the in-memory fake; a test "
+            f"using it would call real S3."
+        )

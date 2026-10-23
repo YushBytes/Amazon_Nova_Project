@@ -248,6 +248,56 @@ def probe_media(path: str) -> SourceProbe:
     )
 
 
+def probe_image(path: str) -> tuple[int, int]:
+    """Return (width, height) of a still image, or raise.
+
+    Phase 9.1. A magic number proves only that the first few bytes look like
+    PNG or JPEG; it says nothing about whether the rest decodes. A file that
+    passes the sniff and then fails to decode is NOT harmless: FFmpeg, handed
+    it as a looping overlay input, **blocks** rather than erroring out, so the
+    pass runs until `RECONSTRUCTION_TIMEOUT_SECONDS` expires - and a timeout is
+    classified retryable, so the whole attempt budget gets spent on a file that
+    can never work. Measured on FFmpeg 9.0.1: an 8-byte PNG header plus zeroes
+    consumed the full timeout every time.
+
+    So the asset path probes the image before accepting it, and this is the
+    probe. Cheap (~60ms) and decisive.
+
+    Raises:
+        ReconstructionError: FFmpeg is unavailable, or the file is not a
+            decodable image with usable dimensions. Never retryable: the same
+            bytes decode the same way every time.
+    """
+    try:
+        probe = ffmpeg.probe(path)
+    except FileNotFoundError as exc:
+        raise ReconstructionError(
+            "Video processing is unavailable on this server (FFmpeg not found)."
+        ) from exc
+    except ffmpeg.Error as exc:
+        raise ReconstructionError(
+            "The image could not be read. It may be corrupt or truncated."
+        ) from exc
+    except Exception as exc:
+        raise ReconstructionError("The image could not be inspected.") from exc
+
+    streams = probe.get("streams") or []
+    video = next((st for st in streams if st.get("codec_type") == "video"), None)
+    if not video:
+        raise ReconstructionError("That file contains no image data.")
+
+    try:
+        width = int(video["width"])
+        height = int(video["height"])
+    except (KeyError, TypeError, ValueError):
+        raise ReconstructionError(
+            "The image's dimensions could not be determined."
+        ) from None
+    if width <= 0 or height <= 0:
+        raise ReconstructionError("The image reports invalid dimensions.")
+    return width, height
+
+
 # ---------------------------------------------------------------------------
 # Resolving the approved region and window
 # ---------------------------------------------------------------------------
@@ -478,13 +528,26 @@ def reconstruct(
 
     warnings: list[str] = []
 
+    asset = Path(asset_path).resolve()
+    # Probe the asset BEFORE building the graph (Phase 9.1). `loop=1` on an
+    # undecodable image does not make FFmpeg exit non-zero - it makes it
+    # **block**, so the pass runs to `timeout_seconds` and that timeout is
+    # classified retryable, spending the whole attempt budget on bytes that
+    # can never work. Measured on FFmpeg 9.0.1: an 8-byte PNG header followed
+    # by zeroes consumed 301s, three times over.
+    #
+    # `remediation_assets.validate_asset_bytes` already rejects such a file at
+    # upload. This is the second line of defence, because `reconstruct` is
+    # also reachable with a stored asset and a path the uploader never
+    # validated - and it is the layer that owns the FFmpeg invocation, so it
+    # is where the invariant belongs. ~60ms, and the refusal is permanent.
+    probe_image(str(asset))
+
     source_input = ffmpeg.input(str(source))
     # `loop=1` turns the still image into a video stream so the overlay has
     # something to draw for the whole window; `t` bounds it so the loop cannot
     # extend the output's duration.
-    asset_input = ffmpeg.input(
-        str(Path(asset_path).resolve()), loop=1, t=max(end - start, 0.1)
-    )
+    asset_input = ffmpeg.input(str(asset), loop=1, t=max(end - start, 0.1))
 
     scaled = asset_input.filter("scale", region.width, region.height)
 
@@ -652,6 +715,7 @@ __all__ = (
     "SourceProbe",
     "UnsafeRegion",
     "Workspace",
+    "probe_image",
     "probe_media",
     "reconstruct",
     "resolve_region",

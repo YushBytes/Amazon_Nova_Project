@@ -33,14 +33,16 @@ import image_provider
 import remediation_repo
 import video_repo
 from remediation_state import RemediationState, UNREACHABLE_IN_THIS_BUILD
+from conftest import real_png
 
 VIDEO_ID = "vid_abcd1234"
 OTHER_VIDEO_ID = "vid_ffff0000"
 
-# A minimal byte string with a real PNG magic number, long enough to pass the
-# MIN_IMAGE_BYTES floor. The pixels are not meaningful - nothing in the
-# backend decodes the image, it is handed to FFmpeg, which is mocked here.
-PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 256
+# A REAL, decodable PNG (Phase 9.1). This was a magic number plus padding
+# until the asset layer began probing for decodability - a padded header is
+# exactly the payload that makes FFmpeg block on a `-loop 1` overlay input,
+# so it is now rejected at upload and cannot stand in for a valid image.
+PNG_BYTES = real_png()
 
 
 # ---------------------------------------------------------------------------
