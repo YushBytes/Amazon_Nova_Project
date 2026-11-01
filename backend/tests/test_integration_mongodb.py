@@ -102,24 +102,48 @@ def mongo_url() -> str:
     return url
 
 
-@pytest.fixture(scope="module")
-def motor_db(mongo_url):
-    """A verified-disposable database handle, cleaned up afterwards."""
+@pytest.fixture
+async def motor_db(mongo_url):
+    """A verified-disposable database handle, cleaned up afterwards.
+
+    ASYNC and FUNCTION-scoped, both deliberately. This fixture was
+    module-scoped and synchronous, building the client inside
+    `anyio.run(connect)`. That could never have worked: `anyio.run` creates an
+    event loop, runs the coroutine, and **closes the loop on return**, while
+    `AsyncIOMotorClient` binds itself to the loop that was running when it was
+    constructed. Every later operation then called `loop.call_soon()` on a
+    closed loop and raised `RuntimeError: Event loop is closed` from
+    `BaseEventLoop._check_closed` - starting with the `anyio.run(clean)` two
+    lines later, which is in *setup*, so all 26 tests in this module were
+    reported as ERRORs and none of their bodies ever executed. (The raising
+    line in base_events.py differs by interpreter - 520 on CI's 3.11, 550 on
+    3.14 - so it is deliberately not cited as a fixed number here.)
+
+    It went unnoticed for three phases because the module skips whenever
+    MONGODB_TEST_URL is unset, which was every local run. GitHub Actions run
+    39964107245 (2026-10-23, commit ea5b1c0) was the first execution with a
+    MongoDB service and failed both backend legs identically: 1212 passed,
+    26 errors, every one an `ERROR at setup of`.
+
+    Being async and function-scoped means pytest-asyncio (`asyncio_mode =
+    auto`) runs this in the SAME loop as the test that requests it, so the
+    client, the test's queries and the cleanup all share one live loop. The
+    cost is one client per test, which is irrelevant at this scale and buys
+    stronger isolation: each test starts from dropped collections.
+    """
     motor = pytest.importorskip("motor.motor_asyncio")
-    import anyio
 
     db_name = _parse_db_name(mongo_url)
 
-    async def connect():
-        client = motor.AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=2000)
-        try:
-            await client.admin.command("ping")
-        except Exception as exc:  # pragma: no cover - environment dependent
-            client.close()
-            pytest.skip(f"MongoDB at {TEST_URL_VAR} is not reachable: {type(exc).__name__}")
-        return client
+    client = motor.AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=2000)
+    try:
+        await client.admin.command("ping")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        client.close()
+        pytest.skip(
+            f"MongoDB at {TEST_URL_VAR} is not reachable: {type(exc).__name__}"
+        )
 
-    client = anyio.run(connect)
     database = client[db_name]
 
     async def clean():
@@ -127,14 +151,18 @@ def motor_db(mongo_url):
         for name in _OWNED_COLLECTIONS:
             await database[name].drop()
 
-    anyio.run(clean)
-    yield database
-    anyio.run(clean)
-    client.close()
+    await clean()
+    try:
+        yield database
+    finally:
+        # `finally` so a failing test still leaves the database clean for the
+        # next one and still closes its client.
+        await clean()
+        client.close()
 
 
 @pytest.fixture
-def patched_db(motor_db, monkeypatch):
+async def patched_db(motor_db, monkeypatch):
     """Point the application's get_database at the real test database."""
     import sys
 
@@ -457,16 +485,32 @@ async def test_owner_listing_is_scoped_against_a_real_server(patched_db):
 
 
 async def test_initialize_database_against_a_real_server(patched_db):
+    """Every initialization step succeeds against a real server.
+
+    Asserted as an exact set, matching its mocked twin in
+    `test_security_db_integrity.py`, so a new initialization step has to be
+    added here consciously rather than slipping in unobserved.
+
+    This expectation was stale and this test was the thing that proved the
+    fixture bug above was hiding real failures: it still named only the two
+    Phase 3.5 steps, while Phase 8 added `ensure_remediation_indexes` and
+    updated the mocked twin only. Because the module errored during *setup*,
+    the mismatch could not be observed for two phases.
+    """
     import db_init
 
-    results = await db_init.initialize_database(strict=False)
-    assert results == {"video_indexes": True, "user_index": True}
-
-    # Repeatable.
-    assert await db_init.initialize_database(strict=False) == {
+    expected = {
         "video_indexes": True,
+        "remediation_indexes": True,
         "user_index": True,
     }
+
+    results = await db_init.initialize_database(strict=False)
+    assert results == expected
+
+    # Repeatable: index creation is idempotent, so a second startup against
+    # the same server must report the same success rather than conflict.
+    assert await db_init.initialize_database(strict=False) == expected
 
 
 # ---------------------------------------------------------------------------
